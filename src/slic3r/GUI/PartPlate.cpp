@@ -4234,6 +4234,12 @@ int PartPlateList::create_plate(bool adjust_position)
 
 	if (printer_technology == ptFFF)
 	{
+		// The counter can lag behind the indices in use (for example after an undo, which
+		// reinitializes the list before deserializing it). Never reuse an index that is already
+		// taken: two plates would share one Print, and deleting one plate would free the Print
+		// of the other.
+		while (m_print_list.count(m_print_index) > 0 || m_gcode_result_list.count(m_print_index) > 0)
+			++m_print_index;
 		Print* print = new Print();
 		GCodeResult* gcode = new GCodeResult();
 		m_print_list.emplace(m_print_index, print);
@@ -5759,6 +5765,9 @@ int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_
 	update_plate_cols();
 	update_all_plates_pos_and_size(false, false, false, false);
 	set_shapes(m_shape, m_exclude_areas, m_logo_texture_filename, m_height_to_lid, m_height_to_rod);
+	// Print indices already given to a plate in this pass. A snapshot may contain two plates with
+	// the same print index (taken while the counter lagged behind); they must not share one Print.
+	std::set<int> used_print_indices;
 	for (unsigned int i = 0; i < (unsigned int)m_plate_list.size(); ++i)
 	{
 		bool need_reset_print = false;
@@ -5778,6 +5787,13 @@ int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_
 
 		std::map<int, PrintBase*>::iterator it = m_print_list.find(m_plate_list[i]->m_print_index);
 		std::map<int, GCodeResult*>::iterator it2 = m_gcode_result_list.find(m_plate_list[i]->m_print_index);
+		const bool shared_print_index = used_print_indices.count(m_plate_list[i]->m_print_index) > 0;
+		if (shared_print_index) {
+			// Already used by an earlier plate: give this plate its own (new) Print below.
+			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": plate %1% shares print index %2% with an earlier plate, creating a new print") % i % m_plate_list[i]->m_print_index;
+			m_plate_list[i]->update_slice_result_valid_state(false);
+			it = m_print_list.end();
+		}
 		if (it != m_print_list.end())
 		{
 			//find it
@@ -5800,6 +5816,7 @@ int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_
 					if ((i == m_current_plate)&&m_plater)
 						m_plater->reset_gcode_toolpaths();
 				}
+				used_print_indices.insert(m_plate_list[i]->m_print_index);
 				continue;
 			}
 		}
@@ -5810,6 +5827,9 @@ int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_
 			++m_print_index;
 		}
 
+		// Skip indices that are still taken (the counter can lag behind after an undo).
+		while (m_print_list.count(m_print_index) > 0 || m_gcode_result_list.count(m_print_index) > 0)
+			++m_print_index;
 		const int new_print_index = m_print_index++;
 
 		Print* print = new Print();
@@ -5838,6 +5858,7 @@ int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_
 		}
 
 		m_plate_list[i]->set_print(print, gcode, new_print_index);
+		used_print_indices.insert(new_print_index);
 
 		print->set_plate_index(i);
 	}
@@ -5862,6 +5883,10 @@ int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_
 	{
 		destroy_print(delete_list[index]);
 	}
+
+	// Move the counter past every index in use, so that create_plate() starts from a free index.
+	if (!m_print_list.empty())
+		m_print_index = std::max(m_print_index, m_print_list.rbegin()->first + 1);
 
 	//update the bed's position
 	Vec2d pos = compute_shape_position(m_current_plate, m_plate_cols);
