@@ -27,7 +27,9 @@ bool WebSocketDebugServer::start()
 
     m_io_context = std::make_unique<net::io_context>();
 
-    tcp::endpoint endpoint(tcp::v4(), m_port);
+    // Bind to loopback only: this debug WebSocket has no authentication, so it must not be
+    // reachable from outside this machine. Local clients connect via 127.0.0.1.
+    tcp::endpoint endpoint(net::ip::address::from_string("127.0.0.1"), m_port);
     m_acceptor = std::make_unique<tcp::acceptor>(*m_io_context, endpoint);
 
     m_running.store(true);
@@ -111,8 +113,11 @@ void WebSocketDebugServer::accept_loop()
             continue;
         }
 
+        // remote_endpoint() without error_code throws if the client is already gone.
+        boost::system::error_code ep_ec;
+        const auto remote = socket.remote_endpoint(ep_ec);
         BOOST_LOG_TRIVIAL(info) << "Flutter Web client connected from "
-                                << socket.remote_endpoint().address().to_string();
+                                << (ep_ec ? std::string("<unknown>") : remote.address().to_string());
 
         // Spawn a thread per session so accept_loop stays unblocked
         m_session_threads.emplace_back(&WebSocketDebugServer::session_loop, this, std::move(socket));        
@@ -131,8 +136,15 @@ void WebSocketDebugServer::session_loop(tcp::socket socket)
         }
     ));
 
-    // Accept WebSocket handshake
-    ws->accept();
+    // Accept WebSocket handshake. Use the error_code overload: this runs on its own thread, so
+    // an exception (e.g. a client that connects and closes without a handshake) would end in
+    // std::terminate and take the whole application down.
+    boost::system::error_code accept_ec;
+    ws->accept(accept_ec);
+    if (accept_ec) {
+        BOOST_LOG_TRIVIAL(warning) << "WebSocket handshake failed: " << accept_ec.message();
+        return;
+    }
 
     // Swap in the new stream under the lock, then close old streams outside
     // the lock so send_worker is never blocked waiting for TCP teardown.
