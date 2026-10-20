@@ -727,6 +727,14 @@ private:
     void sw_SlicerGetMeasurement();
     void sw_SlicerAssemble();
     void sw_SlicerResetMeasurement();
+
+    // Project lifecycle: state, delete, new/open/save project.
+    void sw_SlicerGetProjectState();
+    void sw_SlicerDelete();
+    void sw_SlicerDeletePlate();
+    void sw_SlicerNewProject();
+    void sw_SlicerOpenProject();
+    void sw_SlicerSaveProject();
 };
 
 // Main SSWCP class for managing communication instances

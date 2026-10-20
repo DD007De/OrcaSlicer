@@ -13175,14 +13175,19 @@ bool Plater::priv::delete_object_from_model(size_t obj_idx, bool refresh_immedia
     // show warning message that "cut consistancy" will not be supported any more
     ModelObject *obj = model.objects[obj_idx];
     if (obj->is_cut()) {
-        InfoDialog dialog(q, _L("Delete object which is a part of cut object"),
-                          _L("You try to delete an object which is a part of a cut object.\n"
-                             "This action will break a cut correspondence.\n"
-                             "After that model consistency can't be guaranteed."),
-                          false, wxYES | wxCANCEL | wxCANCEL_DEFAULT | wxICON_WARNING);
-        dialog.SetButtonLabel(wxID_YES, _L("Delete"));
-        if (dialog.ShowModal() == wxID_CANCEL)
-            return false;
+        if (sswcp_api::active()) {
+            // API mode: the caller has already confirmed breaking the cut link (break_cut:true).
+            sswcp_api::note("cut link broken for '" + obj->name + "'");
+        } else {
+            InfoDialog dialog(q, _L("Delete object which is a part of cut object"),
+                              _L("You try to delete an object which is a part of a cut object.\n"
+                                 "This action will break a cut correspondence.\n"
+                                 "After that model consistency can't be guaranteed."),
+                              false, wxYES | wxCANCEL | wxCANCEL_DEFAULT | wxICON_WARNING);
+            dialog.SetButtonLabel(wxID_YES, _L("Delete"));
+            if (dialog.ShowModal() == wxID_CANCEL)
+                return false;
+        }
     }
 
     std::string snapshot_label = "Delete Object";
@@ -16083,6 +16088,17 @@ bool Plater::priv::confirm_auto_generated_gradients(wxWindow *parent, size_t num
     if (m_last_auto_gradient_prompt_physical_count == num_physical) {
         MixedFilamentManager::set_auto_generate_enabled(m_last_auto_gradient_prompt_accepted);
         return m_last_auto_gradient_prompt_accepted;
+    }
+
+    // API mode: no dialog; answer No without remembering it (no mixed filaments are added to the
+    // project as a side effect). load_files() may ask once per filament count: note it once.
+    if (sswcp_api::active()) {
+        const std::string               text  = "auto-generated gradients not created (dialog skipped)";
+        const std::vector<std::string>& notes = sswcp_api::notes();
+        if (std::find(notes.begin(), notes.end(), text) == notes.end())
+            sswcp_api::note(text);
+        MixedFilamentManager::set_auto_generate_enabled(false);
+        return false;
     }
 
     const size_t auto_gradient_count = num_physical * (num_physical - 1) / 2;
@@ -20186,6 +20202,19 @@ int GUI::Plater::close_with_confirm(std::function<bool(bool)> second_check)
     if (up_to_date(false, false)) {
         if (second_check && !second_check(false)) return wxID_CANCEL;
         model().set_backup_path("");
+        return wxID_NO;
+    }
+
+    // API mode (sw_Slicer* commands): never ask and never save, also not with a remembered
+    // "save" choice. The caller has already verified that discarding the unsaved changes was
+    // explicitly requested.
+    if (sswcp_api::active()) {
+        sswcp_api::note("unsaved changes discarded (save dialog skipped)");
+        if (second_check && !second_check(false))
+            return wxID_CANCEL;
+        model().set_backup_path("");
+        up_to_date(true, false);
+        up_to_date(true, true);
         return wxID_NO;
     }
 

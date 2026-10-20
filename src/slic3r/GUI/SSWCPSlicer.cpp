@@ -3,6 +3,7 @@
 #include "SSWCP.hpp"
 #include "GUI_App.hpp"
 #include "MainFrame.hpp"
+#include "slic3r/GUI/GUI.hpp"
 #include "nlohmann/json.hpp"
 #include "slic3r/GUI/Tab.hpp"
 #include "slic3r/GUI/Plater.hpp"
@@ -24,6 +25,8 @@
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "slic3r/Utils/WxFontUtils.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Utils.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/CutUtils.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Slicing.hpp"
@@ -41,8 +44,12 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <exception>
+#include <functional>
+#include <initializer_list>
 #include <iomanip>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -76,7 +83,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 5;
+        m_res_data["phase"]    = 6;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -480,6 +487,42 @@ static const char* sw_slicer_volume_type(ModelVolumeType type)
 
 // All objects with plate, number of instances and volumes (0-based indices, in the
 // order of model.objects and mo->volumes).
+static json sw_slicer_objects_json()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        throw std::runtime_error("no active plater");
+    Model&         model  = plater->model();
+    PartPlateList& plates = plater->get_partplate_list();
+    json objects = json::array();
+    for (size_t i = 0; i < model.objects.size(); ++i) {
+        const ModelObject* mo = model.objects[i];
+        json o;
+        o["object"] = static_cast<int>(i);
+        o["name"]   = mo->name;
+        int plate = -1;
+        if (!mo->instances.empty()) {
+            plate = plates.find_instance_belongs(static_cast<int>(i), 0);
+            if (plate < 0)
+                plate = plates.find_instance(static_cast<int>(i), 0);
+        }
+        o["plate"]     = (plate >= 0) ? plate : -1;
+        o["instances"] = static_cast<int>(mo->instances.size());
+        json vols = json::array();
+        for (size_t v = 0; v < mo->volumes.size(); ++v) {
+            const ModelVolume* mv = mo->volumes[v];
+            json jv;
+            jv["volume"] = static_cast<int>(v);
+            jv["name"]   = mv->name;
+            jv["type"]   = sw_slicer_volume_type(mv->type());
+            vols.push_back(jv);
+        }
+        o["volumes"] = vols;
+        objects.push_back(o);
+    }
+    return objects;
+}
+
 void SSWCP_SliceProject_Instance::sw_SlicerListObjects()
 {
     try {
@@ -488,35 +531,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerListObjects()
             handle_general_fail(-1, "no active plater");
             return;
         }
-        Model&         model = plater->model();
-        PartPlateList& plates = plater->get_partplate_list();
-        json objects = json::array();
-        for (size_t i = 0; i < model.objects.size(); ++i) {
-            const ModelObject* mo = model.objects[i];
-            json o;
-            o["object"] = static_cast<int>(i);
-            o["name"]   = mo->name;
-            int plate = -1;
-            if (!mo->instances.empty()) {
-                plate = plates.find_instance_belongs(static_cast<int>(i), 0);
-                if (plate < 0)
-                    plate = plates.find_instance(static_cast<int>(i), 0);
-            }
-            o["plate"]     = (plate >= 0) ? plate : -1;
-            o["instances"] = static_cast<int>(mo->instances.size());
-            json vols = json::array();
-            for (size_t v = 0; v < mo->volumes.size(); ++v) {
-                const ModelVolume* mv = mo->volumes[v];
-                json jv;
-                jv["volume"] = static_cast<int>(v);
-                jv["name"]   = mv->name;
-                jv["type"]   = sw_slicer_volume_type(mv->type());
-                vols.push_back(jv);
-            }
-            o["volumes"] = vols;
-            objects.push_back(o);
-        }
-        m_res_data["objects"] = objects;
+        m_res_data["objects"] = sw_slicer_objects_json();
         send_to_js();
         finish_job();
     } catch (std::exception& e) {
@@ -3314,6 +3329,851 @@ void SSWCP_SliceProject_Instance::sw_SlicerResetMeasurement()
         GLGizmoMeasure* g = sw_slicer_measure_gizmo(name, false);
         g->api_reset_features();
         m_res_data["reset"] = true;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Project lifecycle: common helpers ----------------------------------------
+// All helpers throw std::runtime_error with a readable message; the handlers catch it and
+// return it as a regular error (handle_general_fail).
+
+// Does the project have unsaved changes? The check of Plater::close_with_confirm(), plus a
+// rule for an empty model, which up_to_date() always treats as clean: an empty model is dirty
+// only if the undo stack holds a project-changing step since the last save, new project or
+// load (for example "delete all" on a modified project). A fresh or new empty project is
+// clean. Unsaved preset edits are reported separately (presets_dirty).
+static bool sw_slicer_project_dirty()
+{
+    Plater* plater = wxGetApp().plater();
+    if (!plater->up_to_date(false, false))
+        return true;
+    return plater->model().objects.empty() && plater->undo_redo_stack_main().project_modified();
+}
+
+// Do the presets have unsaved edits?
+static bool sw_slicer_presets_dirty() { return wxGetApp().has_current_preset_changes(); }
+
+// Project switches, saving and deleting are refused while slicing is in progress or while a
+// project is being loaded (the loading progress dialog lets other requests through).
+static void sw_slicer_require_not_slicing()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater->is_background_process_slicing())
+        throw std::runtime_error("not possible while slicing is in progress");
+    if (plater->is_loading_project())
+        throw std::runtime_error("not possible while a project is being loaded");
+}
+
+// A project switch would silently abort a scheduled G-code export.
+static void sw_slicer_require_no_export()
+{
+    if (wxGetApp().plater()->is_export_gcode_scheduled())
+        throw std::runtime_error("an export is still running; wait until it has finished");
+}
+
+// Optional flag that counts only if it is exactly true (missing, null, false or another type = not set).
+static bool sw_slicer_flag_true(const json& params, const char* key)
+{
+    return params.count(key) && params.at(key).is_boolean() && params.at(key).get<bool>();
+}
+
+// New/open project clear the undo stack: unsaved changes may only be dropped on explicit request.
+static void sw_slicer_require_discard(const json& params)
+{
+    if (sw_slicer_project_dirty() && !sw_slicer_flag_true(params, "discard_unsaved"))
+        throw std::runtime_error(
+            "the project has unsaved changes; save it first (sw_SlicerSaveProject) or pass discard_unsaved:true");
+}
+
+// What to do with unsaved preset edits: "" (there are none), "keep" or "discard".
+// Without allow_keep only "discard" is accepted.
+static std::string sw_slicer_preset_choice(const json& params, bool allow_keep)
+{
+    if (!sw_slicer_presets_dirty())
+        return "";
+    if (!sw_slicer_has_param(params, "preset_changes"))
+        throw std::runtime_error(allow_keep ? "the presets have unsaved changes; pass preset_changes:'keep' or 'discard'" :
+                                              "the presets have unsaved changes; pass preset_changes:'discard'");
+    const json&       j      = params.at("preset_changes");
+    const std::string choice = j.is_string() ? j.get<std::string>() : std::string();
+    if (choice == "discard" || (allow_keep && choice == "keep"))
+        return choice;
+    throw std::runtime_error(allow_keep ? "preset_changes must be 'keep' or 'discard'" : "preset_changes must be 'discard'");
+}
+
+// Discard unsaved preset edits, like the "Discard" button of the unsaved-changes dialog
+// (same steps as GUI_App::check_and_keep_current_preset_changes()).
+static void sw_slicer_discard_preset_changes()
+{
+    GUI_App&                app  = wxGetApp();
+    const PrinterTechnology tech = app.preset_bundle->printers.get_edited_preset().printer_technology();
+    for (Tab* tab : app.tabs_list)
+        if (tab->supports_printer_technology(tech) && tab->current_preset_is_dirty())
+            tab->get_presets()->discard_current_changes();
+    app.load_current_presets(false);
+}
+
+// Path parameter as a boost path (the JSON string is UTF-8).
+static boost::filesystem::path sw_slicer_path_from_utf8(const std::string& s) { return into_path(wxString::FromUTF8(s)); }
+
+// Path as a UTF-8 string (for replies and error messages).
+static std::string sw_slicer_path_to_utf8(const boost::filesystem::path& p) { return into_u8(from_path(p)); }
+
+// Output file parameter: an absolute path with one of the suffixes (case-insensitive), in an
+// existing folder, with a legal file name.
+static boost::filesystem::path sw_slicer_output_path(const json& params, const char* key, std::initializer_list<const char*> suffixes)
+{
+    const std::string k = key;
+    if (!sw_slicer_has_param(params, key) || !params.at(key).is_string() || params.at(key).get<std::string>().empty())
+        throw std::runtime_error("'" + k + "' must be a non-empty string");
+    const std::string             s = params.at(key).get<std::string>();
+    const boost::filesystem::path p = sw_slicer_path_from_utf8(s);
+    if (!p.is_absolute())
+        throw std::runtime_error("'" + k + "' must be an absolute path");
+    bool        suffix_ok = false;
+    std::string expected;
+    for (const char* suffix : suffixes) {
+        suffix_ok = suffix_ok || boost::algorithm::iends_with(s, suffix);
+        expected += (expected.empty() ? "" : " or ") + std::string(suffix);
+    }
+    if (!suffix_ok)
+        throw std::runtime_error("'" + k + "' must end with " + expected);
+    boost::system::error_code ec;
+    if (!boost::filesystem::is_directory(p.parent_path(), ec))
+        throw std::runtime_error("folder does not exist: " + sw_slicer_path_to_utf8(p.parent_path()));
+    if (Plater::has_illegal_filename_characters(sw_slicer_path_to_utf8(p.filename())))
+        throw std::runtime_error("the file name contains characters that are not allowed: <>:/\\|?*\"");
+    return p;
+}
+
+// Never replace another existing file unasked. The project's own file (own_file) may be
+// replaced without a flag, like Ctrl+S.
+static void sw_slicer_require_overwrite_allowed(const boost::filesystem::path& p, const json& params,
+                                                const boost::filesystem::path& own_file = {})
+{
+    boost::system::error_code ec;
+    if (boost::filesystem::is_directory(p, ec))
+        throw std::runtime_error("path is a folder: " + sw_slicer_path_to_utf8(p));
+    if (!boost::filesystem::exists(p, ec))
+        return;
+    const bool is_own = !own_file.empty() && boost::filesystem::equivalent(p, own_file, ec) && !ec;
+    if (!is_own && !sw_slicer_flag_true(params, "overwrite"))
+        throw std::runtime_error("file already exists: " + sw_slicer_path_to_utf8(p) + "; pass overwrite:true to replace it");
+}
+
+// Write through a temporary file next to the target, then replace the target. An existing
+// target is left untouched if writing fails; the temporary file is removed on every error path.
+static void sw_slicer_write_via_temp(const boost::filesystem::path& target, const std::function<bool(const boost::filesystem::path&)>& write)
+{
+    // x.3mf -> x.api-tmp-<random>.3mf, x.gcode.3mf -> x.gcode.api-tmp-<random>.3mf (the
+    // extension stays). A unique name never touches an existing file of the user.
+    boost::system::error_code ec;
+    boost::filesystem::path   tmp;
+    do {
+        boost::filesystem::path tmp_name = target.stem();
+        tmp_name += boost::filesystem::path(".api-tmp-");
+        tmp_name += boost::filesystem::unique_path("%%%%%%%%");
+        tmp_name += target.extension();
+        tmp = target.parent_path() / tmp_name;
+    } while (boost::filesystem::exists(tmp, ec));
+
+    try {
+        if (!write(tmp)) {
+            boost::filesystem::remove(tmp, ec);
+            throw std::runtime_error("writing the file failed: " + sw_slicer_path_to_utf8(target));
+        }
+        boost::filesystem::rename(tmp, target); // replaces an existing target
+    } catch (...) {
+        boost::filesystem::remove(tmp, ec);
+        throw;
+    }
+}
+
+// Plate parameter: params["plate"] if present (0-based), otherwise the current plate.
+static int sw_slicer_resolve_plate(const json& params)
+{
+    PartPlateList& plates = wxGetApp().plater()->get_partplate_list();
+    if (!sw_slicer_has_param(params, "plate"))
+        return plates.get_curr_plate_index();
+    const json& j     = params.at("plate");
+    const int   count = plates.get_plate_count();
+    if (!j.is_number_integer() || j.get<long long>() < 0 || j.get<long long>() >= count)
+        throw std::runtime_error("plate " + j.dump() + " does not exist (there are " + std::to_string(count) +
+                                 " plates, 0-based)");
+    return j.get<int>();
+}
+
+// Deleting (part of) a cut object breaks the cut link: only on explicit request.
+static void sw_slicer_require_break_cut(const ModelObject* mo, int obj, const json& params)
+{
+    if (mo->is_cut() && !sw_slicer_flag_true(params, "break_cut"))
+        throw std::runtime_error("object " + std::to_string(obj) +
+                                 " is part of a cut object; deleting it breaks the cut link; pass break_cut:true");
+}
+
+// Identity of all objects, instances and volumes, to report by name what a delete removed
+// (indices shift after deleting). An item counts as still present if its ObjectID or its
+// address is still in the model: ModelObject::delete_volume() gives the last remaining volume
+// a new ID, so the ID alone would report that volume as deleted too. Deleting allocates no
+// new model items, so an address cannot be reused in between.
+namespace {
+struct SwSlicerItemId
+{
+    size_t      id;
+    const void* ptr;
+    std::string name;
+};
+struct SwSlicerModelIds
+{
+    struct Object
+    {
+        SwSlicerItemId              self;
+        std::vector<SwSlicerItemId> instances;
+        std::vector<SwSlicerItemId> volumes;
+    };
+    std::vector<Object> objects;
+};
+struct SwSlicerItemSet
+{
+    std::set<size_t>      ids;
+    std::set<const void*> ptrs;
+    void add(size_t id, const void* ptr)
+    {
+        ids.insert(id);
+        ptrs.insert(ptr);
+    }
+    bool has(const SwSlicerItemId& item) const { return ids.count(item.id) != 0 || ptrs.count(item.ptr) != 0; }
+};
+} // namespace
+
+static SwSlicerModelIds sw_slicer_model_ids()
+{
+    SwSlicerModelIds ids;
+    for (const ModelObject* mo : wxGetApp().plater()->model().objects) {
+        SwSlicerModelIds::Object o;
+        o.self = {mo->id().id, mo, mo->name};
+        for (const ModelInstance* mi : mo->instances)
+            o.instances.push_back({mi->id().id, mi, std::string()});
+        for (const ModelVolume* mv : mo->volumes)
+            o.volumes.push_back({mv->id().id, mv, mv->name});
+        ids.objects.push_back(std::move(o));
+    }
+    return ids;
+}
+
+// {objects:[names], instances:[{object_name, instance}], volumes:[{object_name, volume_name}]}:
+// what is gone compared to 'before'. A deleted object is reported only as an object.
+static json sw_slicer_deleted_json(const SwSlicerModelIds& before)
+{
+    SwSlicerItemSet after_objects, after_instances, after_volumes;
+    for (const ModelObject* mo : wxGetApp().plater()->model().objects) {
+        after_objects.add(mo->id().id, mo);
+        for (const ModelInstance* mi : mo->instances)
+            after_instances.add(mi->id().id, mi);
+        for (const ModelVolume* mv : mo->volumes)
+            after_volumes.add(mv->id().id, mv);
+    }
+    json objects   = json::array();
+    json instances = json::array();
+    json volumes   = json::array();
+    for (const SwSlicerModelIds::Object& o : before.objects) {
+        if (!after_objects.has(o.self)) {
+            objects.push_back(o.self.name);
+            continue;
+        }
+        for (size_t i = 0; i < o.instances.size(); ++i)
+            if (!after_instances.has(o.instances[i])) {
+                json e;
+                e["object_name"] = o.self.name;
+                e["instance"]    = static_cast<int>(i);
+                instances.push_back(e);
+            }
+        for (const SwSlicerItemId& v : o.volumes)
+            if (!after_volumes.has(v)) {
+                json e;
+                e["object_name"] = o.self.name;
+                e["volume_name"] = v.name;
+                volumes.push_back(e);
+            }
+    }
+    json r;
+    r["objects"]   = objects;
+    r["instances"] = instances;
+    r["volumes"]   = volumes;
+    return r;
+}
+
+static bool sw_slicer_deleted_any(const json& deleted)
+{
+    return !deleted.at("objects").empty() || !deleted.at("instances").empty() || !deleted.at("volumes").empty();
+}
+
+static std::string sw_slicer_join_notes(std::string text, const std::vector<std::string>& notes)
+{
+    for (const std::string& n : notes)
+        text += "; " + n;
+    return text;
+}
+
+// --- Project lifecycle: state, new, open, save -------------------------------------
+
+// Read-only overview of the project: file, unsaved changes, objects, plates, background work.
+void SSWCP_SliceProject_Instance::sw_SlicerGetProjectState()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        PartPlateList& plates = plater->get_partplate_list();
+        m_res_data["path"]          = into_u8(plater->get_project_filename(".3mf"));
+        m_res_data["project_name"]  = into_u8(plater->get_project_name());
+        m_res_data["dirty"]         = sw_slicer_project_dirty();
+        m_res_data["presets_dirty"] = sw_slicer_presets_dirty();
+        m_res_data["objects"]       = static_cast<int>(plater->model().objects.size());
+        m_res_data["plates"]        = plates.get_plate_count();
+        m_res_data["current_plate"] = plates.get_curr_plate_index();
+        m_res_data["slicing"]       = plater->is_background_process_slicing();
+        m_res_data["exporting"]     = plater->is_export_gcode_scheduled();
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Start a new, empty project. Unsaved project changes require discard_unsaved:true and unsaved
+// preset edits require preset_changes:'keep'|'discard'. Clears the undo stack: no undo step.
+void SSWCP_SliceProject_Instance::sw_SlicerNewProject()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_no_export();
+        sw_slicer_require_discard(m_param_data);
+        const std::string presets   = sw_slicer_preset_choice(m_param_data, /*allow_keep=*/true);
+        const bool        was_dirty = sw_slicer_project_dirty();
+
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope api_scope;
+            if (presets == "discard")
+                sw_slicer_discard_preset_changes();
+            // skip_confirm: the checks above replace close_with_confirm(). Without the confirmation
+            // the preset edits are kept (reset() reloads the edited presets).
+            plater->new_project(/*skip_confirm=*/true, /*silent=*/false);
+            notes = sswcp_api::notes();
+        }
+        if (was_dirty)
+            notes.push_back("unsaved changes discarded");
+        if (presets == "keep")
+            notes.push_back("preset changes kept for the new project");
+        else if (presets == "discard")
+            notes.push_back("preset changes discarded");
+        notes.push_back("this action cannot be undone");
+
+        m_res_data["project_name"] = into_u8(plater->get_project_name());
+        m_res_data["objects"]      = sw_slicer_objects_json();
+        m_res_data["plates"]       = plater->get_partplate_list().get_plate_count();
+        m_res_data["notes"]        = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Open a .3mf project (model and settings, without the load-type question). Same flags as
+// sw_SlicerNewProject, but preset edits can only be discarded (the project brings its own
+// presets). Clears the undo stack: no undo step.
+void SSWCP_SliceProject_Instance::sw_SlicerOpenProject()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        const std::string path = (sw_slicer_has_param(m_param_data, "path") && m_param_data.at("path").is_string()) ?
+                                     m_param_data.at("path").get<std::string>() :
+                                     std::string();
+        if (path.empty())
+            throw std::runtime_error("specify 'path'");
+        const boost::filesystem::path file = sw_slicer_path_from_utf8(path);
+        boost::system::error_code     ec;
+        if (!boost::filesystem::is_regular_file(file, ec))
+            throw std::runtime_error("file does not exist: " + path);
+        if (!boost::algorithm::iends_with(path, ".3mf"))
+            throw std::runtime_error("only .3mf project files can be opened (use sw_SlicerAddModel for models)");
+        if (boost::algorithm::iends_with(path, ".gcode.3mf"))
+            throw std::runtime_error("sliced files (.gcode.3mf) open in preview-only mode and are not supported");
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_no_export();
+        sw_slicer_require_discard(m_param_data);
+        const std::string presets   = sw_slicer_preset_choice(m_param_data, /*allow_keep=*/false);
+        const bool        was_dirty = sw_slicer_project_dirty();
+
+        std::vector<std::string> choices;
+        {
+            sswcp_api::Scope api_scope;
+            if (presets == "discard")
+                sw_slicer_discard_preset_changes();
+            // "<loadall>": load model and settings without asking (skips determine_load_type()).
+            // close_with_confirm() runs, but is silent in API mode.
+            plater->load_project(wxString::FromUTF8(path), "<loadall>");
+            choices = sswcp_api::notes();
+        }
+
+        // load_project() returns nothing: it succeeded if the project now refers to the file.
+        const boost::filesystem::path now = into_path(plater->get_project_filename(".3mf"));
+        if (now.empty() || !boost::filesystem::equivalent(now, file, ec) || ec)
+            throw std::runtime_error(sw_slicer_join_notes("the project could not be opened", choices));
+
+        std::vector<std::string> notes;
+        // For an empty model close_with_confirm() sees nothing to discard and adds no note.
+        if (was_dirty && std::find(choices.begin(), choices.end(), "unsaved changes discarded (save dialog skipped)") == choices.end())
+            notes.push_back("unsaved changes discarded");
+        if (presets == "discard")
+            notes.push_back("preset changes discarded");
+        if (plater->using_exported_file())
+            notes.push_back("the file contains sliced data; it was opened in preview-only mode");
+        notes.push_back("this action cannot be undone");
+
+        m_res_data["path"]         = sw_slicer_path_to_utf8(now);
+        m_res_data["project_name"] = into_u8(plater->get_project_name());
+        m_res_data["objects"]      = sw_slicer_objects_json();
+        m_res_data["plates"]       = plater->get_partplate_list().get_plate_count();
+        m_res_data["auto_choices"] = choices;
+        m_res_data["notes"]        = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Same condition as publish() in Plater.cpp: an SVG part whose original file is not yet stored
+// in the 3MF. export_3mf() then asks whether to store the SVGs with their local paths.
+static bool sw_slicer_has_new_svg_files(const Model& model)
+{
+    for (const ModelObject* object : model.objects)
+        for (const ModelVolume* volume : object->volumes)
+            if (volume->emboss_shape.has_value() && !volume->text_configuration.has_value() &&
+                volume->emboss_shape->svg_file.has_value() && volume->emboss_shape->svg_file->path_in_3mf.empty())
+                return true;
+    return false;
+}
+
+// Save the project as .3mf: without 'path' to the project's own file, like Ctrl+S. Another
+// existing file is only replaced with overwrite:true. Writes through a temporary file.
+// Saving changes no model data: no undo step.
+void SSWCP_SliceProject_Instance::sw_SlicerSaveProject()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        // Stricter than MainFrame::can_save_as(): no open (paint) tool at all.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        if (plater->using_exported_file() || plater->only_gcode_mode())
+            throw std::runtime_error("a G-code or sliced file is open; it cannot be saved as a project");
+        if (plater->model().objects.empty())
+            throw std::runtime_error("the project is empty; nothing to save");
+
+        const boost::filesystem::path own = into_path(plater->get_project_filename(".3mf"));
+        boost::filesystem::path       target;
+        if (sw_slicer_has_param(m_param_data, "path")) {
+            target = sw_slicer_output_path(m_param_data, "path", {".3mf"});
+            if (boost::algorithm::iends_with(m_param_data.at("path").get<std::string>(), ".gcode.3mf"))
+                throw std::runtime_error("use a .3mf name without .gcode");
+        } else {
+            if (own.empty())
+                throw std::runtime_error("the project has no file name yet; pass 'path'");
+            target = own;
+        }
+        sw_slicer_require_overwrite_allowed(target, m_param_data, own);
+        boost::system::error_code ec;
+        const bool replaces_other = boost::filesystem::exists(target, ec) &&
+                                    !(!own.empty() && boost::filesystem::equivalent(target, own, ec) && !ec);
+
+        const bool new_svg_files = sw_slicer_has_new_svg_files(plater->model());
+
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope api_scope;
+            sw_slicer_write_via_temp(target, [plater](const boost::filesystem::path& tmp) {
+                // Same strategy as Plater::save_project(), plus Silence: export_3mf() then does not
+                // record the temporary file as project file (recent projects, backup origin), and
+                // publish() skips the SVG "Private protection" question with the answer that keeps
+                // the SVGs editable (they are stored with their local paths).
+                return plater->export_3mf(tmp, SaveStrategy::SplitModel | SaveStrategy::ShareMesh |
+                                                   SaveStrategy::FullPathSources | SaveStrategy::Silence) >= 0;
+            });
+            // Follow-up as in Plater::save_project(), with the real target path.
+            Slic3r::remove_backup(plater->model(), false);
+            plater->set_project_filename(from_path(target));
+            // Record the origin for backup recovery, as a non-silent export does.
+            try {
+                Slic3r::save_string_file(plater->model().get_backup_path() + "/origin.txt", sw_slicer_path_to_utf8(target));
+            } catch (...) {}
+            plater->up_to_date(true, false);
+            plater->up_to_date(true, true);
+            wxGetApp().update_saved_preset_from_current_preset();
+            plater->reset_project_dirty_after_save();
+            plater->update_title_dirty_status();
+            notes = sswcp_api::notes();
+        }
+        if (new_svg_files)
+            notes.push_back("original SVG files stored in the project with their local paths (dialog skipped)");
+        if (replaces_other)
+            notes.push_back("existing file replaced");
+
+        m_res_data["path"]         = sw_slicer_path_to_utf8(target);
+        m_res_data["project_name"] = into_u8(plater->get_project_name());
+        m_res_data["bytes"]        = static_cast<std::uint64_t>(boost::filesystem::file_size(target));
+        m_res_data["notes"]        = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Project lifecycle: delete --------------------------------------------------
+
+// Delete exactly one of: {object, instance?|volume?}, {objects:[...]}, {scope:'selection'},
+// {scope:'plate', plate?} or {scope:'all'}. Cut objects only with break_cut:true.
+// One undo step "API: Delete..."; a no-op takes no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerDelete()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        const bool has_object  = sw_slicer_has_param(m_param_data, "object");
+        const bool has_objects = sw_slicer_has_param(m_param_data, "objects");
+        const bool has_scope   = sw_slicer_has_param(m_param_data, "scope");
+        if (int(has_object) + int(has_objects) + int(has_scope) != 1)
+            throw std::runtime_error("specify exactly one of: object, objects, scope");
+        const std::string scope = has_scope ? (m_param_data.at("scope").is_string() ? m_param_data.at("scope").get<std::string>() : "?") :
+                                              std::string();
+        if (has_scope && scope != "selection" && scope != "plate" && scope != "all")
+            throw std::runtime_error("scope must be 'selection', 'plate' or 'all'");
+        const bool has_inst = sw_slicer_has_param(m_param_data, "instance");
+        const bool has_vol  = sw_slicer_has_param(m_param_data, "volume");
+        if (!has_object && (has_inst || has_vol))
+            throw std::runtime_error("'instance' and 'volume' can only be used with 'object'");
+        if (sw_slicer_has_param(m_param_data, "plate") && scope != "plate")
+            throw std::runtime_error("'plate' can only be used with scope:'plate'");
+
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        Model&    model = plater->model();
+        const int n     = static_cast<int>(model.objects.size());
+        if (n == 0 && scope != "all")
+            throw std::runtime_error("no model on the plate (load a model first)");
+
+        std::vector<std::string> notes;
+        const SwSlicerModelIds   before = sw_slicer_model_ids();
+        auto reply = [&]() {
+            m_res_data["deleted"] = sw_slicer_deleted_json(before);
+            m_res_data["objects"] = sw_slicer_objects_json();
+            m_res_data["notes"]   = notes;
+            send_to_js();
+            finish_job();
+        };
+
+        if (scope == "all") {
+            if (n == 0) {
+                notes.push_back("there are no objects; nothing changed");
+                reply();
+                return;
+            }
+            {
+                sswcp_api::Scope     api_scope;
+                Plater::TakeSnapshot snapshot(plater, "API: Delete all");
+                plater->delete_all_objects_from_model();
+                notes = sswcp_api::notes();
+            }
+            reply();
+            return;
+        }
+
+        if (scope == "plate") {
+            PartPlateList& plates = plater->get_partplate_list();
+            const int      idx    = sw_slicer_resolve_plate(m_param_data);
+            PartPlate*     plate  = plates.get_plate(idx);
+            // Not PartPlate::get_objects(): that returns all model objects.
+            if (plate->empty()) {
+                notes.push_back("plate " + std::to_string(idx) + " has no objects; nothing changed");
+                reply();
+                return;
+            }
+            if (plate->is_locked())
+                throw std::runtime_error("plate " + std::to_string(idx) + " is locked");
+            // Selection::remove_curr_plate() takes the objects whose first instance is on the plate
+            // (with all their instances, also those on other plates).
+            int first_instances = 0;
+            for (int i = 0; i < n; ++i)
+                if (plate->contain_instance(i, 0)) {
+                    sw_slicer_require_break_cut(model.objects[i], i, m_param_data);
+                    ++first_instances;
+                }
+            if (first_instances == 0) {
+                notes.push_back("plate " + std::to_string(idx) + " has no objects whose first instance is on it; nothing changed");
+                reply();
+                return;
+            }
+            {
+                sswcp_api::Scope     api_scope;
+                Plater::TakeSnapshot snapshot(plater, "API: Delete plate objects");
+                if (plates.get_curr_plate_index() != idx &&
+                    (plater->select_plate(idx) != 0 || plates.get_curr_plate_index() != idx))
+                    throw std::runtime_error("plate " + std::to_string(idx) + " could not be selected");
+                plater->remove_curr_plate_all();
+                notes = sswcp_api::notes();
+            }
+            const json deleted = sw_slicer_deleted_json(before);
+            if (!sw_slicer_deleted_any(deleted))
+                throw std::runtime_error(sw_slicer_join_notes("nothing was deleted", notes));
+            reply();
+            return;
+        }
+
+        // object / objects / selection: through the canvas selection and Plater::remove_selected(),
+        // which works on the selection of the current canvas.
+        if (!plater->is_view3D_shown())
+            throw std::runtime_error("deleting is only possible in the 3D view (open the 3D view first)");
+        GLCanvas3D* canvas = sw_slicer_canvas();
+
+        if (has_object) {
+            const int obj = sw_slicer_resolve_object(m_param_data);
+            if (has_inst && has_vol)
+                throw std::runtime_error("specify instance or volume, not both");
+            const int inst = has_inst ? sw_slicer_get_index(m_param_data, "instance") : -1;
+            const int vol  = has_vol ? sw_slicer_get_index(m_param_data, "volume") : -1;
+            sw_slicer_check_indices(obj, inst, vol);
+            const ModelObject* mo       = model.objects[obj];
+            int                sel_inst = inst;
+            if (vol >= 0) {
+                const ModelVolume* mv = mo->volumes[vol];
+                if (mo->volumes.size() == 1)
+                    throw std::runtime_error("this is the only part of the object; delete the object instead");
+                // Checked up front: ObjectList::del_subobject_from_object() would show a dialog.
+                if (mv->is_model_part() && sw_slicer_count_model_parts(mo) == 1)
+                    throw std::runtime_error("deleting the last solid part is not allowed");
+                if (mo->is_cut() && (mv->is_model_part() || mv->is_negative_volume()))
+                    throw std::runtime_error("parts of a cut object cannot be deleted through the API");
+            } else {
+                if (inst >= 0 && mo->instances.size() == 1) {
+                    notes.push_back("last instance: the whole object was deleted");
+                    sel_inst = -1;
+                }
+                if (sel_inst < 0)
+                    sw_slicer_require_break_cut(mo, obj, m_param_data);
+            }
+            sw_slicer_select(obj, sel_inst, vol);
+        } else if (has_objects) {
+            const json& arr = m_param_data.at("objects");
+            if (!arr.is_array() || arr.empty())
+                throw std::runtime_error("'objects' must be a non-empty list of object indices");
+            std::vector<int> objs;
+            for (const json& j : arr) {
+                if (!j.is_number_integer() || j.get<long long>() < 0 || j.get<long long>() >= n)
+                    throw std::runtime_error("object index " + j.dump() + " in 'objects' does not exist (there are " +
+                                             std::to_string(n) + " objects, 0-based)");
+                const int obj = j.get<int>();
+                if (std::find(objs.begin(), objs.end(), obj) != objs.end())
+                    throw std::runtime_error("object index " + std::to_string(obj) + " appears twice in 'objects'");
+                objs.push_back(obj);
+            }
+            for (int obj : objs)
+                sw_slicer_require_break_cut(model.objects[obj], obj, m_param_data);
+            Selection& s = canvas->get_selection();
+            s.clear();
+            for (size_t i = 0; i < objs.size(); ++i)
+                s.add_object(static_cast<unsigned int>(objs[i]), i == 0);
+            wxGetApp().obj_list()->update_selections();
+            canvas->update_gizmos_on_off_state();
+            canvas->set_as_dirty();
+        } else {
+            // scope "selection": what the user selected.
+            const Selection& s = canvas->get_selection();
+            if (s.is_empty())
+                throw std::runtime_error("nothing is selected");
+            std::map<int, std::set<int>> volumes_by_object;
+            for (unsigned int idx : s.get_volume_idxs()) {
+                const GLVolume* v = s.get_volume(idx);
+                if (v == nullptr)
+                    continue;
+                // The wipe tower has object_idx >= 1000.
+                if (v->object_idx() >= 1000)
+                    throw std::runtime_error("the wipe tower cannot be deleted");
+                if (v->object_idx() >= 0 && v->object_idx() < n && v->volume_idx() >= 0)
+                    volumes_by_object[v->object_idx()].insert(v->volume_idx());
+            }
+            if (s.is_wipe_tower())
+                throw std::runtime_error("the wipe tower cannot be deleted");
+            if (s.is_instance_mode()) {
+                // Whole instances: the cut rule applies to every fully selected object.
+                for (const auto& content : s.get_content()) {
+                    const int obj = content.first;
+                    if (obj >= 0 && obj < n && content.second.size() == model.objects[obj]->instances.size())
+                        sw_slicer_require_break_cut(model.objects[obj], obj, m_param_data);
+                }
+            } else {
+                // Single parts: the same up-front checks as for {object, volume}.
+                for (const auto& ov : volumes_by_object) {
+                    const ModelObject* mo     = model.objects[ov.first];
+                    int                solids = 0;
+                    for (int vol : ov.second) {
+                        const ModelVolume* mv = mo->volumes[vol];
+                        if (mo->is_cut() && (mv->is_model_part() || mv->is_negative_volume()))
+                            throw std::runtime_error("parts of a cut object cannot be deleted through the API");
+                        if (mv->is_model_part())
+                            ++solids;
+                    }
+                    if (solids > 0 && solids >= sw_slicer_count_model_parts(mo))
+                        throw std::runtime_error("the selection contains all solid parts of object " + std::to_string(ov.first) +
+                                                 "; delete the object instead");
+                }
+            }
+        }
+
+        // Refuse without a snapshot if the app would not delete anything.
+        if (!plater->can_delete())
+            throw std::runtime_error("nothing to delete in the selection");
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Delete");
+            plater->remove_selected();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        const json deleted = sw_slicer_deleted_json(before);
+        if (!sw_slicer_deleted_any(deleted))
+            throw std::runtime_error(sw_slicer_join_notes("nothing was deleted", notes));
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Delete a plate (default: the current one). A plate with objects requires objects:'delete'
+// (delete them too) or 'keep' (the app moves them to the last plate or off the plates).
+// One undo step "API: Delete plate".
+void SSWCP_SliceProject_Instance::sw_SlicerDeletePlate()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        PartPlateList& plates = plater->get_partplate_list();
+        const int      idx    = sw_slicer_resolve_plate(m_param_data);
+        if (!plater->can_delete_plate())
+            throw std::runtime_error("the last plate cannot be deleted");
+        PartPlate* plate = plates.get_plate(idx);
+        if (plate->is_locked())
+            throw std::runtime_error("plate " + std::to_string(idx) + " is locked");
+        std::string objects_choice;
+        if (sw_slicer_has_param(m_param_data, "objects")) {
+            const json& j  = m_param_data.at("objects");
+            objects_choice = j.is_string() ? j.get<std::string>() : std::string("?");
+            if (objects_choice != "delete" && objects_choice != "keep")
+                throw std::runtime_error("objects must be 'delete' or 'keep'");
+        }
+
+        Model&     model     = plater->model();
+        const int  n         = static_cast<int>(model.objects.size());
+        const bool has_items = !plate->empty();
+        if (has_items) {
+            int count = 0;
+            for (int i = 0; i < n; ++i) {
+                const int n_inst = static_cast<int>(model.objects[i]->instances.size());
+                for (int j = 0; j < n_inst; ++j)
+                    if (plate->contain_instance(i, j)) {
+                        ++count;
+                        break;
+                    }
+            }
+            if (objects_choice.empty())
+                throw std::runtime_error("plate " + std::to_string(idx) + " contains " + std::to_string(count) +
+                                         " object(s); pass objects:'delete' (delete them too) or 'keep' (they are moved off the plate)");
+            if (objects_choice == "delete")
+                for (int i = 0; i < n; ++i)
+                    if (plate->contain_instance(i, 0))
+                        sw_slicer_require_break_cut(model.objects[i], i, m_param_data);
+        }
+
+        std::vector<std::string> notes;
+        int                      ret        = -1;
+        bool                     moved_rest = false;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Delete plate");
+            if (has_items && objects_choice == "delete") {
+                if (plates.get_curr_plate_index() != idx &&
+                    (plater->select_plate(idx) != 0 || plates.get_curr_plate_index() != idx))
+                    throw std::runtime_error("plate " + std::to_string(idx) + " could not be selected");
+                plater->remove_curr_plate_all();
+                // Instances of objects whose first instance is on another plate stay; delete_plate()
+                // moves them like with 'keep'.
+                if (!plates.get_plate(idx)->empty())
+                    moved_rest = true;
+            }
+            // Defensive: no stale (possibly undo-restored) selection, and if the plate being deleted
+            // is the current one, switch to another plate first through the full
+            // Plater::select_plate() path. For idx == 0 PartPlateList::delete_plate() still lowers
+            // the current index internally, but that index then refers to the same plate.
+            plater->deselect_all();
+            wxGetApp().obj_list()->update_selections();
+            if (plates.get_curr_plate_index() == idx) {
+                const int other = (idx > 0) ? idx - 1 : 1;
+                if (plater->select_plate(other) != 0 || plates.get_curr_plate_index() != other)
+                    throw std::runtime_error("could not switch away from plate " + std::to_string(idx) +
+                                             (has_items && objects_choice == "delete" ?
+                                                  "; its objects were already deleted (use Undo)" :
+                                                  ""));
+            }
+            ret   = plater->delete_plate(idx);
+            notes = sswcp_api::notes();
+        }
+        if (ret != 0)
+            throw std::runtime_error(sw_slicer_join_notes("the plate could not be deleted", notes));
+        if (has_items && objects_choice == "keep")
+            notes.push_back("objects of the deleted plate were moved to the last plate or off the plates");
+        if (moved_rest)
+            notes.push_back("instances of objects whose first instance is on another plate were moved to the last plate or off the plates, not deleted");
+
+        m_res_data["deleted_plate"] = idx;
+        m_res_data["plate_count"]   = plates.get_plate_count();
+        m_res_data["current_plate"] = plates.get_curr_plate_index();
+        m_res_data["objects"]       = sw_slicer_objects_json();
+        m_res_data["notes"]         = notes;
         send_to_js();
         finish_job();
     } catch (std::exception& e) {

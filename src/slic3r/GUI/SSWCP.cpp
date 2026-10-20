@@ -4646,6 +4646,18 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerAssemble();
     } else if (m_cmd == "sw_SlicerResetMeasurement") {
         sw_SlicerResetMeasurement();
+    } else if (m_cmd == "sw_SlicerGetProjectState") {
+        sw_SlicerGetProjectState();
+    } else if (m_cmd == "sw_SlicerDelete") {
+        sw_SlicerDelete();
+    } else if (m_cmd == "sw_SlicerDeletePlate") {
+        sw_SlicerDeletePlate();
+    } else if (m_cmd == "sw_SlicerNewProject") {
+        sw_SlicerNewProject();
+    } else if (m_cmd == "sw_SlicerOpenProject") {
+        sw_SlicerOpenProject();
+    } else if (m_cmd == "sw_SlicerSaveProject") {
+        sw_SlicerSaveProject();
     } else {
         handle_general_fail();
     }
@@ -7950,6 +7962,9 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_SlicerPaint",
     "sw_SlicerAddText", "sw_SlicerEditText", "sw_SlicerMeshBoolean",
     "sw_SlicerGetMeasurement", "sw_SlicerAssemble", "sw_SlicerResetMeasurement",
+    // Project lifecycle
+    "sw_SlicerGetProjectState", "sw_SlicerDelete", "sw_SlicerDeletePlate",
+    "sw_SlicerNewProject", "sw_SlicerOpenProject", "sw_SlicerSaveProject",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.

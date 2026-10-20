@@ -15,6 +15,7 @@
 #include "slic3r/GUI/WebPresetDialog.hpp"
 
 #include "slic3r/GUI/SSWCP.hpp"
+#include "slic3r/GUI/SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
 #include "slic3r/GUI/DownloadManager.hpp"
 #include "slic3r/Utils/PresetUpdater.hpp"
 #include "slic3r/Config/Version.hpp"
@@ -6674,6 +6675,11 @@ std::vector<std::pair<unsigned int, std::string>> GUI_App::get_selected_presets(
 bool GUI_App::check_and_save_current_preset_changes(const wxString& caption, const wxString& header, bool remember_choice/* = true*/, bool dont_save_insted_of_discard/* = false*/)
 {
     if (has_current_preset_changes()) {
+        // API mode: no dialog. The sw_Slicer* caller has already discarded or kept the preset edits.
+        if (sswcp_api::active()) {
+            sswcp_api::note("preset changes not saved (dialog skipped)");
+            return true;
+        }
         int act_buttons = ActionButtons::SAVE;
         if (dont_save_insted_of_discard)
             act_buttons |= ActionButtons::DONT_SAVE;
@@ -6726,6 +6732,11 @@ void GUI_App::apply_keeped_preset_modifications()
 bool GUI_App::check_and_keep_current_preset_changes(const wxString& caption, const wxString& header, int action_buttons, bool* postponed_apply_of_keeped_changes/* = nullptr*/)
 {
     if (has_current_preset_changes()) {
+        // API mode: no dialog. The sw_Slicer* caller has already discarded or kept the preset edits.
+        if (sswcp_api::active()) {
+            sswcp_api::note("preset changes kept (dialog skipped)");
+            return true;
+        }
         bool is_called_from_configwizard = postponed_apply_of_keeped_changes != nullptr;
 
         UnsavedChangesDialog dlg(caption, header, "", action_buttons);
