@@ -25,6 +25,7 @@
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/format.hpp"
+#include "slic3r/GUI/WebPreprintDialog.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "slic3r/Utils/WxFontUtils.hpp"
 #include "slic3r/Utils/PrintHost.hpp"
@@ -68,6 +69,14 @@
 #include <boost/log/trivial.hpp>
 #include <wx/font.h>
 #include <wx/fontenum.h>
+#include <wx/weakref.h>
+#ifdef _WIN32
+// SetForegroundWindow() for the send dialog of a cloud-connected printer.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace nlohmann;
 
@@ -4524,6 +4533,62 @@ static std::string sw_slicer_printer_model_name()
     return name;
 }
 
+// Cloud (WAN) connection: hand the upload to the app's own send dialog, as Plater::send_gcode_legacy()
+// does for the U1 (WebPreprintDialog), but always on the "send only" page (preSend, path=5) and without
+// the PrintHostSendDialog (the API supplies the file name). The Flutter page uploads through the cloud
+// and the user confirms there; this code never starts a print. Like the GUI, the dialog works on the
+// current plate and sends that plate's G-code file (PartPlate::get_tmp_gcode_path()), so plate n is
+// selected first. The dialog is modal: it is opened with CallAfter, after the API reply has been sent.
+static void sw_slicer_send_via_app_dialog(int n, const std::string& filename, std::vector<std::string>& notes)
+{
+    MainFrame* frame = wxGetApp().mainframe;
+    if (frame == nullptr)
+        throw std::runtime_error("the main window is not available");
+    if (wxGetApp().get_web_preprint_dialog() != nullptr)
+        throw std::runtime_error("the app's send dialog is already open");
+    sw_slicer_select_plate(n);
+    const std::string         gcode_path = wxGetApp().plater()->get_partplate_list().get_plate(n)->get_tmp_gcode_path();
+    boost::system::error_code ec;
+    if (!boost::filesystem::is_regular_file(boost::filesystem::path(gcode_path), ec))
+        throw std::runtime_error("the G-code of plate " + std::to_string(n) + " was not found; slice it again");
+
+    // The Flutter page only works while the app is the active application: bring it to the front.
+    if (frame->IsIconized())
+        frame->Iconize(false);
+    frame->Show(true);
+    frame->Raise();
+    bool in_front = true;
+#ifdef _WIN32
+    // Windows may refuse this while another application owns the foreground.
+    const HWND hwnd = static_cast<HWND>(frame->GetHandle());
+    ::SetForegroundWindow(hwnd);
+    in_front = ::GetForegroundWindow() == hwnd;
+#endif
+    if (!in_front) {
+        frame->RequestUserAttention();
+        notes.push_back("the app could not bring itself to the front; click the app window so that the send dialog works");
+    }
+    notes.push_back("the printer is connected through the cloud; the app's send dialog was opened - confirm the upload there");
+
+    const bool switch_to_device = wxGetApp().app_config->get_bool("open_device_tab_post_upload");
+    // Queued on the main frame: if the frame is destroyed first, the call is dropped with it.
+    wxWeakRef<MainFrame> weak_frame(frame);
+    frame->CallAfter([weak_frame, gcode_path, filename, switch_to_device]() {
+        if (!weak_frame || wxGetApp().get_web_preprint_dialog() != nullptr)
+            return;
+        WebPreprintDialog* dialog = new WebPreprintDialog();
+        dialog->set_swtich_to_device(switch_to_device);
+        // "Send only" page: upload, never print (Plater::send_gcode_legacy() with post action None).
+        dialog->set_send_page(true);
+        dialog->set_gcode_file_name(gcode_path);
+        dialog->set_display_file_name(filename);
+        dialog->run();
+        if (dialog->is_finish() && weak_frame)
+            weak_frame->select_tab(MainFrame::TabPosition::tpMonitor);
+        delete dialog;
+    });
+}
+
 // Upload the G-code of a sliced plate to the connected printer. Upload only: this command never
 // starts a print. Requires confirm_upload:true; any other parameter than plate, filename and
 // confirm_upload is refused. The upload runs on its own thread; poll sw_SlicerGetStatus -> upload.
@@ -4565,24 +4630,34 @@ void SSWCP_SliceProject_Instance::sw_SlicerSendToPrinter()
         PartPlate* plate = plater->get_partplate_list().get_plate(n);
         sw_slicer_require_plate_ready(n);
 
-        // 4. Printer: only Moonraker hosts. Their upload() shows no dialog for an IP address; for a
-        // ".local" host name it can show an address choice dialog, which must not run on this thread.
+        // 4. Printer. The connected device tells whether the printer is reached over the LAN or
+        // through the cloud (link_mode "wan").
+        std::string connected_model;
+        std::string connected_link_mode;
+        for (const DeviceInfo& device : wxGetApp().app_config->get_devices())
+            if (device.connected) {
+                connected_model     = device.preset_name;
+                connected_link_mode = device.link_mode;
+            }
+        // A cloud (WAN) connection has the cloud broker as its host, not the printer: never upload to
+        // it. The app's own send dialog (Flutter page) handles the cloud upload instead.
+        const bool                 wan = connected_link_mode == "wan";
         std::shared_ptr<PrintHost> host;
-        wxGetApp().get_connect_host(host);
-        if (!host)
-            throw std::runtime_error("no printer is connected");
-        // Moonraker and Moonraker_Mqtt (the Snapmaker connection) both report "Moonraker".
-        if (std::string(host->get_name()) != "Moonraker")
-            throw std::runtime_error(std::string("uploading is not supported for this printer connection (") + host->get_name() + ")");
-        if (boost::algorithm::icontains(host->get_host(), ".local"))
-            throw std::runtime_error("uploading is only supported for a printer connected by IP address");
+        if (!wan) {
+            // LAN: only Moonraker hosts. Their upload() shows no dialog for an IP address; for a
+            // ".local" host name it can show an address choice dialog, which must not run on this thread.
+            wxGetApp().get_connect_host(host);
+            if (!host)
+                throw std::runtime_error("no printer is connected");
+            // Moonraker and Moonraker_Mqtt (the Snapmaker connection) both report "Moonraker".
+            if (std::string(host->get_name()) != "Moonraker")
+                throw std::runtime_error(std::string("uploading is not supported for this printer connection (") + host->get_name() + ")");
+            if (boost::algorithm::icontains(host->get_host(), ".local"))
+                throw std::runtime_error("uploading is only supported for a printer connected by IP address");
+        }
 
         std::vector<std::string> notes;
         // Same check as Plater::send_gcode_legacy(): the G-code must be made for the connected printer model.
-        std::string connected_model;
-        for (const DeviceInfo& device : wxGetApp().app_config->get_devices())
-            if (device.connected)
-                connected_model = device.preset_name;
         connected_model.erase(std::remove(connected_model.begin(), connected_model.end(), '('), connected_model.end());
         connected_model.erase(std::remove(connected_model.begin(), connected_model.end(), ')'), connected_model.end());
         const std::string current_model = sw_slicer_printer_model_name();
@@ -4609,6 +4684,18 @@ void SSWCP_SliceProject_Instance::sw_SlicerSendToPrinter()
             filename = boost::filesystem::path(Slic3r::fold_utf8_to_ascii(proposed)).filename().string();
             if (!sw_slicer_valid_upload_name(filename))
                 throw std::runtime_error("the proposed file name '" + filename + "' is not usable; pass 'filename'");
+        }
+
+        if (wan) {
+            // No upload by the API: the upload state is left unchanged.
+            sw_slicer_send_via_app_dialog(n, filename, notes);
+            m_res_data["mode"]     = "app_dialog";
+            m_res_data["filename"] = filename;
+            m_res_data["plate"]    = n;
+            m_res_data["notes"]    = notes;
+            send_to_js();
+            finish_job();
+            return;
         }
 
         // 6. Source: the plate's G-code, copied first so that a later reslice cannot change the
@@ -4721,6 +4808,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerSendToPrinter()
                 notes.push_back("post-processing scripts are not run for the upload (the plate's G-code is sent as sliced, like the app's own U1 upload)");
         }
         notes.push_back("a file with the same name on the printer is replaced");
+        m_res_data["mode"]     = "upload";
         m_res_data["started"]  = true;
         m_res_data["id"]       = id;
         m_res_data["filename"] = filename;
