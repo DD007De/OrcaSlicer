@@ -4658,6 +4658,14 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerOpenProject();
     } else if (m_cmd == "sw_SlicerSaveProject") {
         sw_SlicerSaveProject();
+    } else if (m_cmd == "sw_SlicerSliceAll") {
+        sw_SlicerSliceAll();
+    } else if (m_cmd == "sw_SlicerExportGcode") {
+        sw_SlicerExportGcode();
+    } else if (m_cmd == "sw_SlicerExportSliced") {
+        sw_SlicerExportSliced();
+    } else if (m_cmd == "sw_SlicerSendToPrinter") {
+        sw_SlicerSendToPrinter();
     } else {
         handle_general_fail();
     }
@@ -7965,6 +7973,8 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     // Project lifecycle
     "sw_SlicerGetProjectState", "sw_SlicerDelete", "sw_SlicerDeletePlate",
     "sw_SlicerNewProject", "sw_SlicerOpenProject", "sw_SlicerSaveProject",
+    // Slice all, export, upload
+    "sw_SlicerSliceAll", "sw_SlicerExportGcode", "sw_SlicerExportSliced", "sw_SlicerSendToPrinter",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.

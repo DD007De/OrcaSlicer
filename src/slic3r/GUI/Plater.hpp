@@ -494,6 +494,15 @@ public:
     void send_to_printer(bool isall = false);
     void export_gcode(bool prefer_removable);
     void export_gcode_3mf(bool export_all = false);
+    // Slice all plates, like the "Slice all" button (without switching to the preview when 'silent').
+    // Returns false if slicing all plates could not be started.
+    bool slice_all_plates(bool silent);
+    // True while a "slice all" run is still working through the plates.
+    bool is_slicing_all() const;
+    // Export the G-code of the current plate to 'path' without a file dialog. The export runs
+    // asynchronously in the background process (poll is_export_gcode_scheduled()). Returns false
+    // if no export was scheduled.
+    bool export_gcode_to(const boost::filesystem::path& path);
     void send_gcode_finish(wxString name);
     void export_core_3mf();
     static TriangleMesh combine_mesh_fff(const ModelObject& mo, int instance_id, std::function<void(const std::string&)> notify_func = {});

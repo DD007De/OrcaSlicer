@@ -22,8 +22,13 @@
 #include "slic3r/GUI/Jobs/Job.hpp"
 #include "slic3r/GUI/Jobs/Worker.hpp"
 #include "slic3r/GUI/SSWCPApiMode.hpp"
+#include "slic3r/GUI/NotificationManager.hpp"
+#include "slic3r/GUI/I18N.hpp"
+#include "slic3r/GUI/format.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "slic3r/Utils/WxFontUtils.hpp"
+#include "slic3r/Utils/PrintHost.hpp"
+#include "slic3r/Utils/ASCIIFolding.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
@@ -50,10 +55,13 @@
 #include <initializer_list>
 #include <iomanip>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem/operations.hpp>
@@ -83,7 +91,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 6;
+        m_res_data["phase"]    = 7;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -188,8 +196,14 @@ void SSWCP_SliceProject_Instance::sw_SlicerSlice()
     }
 }
 
+// Defined with sw_SlicerSendToPrinter: the state of the last upload, or null if there was none,
+// and the one-time result notification of a finished upload (shown here, on the GUI thread).
+static json sw_slicer_upload_status_json();
+static void sw_slicer_upload_notify();
+
 // Poll status: whether a slice is running, a rough progress (0/100, -1 = invalid),
-// and whether the slice result is valid.
+// and whether the slice result is valid. Also whether a G-code export or a "slice all" run is
+// in progress, the last upload to the printer (upload, if any) and with all:true every plate.
 void SSWCP_SliceProject_Instance::sw_SlicerGetStatus()
 {
     try {
@@ -198,6 +212,29 @@ void SSWCP_SliceProject_Instance::sw_SlicerGetStatus()
         m_res_data["slicing"] = plater->is_background_process_slicing();
         m_res_data["percent"] = (plate != nullptr) ? static_cast<int>(plate->get_slicing_percent()) : 0;
         m_res_data["valid"]   = (plate != nullptr) ? plate->is_slice_result_valid() : false;
+        m_res_data["exporting"]   = plater->is_export_gcode_scheduled();
+        m_res_data["slicing_all"] = plater->is_slicing_all();
+        const bool all = m_param_data.count("all") && m_param_data.at("all").is_boolean() && m_param_data.at("all").get<bool>();
+        if (all) {
+            PartPlateList& plates = plater->get_partplate_list();
+            json           list   = json::array();
+            for (int i = 0; i < plates.get_plate_count(); ++i) {
+                PartPlate* p = plates.get_plate(i);
+                json       e;
+                e["plate"]   = i;
+                e["empty"]   = p->empty();
+                e["valid"]   = p->is_slice_result_valid();
+                e["ready"]   = p->is_slice_result_ready_for_print();
+                e["percent"] = static_cast<int>(p->get_slicing_percent());
+                list.push_back(e);
+            }
+            m_res_data["plates"]    = list;
+            m_res_data["all_ready"] = plates.is_all_slice_results_ready_for_print();
+        }
+        const json upload = sw_slicer_upload_status_json();
+        if (!upload.is_null())
+            m_res_data["upload"] = upload;
+        sw_slicer_upload_notify();
         send_to_js();
         finish_job();
     } catch (std::exception& e) {
@@ -4174,6 +4211,521 @@ void SSWCP_SliceProject_Instance::sw_SlicerDeletePlate()
         m_res_data["current_plate"] = plates.get_curr_plate_index();
         m_res_data["objects"]       = sw_slicer_objects_json();
         m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Slicing all plates, exporting and uploading ----------------------------------
+// Exporting and uploading change no model data: no undo step.
+
+// Slice all plates, like the "Slice all" button. Returns immediately; poll sw_SlicerGetStatus
+// (slicing_all, slicing, and with all:true the state of every plate).
+void SSWCP_SliceProject_Instance::sw_SlicerSliceAll()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_no_export();
+        if (plater->model().objects.empty())
+            throw std::runtime_error("no model on the plate (load a model first)");
+
+        PartPlateList& plates    = plater->get_partplate_list();
+        json           sliceable = json::array();
+        for (int i = 0; i < plates.get_plate_count(); ++i)
+            if (plater->is_plate_sliceable(i))
+                sliceable.push_back(i);
+        if (sliceable.empty())
+            throw std::runtime_error("no plate can be sliced (empty, or blocked by a filament check)");
+
+        std::vector<std::string> notes;
+        bool                     ok = false;
+        {
+            sswcp_api::Scope api_scope;
+            // Not silent: the preview is shown, as with the button.
+            ok    = plater->slice_all_plates(/*silent=*/false);
+            notes = sswcp_api::notes();
+        }
+        if (!ok)
+            throw std::runtime_error(sw_slicer_join_notes("slicing all plates could not be started", notes));
+        if (!plater->is_slicing_all())
+            notes.push_back("no slicing started; the slice results may already be up to date (check sw_SlicerGetStatus with all:true)");
+
+        m_res_data["started"] = true;
+        m_res_data["plates"]  = sliceable;
+        m_res_data["notes"]   = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Guards shared by the export and upload commands.
+static void sw_slicer_require_export_possible()
+{
+    sw_slicer_require_free_gizmo();
+    sw_slicer_require_idle();
+    sw_slicer_require_not_slicing();
+    if (wxGetApp().plater()->is_export_gcode_scheduled())
+        throw std::runtime_error("another export is still running");
+    if (wxGetApp().plater()->model().objects.empty())
+        throw std::runtime_error("no model on the plate (load a model first)");
+}
+
+// The plate must have a slice result that can be printed (same check as MainFrame::can_export_gcode()).
+static void sw_slicer_require_plate_ready(int n)
+{
+    if (!wxGetApp().plater()->get_partplate_list().get_plate(n)->is_slice_result_ready_for_print())
+        throw std::runtime_error("plate " + std::to_string(n) + " has no valid slice result; slice it first (sw_SlicerSlice / sw_SlicerSliceAll)");
+}
+
+// Make plate n the current plate (the app exports the current plate). The selection stays visible.
+static void sw_slicer_select_plate(int n)
+{
+    Plater*        plater = wxGetApp().plater();
+    PartPlateList& plates = plater->get_partplate_list();
+    if (plates.get_curr_plate_index() != n && (plater->select_plate(n) != 0 || plates.get_curr_plate_index() != n))
+        throw std::runtime_error("plate " + std::to_string(n) + " could not be selected");
+}
+
+// Export the G-code of a sliced plate to 'path' (.gcode) without a dialog. The export runs in the
+// background; poll sw_SlicerGetStatus until 'exporting' is false. An existing file is only replaced
+// with overwrite:true.
+void SSWCP_SliceProject_Instance::sw_SlicerExportGcode()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_export_possible();
+        const boost::filesystem::path target = sw_slicer_output_path(m_param_data, "path", {".gcode"});
+        // The app passes the file name through the placeholder parser (PrintStatistics::finalize_output_path),
+        // so the file actually written could differ from 'path'.
+        const std::string stem = sw_slicer_path_to_utf8(target.stem());
+        if (stem.find_first_of("{}[]") != std::string::npos)
+            throw std::runtime_error("the file name must not contain { } [ or ] (the app treats them as placeholders)");
+        sw_slicer_require_overwrite_allowed(target, m_param_data);
+        boost::system::error_code ec;
+        const bool                replaces = boost::filesystem::exists(target, ec);
+        const int                 n        = sw_slicer_resolve_plate(m_param_data);
+        sw_slicer_require_plate_ready(n);
+
+        std::vector<std::string> notes;
+        bool                     started = false;
+        {
+            sswcp_api::Scope api_scope;
+            sw_slicer_select_plate(n);
+            // The app writes the file itself, in the background (BackgroundSlicingProcess), to a
+            // temporary file next to the target that replaces the target only after a successful export.
+            started = plater->export_gcode_to(target);
+            notes   = sswcp_api::notes();
+        }
+        if (!started)
+            throw std::runtime_error(sw_slicer_join_notes("the export could not be started", notes));
+        if (replaces)
+            notes.push_back("existing file is replaced when the export has finished");
+
+        m_res_data["started"] = true;
+        m_res_data["path"]    = sw_slicer_path_to_utf8(target);
+        m_res_data["plate"]   = n;
+        m_res_data["notes"]   = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Export a sliced file (.gcode.3mf: G-code plus project data) of one plate (scope 'plate', default
+// the current plate) or of all plates (scope 'all'). Synchronous; written through a temporary file.
+// The project file name and the unsaved-changes state do not change.
+void SSWCP_SliceProject_Instance::sw_SlicerExportSliced()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        std::string scope = "plate";
+        if (sw_slicer_has_param(m_param_data, "scope")) {
+            const json& j = m_param_data.at("scope");
+            scope         = j.is_string() ? j.get<std::string>() : std::string("?");
+        }
+        if (scope != "plate" && scope != "all")
+            throw std::runtime_error("scope must be 'plate' or 'all'");
+        if (scope == "all" && sw_slicer_has_param(m_param_data, "plate"))
+            throw std::runtime_error("'plate' can only be used with scope:'plate'");
+        sw_slicer_require_export_possible();
+        const boost::filesystem::path target = sw_slicer_output_path(m_param_data, "path", {".3mf"});
+        sw_slicer_require_overwrite_allowed(target, m_param_data);
+        boost::system::error_code ec;
+        const bool                replaces = boost::filesystem::exists(target, ec);
+
+        PartPlateList& plates   = plater->get_partplate_list();
+        int            n        = -1;
+        json           exported = json::array();
+        if (scope == "plate") {
+            n = sw_slicer_resolve_plate(m_param_data);
+            sw_slicer_require_plate_ready(n);
+            exported.push_back(n);
+        } else {
+            if (!plates.is_all_slice_results_ready_for_print())
+                throw std::runtime_error("not all plates have a valid slice result; slice them first (sw_SlicerSliceAll)");
+            for (int i = 0; i < plates.get_plate_count(); ++i)
+                if (plates.get_plate(i)->is_slice_result_ready_for_print())
+                    exported.push_back(i);
+        }
+        const bool new_svg_files = sw_slicer_has_new_svg_files(plater->model());
+
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope api_scope;
+            // Like the GUI, export the current plate: export_3mf() stores the first-layer data of the
+            // current plate.
+            if (scope == "plate")
+                sw_slicer_select_plate(n);
+            const int idx = (scope == "all") ? PLATE_ALL_IDX : n;
+            sw_slicer_write_via_temp(target, [plater, idx](const boost::filesystem::path& tmp) {
+                // Same strategy as Plater::export_gcode_3mf(). With Silence, export_3mf() does not
+                // record the file as project file and skips the SVG question.
+                return plater->export_3mf(tmp, SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode |
+                                                   SaveStrategy::SkipModel, idx) >= 0;
+            });
+            notes = sswcp_api::notes();
+        }
+        if (!boost::algorithm::iends_with(m_param_data.at("path").get<std::string>(), ".gcode.3mf"))
+            notes.push_back("a sliced file is usually named *.gcode.3mf");
+        if (new_svg_files)
+            notes.push_back("original SVG files stored with their local paths (dialog skipped)");
+        if (replaces)
+            notes.push_back("existing file replaced");
+
+        m_res_data["path"]   = sw_slicer_path_to_utf8(target);
+        m_res_data["bytes"]  = static_cast<std::uint64_t>(boost::filesystem::file_size(target));
+        m_res_data["plates"] = exported;
+        m_res_data["notes"]  = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// An upload without any progress for this long is cancelled (the transfer callback keeps running
+// while curl waits, so a hanging connection is noticed).
+static constexpr std::chrono::seconds SW_SLICER_UPLOAD_STALL_TIMEOUT{180};
+// An upload whose thread shows no sign of life for this long no longer blocks a new upload.
+static constexpr std::chrono::seconds SW_SLICER_UPLOAD_ABANDON_TIMEOUT{300};
+
+// State of the last upload to the printer, shared with the upload thread. The thread holds its own
+// reference, so the state outlives the static owner at shutdown. The thread only writes to the
+// state while 'id' is still its own upload id.
+namespace {
+struct SwSlicerUploadState
+{
+    std::mutex  mutex;
+    int         id = 0;
+    std::string state = "idle"; // idle | uploading | done | failed
+    int         progress = 0;   // 0..100
+    std::string filename;
+    std::string error;
+    // The result notification is shown by sw_SlicerGetStatus on the GUI thread, never by the thread.
+    bool        notified = true;
+    // Stall detection.
+    size_t                                last_ulnow   = 0;
+    size_t                                last_ultotal = 0;
+    std::chrono::steady_clock::time_point last_activity;
+    bool                                  stalled = false;
+};
+} // namespace
+
+static const std::shared_ptr<SwSlicerUploadState>& sw_slicer_upload_state()
+{
+    static const std::shared_ptr<SwSlicerUploadState> state = std::make_shared<SwSlicerUploadState>();
+    return state;
+}
+
+static json sw_slicer_upload_status_json()
+{
+    const std::shared_ptr<SwSlicerUploadState>& s = sw_slicer_upload_state();
+    std::lock_guard<std::mutex>                 lock(s->mutex);
+    if (s->state == "idle")
+        return json();
+    json j;
+    j["id"]       = s->id;
+    j["state"]    = s->state;
+    j["progress"] = s->progress;
+    j["filename"] = s->filename;
+    j["error"]    = s->error;
+    return j;
+}
+
+// Called from sw_SlicerGetStatus (GUI thread, the Plater is alive): show the result notification of
+// a finished upload once.
+static void sw_slicer_upload_notify()
+{
+    const std::shared_ptr<SwSlicerUploadState>& s = sw_slicer_upload_state();
+    bool                                        ok = false;
+    std::string                                 filename, error;
+    {
+        std::lock_guard<std::mutex> lock(s->mutex);
+        if (s->notified || (s->state != "done" && s->state != "failed"))
+            return;
+        s->notified = true;
+        ok          = s->state == "done";
+        filename    = s->filename;
+        error       = s->error;
+    }
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+    if (ok)
+        plater->send_gcode_finish(wxString::FromUTF8(filename));
+    else
+        plater->get_notification_manager()->push_notification(NotificationType::CustomNotification,
+                                                              NotificationManager::NotificationLevel::ErrorNotificationLevel,
+                                                              GUI::format(_L("Uploading %1% to the printer failed: %2%"), filename, error));
+}
+
+// Upload file name: a plain name ending in .gcode (no folder, no "..").
+static bool sw_slicer_valid_upload_name(const std::string& name)
+{
+    return boost::algorithm::iends_with(name, ".gcode") && name.size() > std::string(".gcode").size() &&
+           name.find_first_of("/\\") == std::string::npos && name.find("..") == std::string::npos &&
+           !Plater::has_illegal_filename_characters(name);
+}
+
+// Base name of a printer preset as the app compares it with the connected printer
+// (same rule as Plater::send_gcode_legacy(): system preset or its base, without parentheses).
+static std::string sw_slicer_printer_model_name()
+{
+    PresetCollection& printers = wxGetApp().preset_bundle->printers;
+    const Preset&     current  = printers.get_edited_preset();
+    std::string       name;
+    if (current.is_system) {
+        name = current.name;
+    } else if (const Preset* base = printers.get_preset_base(current)) {
+        name = base->name;
+    }
+    name.erase(std::remove(name.begin(), name.end(), '('), name.end());
+    name.erase(std::remove(name.begin(), name.end(), ')'), name.end());
+    return name;
+}
+
+// Upload the G-code of a sliced plate to the connected printer. Upload only: this command never
+// starts a print. Requires confirm_upload:true; any other parameter than plate, filename and
+// confirm_upload is refused. The upload runs on its own thread; poll sw_SlicerGetStatus -> upload.
+void SSWCP_SliceProject_Instance::sw_SlicerSendToPrinter()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        // 1. Confirmation and parameters first, before any other check.
+        if (!sw_slicer_flag_true(m_param_data, "confirm_upload"))
+            throw std::runtime_error("uploading to the printer requires confirm_upload:true");
+        for (auto it = m_param_data.begin(); it != m_param_data.end(); ++it)
+            if (it.key() != "plate" && it.key() != "filename" && it.key() != "confirm_upload")
+                throw std::runtime_error("unknown parameter '" + it.key() + "'; this command only uploads, it never starts a print");
+
+        // 2. Guards.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        if (plater->model().objects.empty())
+            throw std::runtime_error("no model on the plate (load a model first)");
+        const std::shared_ptr<SwSlicerUploadState>& state     = sw_slicer_upload_state();
+        bool                                        abandoned = false;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->state == "uploading") {
+                // Normally a stalled upload cancels itself; this covers a thread that hangs outside the transfer.
+                if (std::chrono::steady_clock::now() - state->last_activity < SW_SLICER_UPLOAD_ABANDON_TIMEOUT)
+                    throw std::runtime_error("an upload is still running");
+                abandoned = true;
+            }
+        }
+
+        // 3. Plate.
+        const int  n     = sw_slicer_resolve_plate(m_param_data);
+        PartPlate* plate = plater->get_partplate_list().get_plate(n);
+        sw_slicer_require_plate_ready(n);
+
+        // 4. Printer: only Moonraker hosts. Their upload() shows no dialog for an IP address; for a
+        // ".local" host name it can show an address choice dialog, which must not run on this thread.
+        std::shared_ptr<PrintHost> host;
+        wxGetApp().get_connect_host(host);
+        if (!host)
+            throw std::runtime_error("no printer is connected");
+        // Moonraker and Moonraker_Mqtt (the Snapmaker connection) both report "Moonraker".
+        if (std::string(host->get_name()) != "Moonraker")
+            throw std::runtime_error(std::string("uploading is not supported for this printer connection (") + host->get_name() + ")");
+        if (boost::algorithm::icontains(host->get_host(), ".local"))
+            throw std::runtime_error("uploading is only supported for a printer connected by IP address");
+
+        std::vector<std::string> notes;
+        // Same check as Plater::send_gcode_legacy(): the G-code must be made for the connected printer model.
+        std::string connected_model;
+        for (const DeviceInfo& device : wxGetApp().app_config->get_devices())
+            if (device.connected)
+                connected_model = device.preset_name;
+        connected_model.erase(std::remove(connected_model.begin(), connected_model.end(), '('), connected_model.end());
+        connected_model.erase(std::remove(connected_model.begin(), connected_model.end(), ')'), connected_model.end());
+        const std::string current_model = sw_slicer_printer_model_name();
+        if (connected_model.empty())
+            notes.push_back("the model of the connected printer is unknown; not compared with the printer preset");
+        else if (connected_model != current_model)
+            throw std::runtime_error("the G-code is made for printer preset '" + current_model + "' but the connected printer is '" +
+                                     connected_model + "'; select the matching printer preset and slice again");
+
+        // 5. File name on the printer: 'filename' or the name the app proposes (as in send_gcode_legacy()).
+        std::string filename;
+        if (sw_slicer_has_param(m_param_data, "filename")) {
+            const json& j = m_param_data.at("filename");
+            filename      = j.is_string() ? j.get<std::string>() : std::string();
+            if (!sw_slicer_valid_upload_name(filename))
+                throw std::runtime_error("filename must be a plain file name ending in .gcode");
+        } else {
+            Print* print = plate->fff_print();
+            if (print == nullptr)
+                throw std::runtime_error("plate " + std::to_string(n) + " has no print data");
+            std::string proposed = print->output_filepath("");
+            if (!print->print_statistics().estimated_normal_print_time.empty())
+                proposed = print->print_statistics().finalize_output_path(proposed);
+            filename = boost::filesystem::path(Slic3r::fold_utf8_to_ascii(proposed)).filename().string();
+            if (!sw_slicer_valid_upload_name(filename))
+                throw std::runtime_error("the proposed file name '" + filename + "' is not usable; pass 'filename'");
+        }
+
+        // 6. Source: the plate's G-code, copied first so that a later reslice cannot change the
+        // file while it is being uploaded (BackgroundSlicingProcess::prepare_upload() copies too).
+        // Same conversion as send_gcode_legacy() (a plain std::string to path).
+        const boost::filesystem::path source(plate->get_tmp_gcode_path());
+        boost::system::error_code     ec;
+        if (!boost::filesystem::is_regular_file(source, ec))
+            throw std::runtime_error("the G-code of plate " + std::to_string(n) + " was not found; slice it again");
+        const boost::filesystem::path upload_copy = boost::filesystem::temp_directory_path() /
+                                                    boost::filesystem::unique_path(".api-upload-%%%%-%%%%-%%%%.gcode");
+        boost::filesystem::copy_file(source, upload_copy, ec);
+        if (ec) {
+            boost::system::error_code ignore;
+            boost::filesystem::remove(upload_copy, ignore);
+            throw std::runtime_error("the G-code could not be prepared for the upload: " + ec.message());
+        }
+
+        PrintHostUpload upload_data;
+        upload_data.use_3mf     = false;
+        upload_data.source_path = upload_copy;
+        upload_data.upload_path = boost::filesystem::path(filename);
+        // Upload only: starting a print is a separate, explicitly confirmed printer command.
+        upload_data.post_action = PrintHostPostUploadAction::None;
+
+        int id = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            id                   = ++state->id; // an abandoned thread no longer writes to the state
+            state->state         = "uploading";
+            state->progress      = 0;
+            state->filename      = filename;
+            state->error.clear();
+            state->notified      = true;
+            state->last_ulnow    = 0;
+            state->last_ultotal  = 0;
+            state->last_activity = std::chrono::steady_clock::now();
+            state->stalled       = false;
+        }
+
+        // 7. The thread keeps its own references (host, state) and copies of the paths; it touches
+        // neither the GUI, the Plater nor the model. The result notification is shown by
+        // sw_SlicerGetStatus on the GUI thread.
+        std::shared_ptr<SwSlicerUploadState> thread_state = state;
+        try {
+            std::thread([thread_state, id, host, upload_data, upload_copy]() {
+                std::string error;
+                bool        ok = false;
+                try {
+                    ok = host->upload(
+                        upload_data,
+                        [thread_state, id](Http::Progress progress, bool& cancel) {
+                            const auto                  now = std::chrono::steady_clock::now();
+                            std::lock_guard<std::mutex> lock(thread_state->mutex);
+                            if (thread_state->id != id || thread_state->stalled) {
+                                cancel = true; // abandoned or stalled (also stops the port 8080 retry)
+                                return;
+                            }
+                            if (progress.ulnow != thread_state->last_ulnow || progress.ultotal != thread_state->last_ultotal) {
+                                thread_state->last_ulnow    = progress.ulnow;
+                                thread_state->last_ultotal  = progress.ultotal;
+                                thread_state->last_activity = now;
+                                if (progress.ultotal > 0)
+                                    thread_state->progress = static_cast<int>(std::min<size_t>(100, progress.ulnow * 100 / progress.ultotal));
+                            } else if (now - thread_state->last_activity > SW_SLICER_UPLOAD_STALL_TIMEOUT) {
+                                thread_state->stalled = true;
+                                cancel                = true;
+                            }
+                        },
+                        [&error](wxString message) { error = into_u8(message); },
+                        [](wxString /*tag*/, wxString /*status*/) {});
+                } catch (const std::exception& e) {
+                    ok    = false;
+                    error = e.what();
+                }
+                boost::system::error_code ignore;
+                boost::filesystem::remove(upload_copy, ignore);
+                std::lock_guard<std::mutex> lock(thread_state->mutex);
+                if (thread_state->id != id)
+                    return; // abandoned: a newer upload owns the state
+                if (thread_state->stalled) {
+                    ok    = false;
+                    error = "the upload made no progress for " + std::to_string(SW_SLICER_UPLOAD_STALL_TIMEOUT.count()) +
+                            " s and was cancelled";
+                } else if (!ok && error.empty()) {
+                    error = "the upload failed";
+                }
+                thread_state->state = ok ? "done" : "failed";
+                if (ok)
+                    thread_state->progress = 100;
+                thread_state->error    = ok ? std::string() : error;
+                thread_state->notified = false;
+            }).detach();
+        } catch (const std::exception& e) {
+            // The thread could not be started: nothing is uploading (the error is in this reply).
+            boost::system::error_code ignore;
+            boost::filesystem::remove(upload_copy, ignore);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->state = "failed";
+            state->error = e.what();
+            throw std::runtime_error(std::string("the upload could not be started: ") + e.what());
+        }
+
+        if (abandoned)
+            notes.push_back("the previous upload showed no activity for " + std::to_string(SW_SLICER_UPLOAD_ABANDON_TIMEOUT.count()) +
+                            " s and was abandoned");
+        if (Print* print = plate->fff_print()) {
+            const std::vector<std::string>& scripts = print->config().post_process.values;
+            if (std::any_of(scripts.begin(), scripts.end(), [](const std::string& script) { return !script.empty(); }))
+                notes.push_back("post-processing scripts are not run for the upload (the plate's G-code is sent as sliced, like the app's own U1 upload)");
+        }
+        notes.push_back("a file with the same name on the printer is replaced");
+        m_res_data["started"]  = true;
+        m_res_data["id"]       = id;
+        m_res_data["filename"] = filename;
+        m_res_data["plate"]    = n;
+        m_res_data["notes"]    = notes;
         send_to_js();
         finish_job();
     } catch (std::exception& e) {

@@ -10170,6 +10170,29 @@ struct Plater::priv
     //BBS: add a flag to ignore cancel event
     bool m_ignore_event{false};
     bool m_slice_all{false};
+    // Set by Plater::export_gcode_to() in SSWCP API mode: the running G-code export shows no
+    // dialogs when it completes (warnings and errors stay visible as notifications).
+    bool m_export_without_dialogs { false };
+    // Set by Plater::export_gcode_to(): the app writes the G-code to m_api_export_temp (next to the
+    // target) and on_process_completed() renames it to m_api_export_target only after a successful
+    // export, so an existing target is never damaged by a failed export.
+    boost::filesystem::path m_api_export_target;
+    boost::filesystem::path m_api_export_temp;
+    // Forget an API export whose completion will not be handled (export reset without a
+    // completed event): restore the dialogs and remove the temporary file.
+    void clear_api_export()
+    {
+        m_export_without_dialogs = false;
+        if (!m_api_export_target.empty())
+            exporting_status = ExportingStatus::NOT_EXPORTING;
+        if (!m_api_export_temp.empty()) {
+            boost::system::error_code ec;
+            boost::filesystem::remove(m_api_export_temp, ec);
+        }
+        m_api_export_target.clear();
+        m_api_export_temp.clear();
+    }
+    bool has_slicing_warnings() const { return !current_warnings.empty(); }
     bool m_is_slicing {false};
     bool m_is_publishing {false};
     int m_is_RightClickInLeftUI{-1};
@@ -10531,6 +10554,7 @@ struct Plater::priv
     void on_action_open_project(SimpleEvent&);
     void on_action_slice_plate(SimpleEvent&);
     void on_action_slice_all(SimpleEvent&);
+    bool start_slice_all(bool switch_to_preview);
     void on_action_publish(wxCommandEvent &evt);
     void on_action_print_plate(SimpleEvent&);
     void on_action_print_all(SimpleEvent&);
@@ -13230,6 +13254,8 @@ void Plater::priv::delete_all_objects_from_model()
 
     // Stop and reset the Print content.
     background_process.reset();
+    // A scheduled API export is dropped without a completed event.
+    clear_api_export();
 
     //BBS: update partplate
     partplate_list.clear();
@@ -13293,6 +13319,8 @@ void Plater::priv::reset(bool apply_presets_change)
 
     // Stop and reset the Print content.
     this->background_process.reset();
+    // A scheduled API export is dropped without a completed event.
+    clear_api_export();
     model.clear_objects();
     assemble_view->get_canvas3d()->reset_explosion_ratio();
     update();
@@ -15317,7 +15345,8 @@ void Plater::priv::on_slicing_completed(wxCommandEvent & evt)
 
 void Plater::priv::on_export_began(wxCommandEvent& evt)
 {
-    if (show_warning_dialog)
+    // An export started through the SSWCP API shows no dialog; the warnings stay as notifications.
+    if (show_warning_dialog && !m_export_without_dialogs)
         warnings_dialog();
 }
 
@@ -15477,12 +15506,49 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
 
     // Reset the "export G-code path" name, so that the automatic background processing will be enabled again.
     this->background_process.reset_export();
+    const bool export_without_dialogs = m_export_without_dialogs;
+    m_export_without_dialogs = false;
+    const fs::path api_export_target = m_api_export_target;
+    const fs::path api_export_temp   = m_api_export_temp;
+    m_api_export_target.clear();
+    m_api_export_temp.clear();
     // This bool stops showing export finished notification even when process_completed_with_error is false
     bool has_error = false;
+    if (!api_export_target.empty()) {
+        // SSWCP API export: replace the target only now that the export has succeeded. If a
+        // post-processing script renamed the temporary file, it no longer exists and this fails too.
+        boost::system::error_code ec;
+        if (!evt.error() && !evt.cancelled()) {
+            fs::rename(api_export_temp, api_export_target, ec);
+            if (ec) {
+                boost::system::error_code ignore;
+                fs::remove(api_export_temp, ignore);
+                notification_manager->stop_delayed_notifications_of_type(NotificationType::ExportOngoing);
+                notification_manager->close_notification_of_type(NotificationType::ExportOngoing);
+                notification_manager->push_notification(NotificationType::CustomNotification,
+                                                        NotificationManager::NotificationLevel::ErrorNotificationLevel,
+                                                        GUI::format(_L("The exported G-code could not be moved to %1% (%2%). An existing file was left unchanged."),
+                                                                    from_path(api_export_target), ec.message()));
+                has_error = true;
+            } else {
+                // The copy keeps the modification time of the sliced source file; stamp the target
+                // with the export time so clients can tell a fresh export from an old file.
+                boost::system::error_code ignore;
+                fs::last_write_time(api_export_target, std::time(nullptr), ignore);
+            }
+        } else {
+            fs::remove(api_export_temp, ec);
+        }
+    }
     if (evt.error()) {
         auto message = evt.format_error_message();
         if (evt.critical_error()) {
-            if (q->m_tracking_popup_menu) {
+            if (export_without_dialogs) {
+                // Export started through the SSWCP API: report the error as a notification, not a dialog.
+                notification_manager->push_notification(NotificationType::CustomNotification,
+                                                        NotificationManager::NotificationLevel::ErrorNotificationLevel, message.first);
+                notification_manager->set_slicing_progress_hidden();
+            } else if (q->m_tracking_popup_menu) {
                 // We don't want to pop-up a message box when tracking a pop-up menu.
                 // We postpone the error message instead.
                 q->m_tracking_popup_menu_error_message = message.first;
@@ -15641,6 +15707,8 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         m_cur_slice_plate = q->find_next_sliceable_plate_for_slice_all(m_cur_slice_plate + 1);
         if (m_cur_slice_plate < 0)
         {
+            // The run is over: do not leave the "slice all" state behind for the next single slice.
+            m_slice_all = false;
             m_is_slicing = false;
             return;
         }
@@ -15651,6 +15719,7 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         int ret = q->start_next_slice();
         if (ret) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(":slicing all, plate %1% can not be sliced, will stop")%m_cur_slice_plate;
+            m_slice_all = false;
             m_is_slicing = false;
         }
         //not the last plate
@@ -15744,6 +15813,13 @@ void Plater::priv::on_action_slice_plate(SimpleEvent&)
 //BBS: GUI refactor: slice all
 void Plater::priv::on_action_slice_all(SimpleEvent&)
 {
+    start_slice_all(!m_is_publishing);
+}
+
+// Shared by the "Slice all" button and Plater::slice_all_plates(). Returns false if slicing
+// all plates could not be started.
+bool Plater::priv::start_slice_all(bool switch_to_preview)
+{
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice project event\n" ;
         //BBS update extruder params and speed table before slicing
@@ -15756,7 +15832,7 @@ void Plater::priv::on_action_slice_all(SimpleEvent&)
         Model::setPrintSpeedTable(config, print_config);
 
         if (!q->guard_before_slice_all())
-            return;
+            return false;
 
         m_slice_all = true;
         m_slice_all_only_has_gcode = true;
@@ -15764,7 +15840,7 @@ void Plater::priv::on_action_slice_all(SimpleEvent&)
         if (m_cur_slice_plate < 0)
         {
             m_slice_all = false;
-            return;
+            return false;
         }
         //select plate
         q->select_plate(m_cur_slice_plate);
@@ -15774,11 +15850,13 @@ void Plater::priv::on_action_slice_all(SimpleEvent&)
             m_slice_all_only_has_gcode = false;
         }
         //BBS: wish to select all plates stats item
-        if (!m_is_publishing)
+        if (switch_to_preview)
             q->select_view_3D("Preview");
         if (!slice_cancelled)
             preview->get_canvas3d()->_update_select_plate_toolbar_stats_item(true);
+        return !slice_cancelled;
     }
+    return false;
 }
 
 void Plater::priv::on_action_publish(wxCommandEvent &event)
@@ -20567,6 +20645,9 @@ void Plater::export_gcode(bool prefer_removable)
         p->exporting_status = path_on_removable_media ? ExportingStatus::EXPORTING_TO_REMOVABLE : ExportingStatus::EXPORTING_TO_LOCAL;
         p->last_output_path = output_path.string();
         p->last_output_dir_path = output_path.parent_path().string();
+        // A user export always shows its dialogs, even if an earlier API export left its state behind.
+        if (!p->background_process.is_export_scheduled())
+            p->clear_api_export();
         p->export_gcode(output_path, path_on_removable_media);
         // Storing a path to AppConfig either as path to removable media or a path to internal media.
         // is_path_on_removable_drive() is called with the "true" parameter to update its internal database as the user may have shuffled the external drives
@@ -20673,6 +20754,69 @@ void Plater::export_gcode_3mf(bool export_all)
         appconfig.update_last_output_dir(output_path.parent_path().string(), false);
         p->notification_manager->push_exporting_finished_notification(output_path.string(), p->last_output_dir_path, on_removable);
     }
+}
+
+bool Plater::slice_all_plates(bool silent)
+{
+    return p->start_slice_all(!silent);
+}
+
+bool Plater::is_slicing_all() const
+{
+    // Defensive: the "slice all" state only counts while slicing is still in progress.
+    return p->m_slice_all && p->m_is_slicing;
+}
+
+// The dialog-free part of Plater::export_gcode(). The G-code is written to a temporary file next to
+// 'path' and only moved to 'path' when the export has succeeded (Plater::priv::on_process_completed),
+// so an existing file is never damaged by a failed export. The last used output folder in the app
+// configuration is left unchanged.
+bool Plater::export_gcode_to(const boost::filesystem::path& path)
+{
+    if (p->model.objects.empty() || path.empty())
+        return false;
+    if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
+        return false;
+    if (p->background_process.is_export_scheduled())
+        return false;
+    // No export is scheduled: whatever is left of an earlier API export is stale.
+    p->clear_api_export();
+
+    // x.gcode -> x.api-tmp-<random>.gcode in the same folder (same file system, so the final rename
+    // is a plain replace). A unique name never touches an existing file of the user. The random part
+    // is hexadecimal, so PrintStatistics::finalize_output_path() leaves the name unchanged.
+    boost::system::error_code ec;
+    fs::path                  temp;
+    do {
+        fs::path name = path.stem();
+        name += fs::path(".api-tmp-");
+        name += fs::unique_path("%%%%%%%%");
+        name += path.extension();
+        temp = path.parent_path() / name;
+    } while (fs::exists(temp, ec));
+
+    if (sswcp_api::active() && p->has_slicing_warnings())
+        sswcp_api::note("the slice result has warnings (warnings dialog skipped; see the notifications in the app)");
+    RemovableDriveManager& removable_drive_manager = *wxGetApp().removable_drive_manager();
+    const bool             path_on_removable_media = removable_drive_manager.set_and_verify_last_save_path(path.string());
+    p->notification_manager->new_export_began(path_on_removable_media);
+    p->exporting_status         = path_on_removable_media ? ExportingStatus::EXPORTING_TO_REMOVABLE : ExportingStatus::EXPORTING_TO_LOCAL;
+    p->last_output_path         = path.string();
+    p->last_output_dir_path     = path.parent_path().string();
+    p->m_export_without_dialogs = sswcp_api::active();
+    p->m_api_export_target      = path;
+    p->m_api_export_temp        = temp;
+    p->export_gcode(temp, path_on_removable_media);
+    // priv::export_gcode() returns silently if the background process is invalid, and the background
+    // process may not start: then no completed event will follow.
+    bool scheduled = p->background_process.is_export_scheduled();
+    if (scheduled && !p->background_process.running()) {
+        p->background_process.reset_export();
+        scheduled = false;
+    }
+    if (!scheduled)
+        p->clear_api_export();
+    return scheduled;
 }
 
 void Plater::send_gcode_finish(wxString name)
@@ -23148,6 +23292,7 @@ bool Plater::confirm_filament_temp_mixing_before_slice()
     case FilamentTempMixingState::BlockedError:
         sync_filament_temp_mixing_notification();
         sync_cold_plate_notification();
+        sswcp_api::note("slicing blocked by a filament temperature conflict");
         return false;
     case FilamentTempMixingState::AllowedWarning:
         break;
@@ -23155,6 +23300,12 @@ bool Plater::confirm_filament_temp_mixing_before_slice()
         BOOST_LOG_TRIVIAL(warning) << "[Plater] confirm_filament_temp_mixing_before_slice: unknown state "
                                    << static_cast<int>(state);
         return true;
+    }
+
+    // API mode: never confirm on the user's behalf; slicing stays blocked.
+    if (sswcp_api::active()) {
+        sswcp_api::note("slicing blocked: mixing high- and low-temperature filaments needs confirmation in the app");
+        return false;
     }
 
     // Show the actual high/low filament breakdown so the user can see which
@@ -23175,8 +23326,10 @@ bool Plater::confirm_filament_temp_mixing_before_slice()
 
 bool Plater::confirm_filament_temp_mixing_before_slice_all()
 {
-    if (!has_sliceable_plate_for_slice_all())
+    if (!has_sliceable_plate_for_slice_all()) {
+        sswcp_api::note("slicing blocked: no plate can be sliced (for example a filament temperature conflict)");
         return false;
+    }
 
     // Collect every sliceable, not-yet-sliced plate that is currently in the
     // AllowedWarning state, along with its high/low filament breakdown so the
@@ -23200,6 +23353,12 @@ bool Plater::confirm_filament_temp_mixing_before_slice_all()
 
     if (mixing_plates.empty())
         return true;
+
+    // API mode: never confirm on the user's behalf; slicing stays blocked.
+    if (sswcp_api::active()) {
+        sswcp_api::note("slicing blocked: mixing high- and low-temperature filaments needs confirmation in the app");
+        return false;
+    }
 
     const std::string body = filament_temp_mixing_warning_text_slice_all(mixing_plates)
                              + "\n"

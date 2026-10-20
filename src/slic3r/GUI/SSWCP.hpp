@@ -735,6 +735,12 @@ private:
     void sw_SlicerNewProject();
     void sw_SlicerOpenProject();
     void sw_SlicerSaveProject();
+
+    // Slice all plates, export, upload to the printer (upload only).
+    void sw_SlicerSliceAll();
+    void sw_SlicerExportGcode();
+    void sw_SlicerExportSliced();
+    void sw_SlicerSendToPrinter();
 };
 
 // Main SSWCP class for managing communication instances
