@@ -48,6 +48,14 @@ public:
     bool create_volume(ModelVolumeType volume_type);
 
     /// <summary>
+    /// Create new text without given position, with the given text instead of the
+    /// default one (scripting API, SSWCP). An empty text keeps the default text.
+    /// </summary>
+    /// <param name="volume_type">Object part / Negative volume / Modifier</param>
+    /// <param name="text">UTF8 text of the new volume</param>
+    bool create_volume(ModelVolumeType volume_type, const std::string &text);
+
+    /// <summary>
     /// Handle pressing of shortcut
     /// </summary>
     void on_shortcut_key();

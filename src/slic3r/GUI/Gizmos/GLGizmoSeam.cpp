@@ -101,6 +101,40 @@ bool GLGizmoSeam::on_key_down_select_tool_type(int keyCode) {
     return true;
 }
 
+bool GLGizmoSeam::set_tool(const std::string& tool)
+{
+    wchar_t new_tool = 0;
+    if (tool == "circle")
+        new_tool = ImGui::CircleButtonIcon;
+    else if (tool == "sphere")
+        new_tool = ImGui::SphereButtonIcon;
+    else
+        return false;
+
+    // Same as a click on the tool button: m_cursor_type / m_tool_type are derived from
+    // m_current_tool on the next frame.
+    const wchar_t old_tool = m_current_tool;
+    if (new_tool != old_tool) {
+        m_current_tool = new_tool;
+        for (auto& triangle_selector : m_triangle_selectors) {
+            triangle_selector->seed_fill_unselect_all_triangles();
+            triangle_selector->request_update_render_data();
+        }
+        this->tool_changed(old_tool, new_tool);
+    }
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return true;
+}
+
+bool GLGizmoSeam::set_tool_option(const std::string& key, double value)
+{
+    // Only the options this gizmo's window shows.
+    if (key == "cursor_radius" || key == "vertical_only")
+        return GLGizmoPainterBase::set_tool_option(key, value);
+    return false;
+}
+
 void GLGizmoSeam::show_tooltip_information(float caption_max, float x, float y)
 {
     ImTextureID normal_id = m_parent.get_gizmos_manager().get_icon_texture_id(GLGizmosManager::MENU_ICON_NAME::IC_TOOLBAR_TOOLTIP);

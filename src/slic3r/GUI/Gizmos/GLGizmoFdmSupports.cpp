@@ -19,6 +19,8 @@
 
 #include <boost/log/trivial.hpp>
 
+#include <algorithm>
+
 namespace Slic3r::GUI {
 
 GLGizmoFdmSupports::GLGizmoFdmSupports(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id)
@@ -155,6 +157,60 @@ bool GLGizmoFdmSupports::on_key_down_select_tool_type(int keyCode) {
         break;
     }
     return true;
+}
+
+bool GLGizmoFdmSupports::set_tool(const std::string& tool)
+{
+    wchar_t new_tool = 0;
+    if (tool == "circle")
+        new_tool = ImGui::CircleButtonIcon;
+    else if (tool == "sphere")
+        new_tool = ImGui::SphereButtonIcon;
+    else if (tool == "fill")
+        new_tool = ImGui::FillButtonIcon;
+    else if (tool == "gap_fill")
+        new_tool = ImGui::GapFillIcon;
+    else
+        return false;
+
+    // Same as a click on the tool button: m_cursor_type / m_tool_type are derived from
+    // m_current_tool on the next frame.
+    const wchar_t old_tool = m_current_tool;
+    if (new_tool != old_tool) {
+        m_current_tool = new_tool;
+        for (auto& triangle_selector : m_triangle_selectors) {
+            triangle_selector->seed_fill_unselect_all_triangles();
+            triangle_selector->request_update_render_data();
+        }
+        this->tool_changed(old_tool, new_tool);
+    }
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return true;
+}
+
+bool GLGizmoFdmSupports::set_tool_option(const std::string& key, double value)
+{
+    if (key == "highlight_angle") {
+        // The first frame after opening (m_support_threshold_angle == -1) resets the highlight
+        // angle to the object's support threshold. Initialise m_support_threshold_angle here
+        // already, so that reset is skipped and the angle set here stays; the next frame
+        // refreshes m_support_threshold_angle itself with the same value.
+        if (m_support_threshold_angle == -1 && m_c->selection_info() != nullptr && m_c->selection_info()->model_object() != nullptr)
+            m_support_threshold_angle = std::max(get_selection_support_threshold_angle(), 0);
+        m_highlight_by_angle_threshold_deg = std::clamp<float>(float(value), 0.f, 90.f);
+        // Same as the slider: also update the slope (overhang) highlight.
+        m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
+        if (!m_parent.is_using_slope())
+            m_parent.use_slope(true);
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+        return true;
+    }
+    // Only the options this gizmo's window shows.
+    if (key == "cursor_radius" || key == "smart_fill_angle" || key == "on_overhangs_only" || key == "gap_area")
+        return GLGizmoPainterBase::set_tool_option(key, value);
+    return false;
 }
 
 void GLGizmoFdmSupports::on_set_state()

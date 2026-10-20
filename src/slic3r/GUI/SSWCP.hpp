@@ -664,6 +664,69 @@ private:
     void sw_DeleteRecentFiles();
 
     void sw_SubscribeRecentFiles();
+
+    // sw_Slicer*: live control of the slicer (implemented in SSWCPSlicer.cpp).
+    // Probe and preset config.
+    void sw_SlicerPing();
+    void sw_SlicerGetConfig();
+    void sw_SlicerSetConfig();
+
+    // Slicing, status polling, print time and material usage.
+    void sw_SlicerSlice();
+    void sw_SlicerGetStatus();
+    void sw_SlicerGetStats();
+
+    // View switching and layer navigation in the preview.
+    void sw_SlicerShowView();
+    void sw_SlicerGoToLayer();
+
+    // Color change from layer N (or height z) via MMU segmentation painting; an alias of
+    // sw_SlicerPaint {type:"color", action:"height_band"}.
+    void sw_SlicerSetColorFromLayer();
+
+    // 3D toolbar: objects, selection, job status, undo/redo, open/close gizmo.
+    void sw_SlicerListObjects();
+    void sw_SlicerSelect();
+    void sw_SlicerGetSelection();
+    void sw_SlicerJobStatus();
+    void sw_SlicerUndo();
+    void sw_SlicerRedo();
+    void sw_SlicerOpenGizmo();
+    void sw_SlicerCloseGizmo();
+
+    // Add model and plate (API mode without dialogs).
+    void sw_SlicerAddModel();
+    void sw_SlicerAddPlate();
+
+    // Orient and arrange (asynchronous through the job worker).
+    void sw_SlicerOrient();
+    void sw_SlicerArrange();
+
+    // Move, rotate, scale.
+    void sw_SlicerMove();
+    void sw_SlicerRotate();
+    void sw_SlicerScale();
+
+    // Split, lay on face, cut (plane + groove).
+    void sw_SlicerSplitObjects();
+    void sw_SlicerSplitParts();
+    void sw_SlicerLayOnFace();
+    void sw_SlicerCut();
+
+    // Variable layer height and brim ears.
+    void sw_SlicerLayerHeight();
+    void sw_SlicerBrimEars();
+
+    // Parametric painting (support / seam / fuzzy skin / color).
+    void sw_SlicerPaint();
+
+    // Text (Emboss), mesh boolean, measure and assemble.
+    void sw_SlicerAddText();
+    void sw_SlicerEditText();
+    void sw_SlicerMeshBoolean();
+    void sw_SlicerGetMeasurement();
+    void sw_SlicerAssemble();
+    void sw_SlicerResetMeasurement();
 };
 
 // Main SSWCP class for managing communication instances
@@ -731,6 +794,9 @@ public:
     static bool is_debug_mode_enabled();
     static void send_message_to_flutter(const std::string& message);
     static void send_message_auto(const std::string& message, wxWebView* webview = nullptr);
+
+    // Sorted list of all registered sw_Slicer* commands (reported by sw_SlicerPing).
+    static std::vector<std::string> slicer_commands();
 
 private:
     static std::unordered_set<std::string> m_machine_find_cmd_list;     // Machine find commands

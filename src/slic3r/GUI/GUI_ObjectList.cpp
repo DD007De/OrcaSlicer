@@ -23,6 +23,7 @@
 #include "Widgets/ProgressDialog.hpp"
 #include "SingleChoiceDialog.hpp"
 #include "StepMeshDialog.hpp"
+#include "SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
 
 #include <boost/algorithm/string.hpp>
 #include <wx/progdlg.h>
@@ -2851,7 +2852,11 @@ void ObjectList::split()
     const ConfigOptionStrings* filament_colors = config.option<ConfigOptionStrings>("filament_colour", false);
     const auto filament_cnt = (filament_colors == nullptr) ? size_t(1) : filament_colors->size();
     if (!volume->is_splittable()) {
-        wxMessageBox(_(L("The target object contains only one part and can not be split.")));
+        if (sswcp_api::active()) {
+            sswcp_api::note("the part consists of a single piece and could not be split (message skipped)");
+        } else {
+            wxMessageBox(_(L("The target object contains only one part and can not be split.")));
+        }
         return;
     }
 

@@ -77,6 +77,11 @@ public:
 
     const float get_cursor_radius_min() const override { return CursorRadiusMin; }
 
+    // Scripting API (SSWCP): tools circle|sphere|triangle|height_range|fill|gap_fill;
+    // extra options "filament" (filament ID) and "detect_geometry_edge".
+    bool set_tool(const std::string& tool) override;
+    bool set_tool_option(const std::string& key, double value) override;
+
     // BBS
     bool on_number_key_down(int number);
     bool on_key_down_select_tool_type(int keyCode);

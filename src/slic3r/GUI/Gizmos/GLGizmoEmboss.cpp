@@ -336,8 +336,17 @@ bool GLGizmoEmboss::create_volume(ModelVolumeType volume_type, const Vec2d& mous
 // Designed for create volume without information of mouse in scene
 bool GLGizmoEmboss::create_volume(ModelVolumeType volume_type)
 {
+    return create_volume(volume_type, std::string());
+}
+
+// Same as create_volume(volume_type), but with the given text; an empty text keeps the
+// default text (scripting API, SSWCP)
+bool GLGizmoEmboss::create_volume(ModelVolumeType volume_type, const std::string &text)
+{
     if (!init_create(volume_type))
         return false;
+    if (!text.empty())
+        m_text = text;
 
     // NOTE: change style manager - be carefull with order changes
     DataBasePtr base = create_emboss_data_base(m_text, m_style_manager, m_text_lines, m_parent.get_selection(), volume_type, m_job_cancel);

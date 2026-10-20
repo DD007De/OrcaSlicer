@@ -13,6 +13,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 
@@ -31,6 +32,43 @@ GLGizmoPainterBase::~GLGizmoPainterBase()
 {
     if (s_sphere != nullptr)
         s_sphere.reset();
+}
+
+// Scripting API (SSWCP): set one of the shared painter options, clamped to the same
+// ranges as the sliders. Subclasses only forward the keys their own window shows.
+bool GLGizmoPainterBase::set_tool_option(const std::string& key, double value)
+{
+    const float v = float(value);
+    if (key == "cursor_radius")
+        m_cursor_radius = std::clamp<float>(v, this->get_cursor_radius_min(), this->get_cursor_radius_max());
+    else if (key == "cursor_height")
+        m_cursor_height = std::clamp<float>(v, this->get_cursor_height_min(), this->get_cursor_height_max());
+    else if (key == "smart_fill_angle") {
+        m_smart_fill_angle = std::clamp<float>(v, SmartFillAngleMin, SmartFillAngleMax);
+        for (auto& triangle_selector : m_triangle_selectors) {
+            triangle_selector->seed_fill_unselect_all_triangles();
+            triangle_selector->request_update_render_data();
+        }
+    } else if (key == "on_overhangs_only")
+        m_paint_on_overhangs_only = (value != 0.);
+    else if (key == "highlight_angle")
+        m_highlight_by_angle_threshold_deg = std::clamp<float>(v, 0.f, 90.f);
+    else if (key == "vertical_only") {
+        m_vertical_only = (value != 0.);
+        if (m_vertical_only)
+            m_horizontal_only = false;
+    } else if (key == "horizontal_only") {
+        m_horizontal_only = (value != 0.);
+        if (m_horizontal_only)
+            m_vertical_only = false;
+    } else if (key == "gap_area")
+        TriangleSelectorPatch::gap_area = std::clamp<float>(v, TriangleSelectorPatch::GapAreaMin, TriangleSelectorPatch::GapAreaMax);
+    else
+        return false;
+
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return true;
 }
 
 void GLGizmoPainterBase::data_changed(bool is_serializing)

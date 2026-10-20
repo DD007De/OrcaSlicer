@@ -11,6 +11,7 @@
 #include <imgui/imgui_internal.h>
 
 #include <numeric>
+#include <cmath>
 
 #include <GL/glew.h>
 
@@ -2685,6 +2686,136 @@ bool GLGizmoMeasure::is_pick_meet_assembly_mode(const SelectedFeatures::Item &it
     else {
         return true;
     }
+}
+
+int GLGizmoMeasure::api_selected_feature_count() const
+{
+    int count = 0;
+    if (m_selected_features.first.feature.has_value())
+        ++count;
+    if (m_selected_features.second.feature.has_value())
+        ++count;
+    return count;
+}
+
+void GLGizmoMeasure::api_reset_features()
+{
+    // Same as the Delete key in this gizmo.
+    reset_all_feature();
+    update_measurement_result();
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+}
+
+// Face-face assembly actions with the same preconditions as the buttons in
+// show_face_face_assembly_common()/_senior(). The set_* functions do not check everything
+// themselves (set_to_center_coincidence() reads m_hit_different_volumes[1] without a size
+// check, set_to_reverse_rotation() does 'throw;' for a degenerate axis), so check up front.
+// Split in a check and a run step so the caller can skip a no-op (no undo step) and wrap the
+// run step in its own named snapshot. The error texts are returned in the API reply.
+static constexpr double API_ASSEMBLY_MAX_DISTANCE = 10000.;  // mm
+static constexpr double API_ASSEMBLY_MAX_ANGLE    = 360.;    // degrees
+
+bool GLGizmoMeasure::api_check_assembly_action(const std::string &action, double value, std::string &err, bool &no_op)
+{
+    no_op = false;
+    if (action != "parallel" && action != "center_coincidence" && action != "flip" &&
+        action != "parallel_distance" && action != "rotate_around_center") {
+        err = "unknown assembly action '" + action +
+              "' (expected parallel|center_coincidence|flip|parallel_distance|rotate_around_center)";
+        return false;
+    }
+    if (m_measure_mode != EMeasureMode::ONLY_ASSEMBLY || m_assembly_mode != AssemblyMode::FACE_FACE) {
+        err = "assembly actions only work in the assembly tool, in face-to-face mode";
+        return false;
+    }
+    if (!m_selected_features.first.feature.has_value() || !m_selected_features.second.feature.has_value()) {
+        err = "pick two faces in the assembly tool first";
+        return false;
+    }
+    if (m_hit_different_volumes.size() != 2) {
+        err = "the two faces must belong to two different parts or objects";
+        return false;
+    }
+    if (m_selected_features.first.feature->get_type() != Measure::SurfaceFeatureType::Plane ||
+        m_selected_features.second.feature->get_type() != Measure::SurfaceFeatureType::Plane) {
+        err = "both selected features must be faces";
+        return false;
+    }
+    if (!std::isfinite(value)) {
+        err = "'value' must be a finite number";
+        return false;
+    }
+
+    const Measure::AssemblyAction &a = m_assembly_action;
+    if (action == "parallel") {
+        if (!a.can_set_to_parallel) {
+            err = "the faces cannot be made parallel now (are they already parallel?)";
+            return false;
+        }
+    } else if (action == "center_coincidence") {
+        if (!a.can_set_to_center_coincidence) {
+            err = "the centers of these faces cannot be made coincident";
+            return false;
+        }
+    } else if (action == "flip") {
+        if (!a.can_set_feature_2_reverse_rotation) {
+            err = "face 2 cannot be flipped now";
+            return false;
+        }
+        // Same axis as set_to_reverse_rotation() computes; it does 'throw;' when it is degenerate.
+        const auto [idx2, normal2, pt2] = m_selected_features.second.feature->get_plane();
+        const Vec3d new_pt              = Measure::get_one_point_in_plane(pt2, normal2);
+        if ((new_pt - pt2).normalized().norm() < 0.1) {
+            err = "face 2 cannot be flipped (no rotation axis found)";
+            return false;
+        }
+    } else if (action == "parallel_distance") {
+        if (!a.has_parallel_distance) {
+            err = "the faces are not parallel: make them parallel first (action 'parallel')";
+            return false;
+        }
+        if (std::abs(value) > API_ASSEMBLY_MAX_DISTANCE) {
+            err = "'value' must be between -10000 and 10000 mm";
+            return false;
+        }
+        // Same no-op filter as the input field (show_face_face_assembly_senior()).
+        no_op = std::abs(value - a.parallel_distance) <= EPSILON;
+    } else { // rotate_around_center
+        if (!a.can_around_center_of_faces) {
+            err = "rotating around the center is only possible for parallel faces";
+            return false;
+        }
+        if (std::abs(value) > API_ASSEMBLY_MAX_ANGLE) {
+            err = "'value' must be between -360 and 360 degrees";
+            return false;
+        }
+        // Same no-op filter as the input field (|angle| > EPSILON).
+        no_op = std::abs(value) <= EPSILON;
+    }
+    return true;
+}
+
+void GLGizmoMeasure::api_run_assembly_action(const std::string &action, double value)
+{
+    const bool same = is_two_volume_in_same_model_object();
+    if (action == "parallel")
+        set_to_parallel(same);
+    else if (action == "center_coincidence")
+        set_to_center_coincidence(same);
+    else if (action == "flip") {
+        // Same side effect as the "Flip by Face 2" checkbox.
+        m_flip_volume_2 = !m_flip_volume_2;
+        set_to_reverse_rotation(same, 1);
+    } else if (action == "parallel_distance")
+        set_parallel_distance(same, static_cast<float>(value));
+    else if (action == "rotate_around_center")
+        set_to_around_center_of_faces(same, static_cast<float>(value));
+    // The features were moved along with the volume (update_feature_by_tran); recompute now so
+    // the caller reads a fresh measurement instead of waiting for the next data_changed().
+    update_measurement_result();
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
 }
 
 } // namespace GUI

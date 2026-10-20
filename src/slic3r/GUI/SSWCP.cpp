@@ -4572,6 +4572,80 @@ void SSWCP_SliceProject_Instance::process()
         sw_DeleteRecentFiles();
     } else if (m_cmd == "sw_SubscribeRecentFiles") {
         sw_SubscribeRecentFiles();
+    } else if (m_cmd == "sw_SlicerPing") {
+        sw_SlicerPing();
+    } else if (m_cmd == "sw_SlicerGetConfig") {
+        sw_SlicerGetConfig();
+    } else if (m_cmd == "sw_SlicerSetConfig") {
+        sw_SlicerSetConfig();
+    } else if (m_cmd == "sw_SlicerSlice") {
+        sw_SlicerSlice();
+    } else if (m_cmd == "sw_SlicerGetStatus") {
+        sw_SlicerGetStatus();
+    } else if (m_cmd == "sw_SlicerGetStats") {
+        sw_SlicerGetStats();
+    } else if (m_cmd == "sw_SlicerShowView") {
+        sw_SlicerShowView();
+    } else if (m_cmd == "sw_SlicerGoToLayer") {
+        sw_SlicerGoToLayer();
+    } else if (m_cmd == "sw_SlicerSetColorFromLayer") {
+        sw_SlicerSetColorFromLayer();
+    } else if (m_cmd == "sw_SlicerListObjects") {
+        sw_SlicerListObjects();
+    } else if (m_cmd == "sw_SlicerSelect") {
+        sw_SlicerSelect();
+    } else if (m_cmd == "sw_SlicerGetSelection") {
+        sw_SlicerGetSelection();
+    } else if (m_cmd == "sw_SlicerJobStatus") {
+        sw_SlicerJobStatus();
+    } else if (m_cmd == "sw_SlicerUndo") {
+        sw_SlicerUndo();
+    } else if (m_cmd == "sw_SlicerRedo") {
+        sw_SlicerRedo();
+    } else if (m_cmd == "sw_SlicerOpenGizmo") {
+        sw_SlicerOpenGizmo();
+    } else if (m_cmd == "sw_SlicerCloseGizmo") {
+        sw_SlicerCloseGizmo();
+    } else if (m_cmd == "sw_SlicerAddModel") {
+        sw_SlicerAddModel();
+    } else if (m_cmd == "sw_SlicerAddPlate") {
+        sw_SlicerAddPlate();
+    } else if (m_cmd == "sw_SlicerOrient") {
+        sw_SlicerOrient();
+    } else if (m_cmd == "sw_SlicerArrange") {
+        sw_SlicerArrange();
+    } else if (m_cmd == "sw_SlicerMove") {
+        sw_SlicerMove();
+    } else if (m_cmd == "sw_SlicerRotate") {
+        sw_SlicerRotate();
+    } else if (m_cmd == "sw_SlicerScale") {
+        sw_SlicerScale();
+    } else if (m_cmd == "sw_SlicerSplitObjects") {
+        sw_SlicerSplitObjects();
+    } else if (m_cmd == "sw_SlicerSplitParts") {
+        sw_SlicerSplitParts();
+    } else if (m_cmd == "sw_SlicerLayOnFace") {
+        sw_SlicerLayOnFace();
+    } else if (m_cmd == "sw_SlicerCut") {
+        sw_SlicerCut();
+    } else if (m_cmd == "sw_SlicerLayerHeight") {
+        sw_SlicerLayerHeight();
+    } else if (m_cmd == "sw_SlicerBrimEars") {
+        sw_SlicerBrimEars();
+    } else if (m_cmd == "sw_SlicerPaint") {
+        sw_SlicerPaint();
+    } else if (m_cmd == "sw_SlicerAddText") {
+        sw_SlicerAddText();
+    } else if (m_cmd == "sw_SlicerEditText") {
+        sw_SlicerEditText();
+    } else if (m_cmd == "sw_SlicerMeshBoolean") {
+        sw_SlicerMeshBoolean();
+    } else if (m_cmd == "sw_SlicerGetMeasurement") {
+        sw_SlicerGetMeasurement();
+    } else if (m_cmd == "sw_SlicerAssemble") {
+        sw_SlicerAssemble();
+    } else if (m_cmd == "sw_SlicerResetMeasurement") {
+        sw_SlicerResetMeasurement();
     } else {
         handle_general_fail();
     }
@@ -7860,7 +7934,34 @@ std::unordered_set<std::string> SSWCP::m_machine_connect_cmd_list = {
 
 std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_NewProject", "sw_OpenProject", "sw_GetRecentProjects", "sw_OpenRecentFile", "sw_DeleteRecentFiles", "sw_SubscribeRecentFiles",
+    "sw_SlicerPing", "sw_SlicerGetConfig", "sw_SlicerSetConfig",
+    "sw_SlicerSlice", "sw_SlicerGetStatus", "sw_SlicerGetStats",
+    "sw_SlicerShowView", "sw_SlicerGoToLayer", "sw_SlicerSetColorFromLayer",
+    // 3D toolbar
+    "sw_SlicerListObjects", "sw_SlicerSelect", "sw_SlicerGetSelection",
+    "sw_SlicerJobStatus", "sw_SlicerUndo", "sw_SlicerRedo",
+    "sw_SlicerOpenGizmo", "sw_SlicerCloseGizmo",
+    "sw_SlicerAddModel", "sw_SlicerAddPlate",
+    "sw_SlicerOrient", "sw_SlicerArrange",
+    "sw_SlicerMove", "sw_SlicerRotate", "sw_SlicerScale",
+    "sw_SlicerSplitObjects", "sw_SlicerSplitParts",
+    "sw_SlicerLayOnFace", "sw_SlicerCut",
+    "sw_SlicerLayerHeight", "sw_SlicerBrimEars",
+    "sw_SlicerPaint",
+    "sw_SlicerAddText", "sw_SlicerEditText", "sw_SlicerMeshBoolean",
+    "sw_SlicerGetMeasurement", "sw_SlicerAssemble", "sw_SlicerResetMeasurement",
 };
+
+// All sw_Slicer* commands (sorted), reported by sw_SlicerPing.
+std::vector<std::string> SSWCP::slicer_commands()
+{
+    std::vector<std::string> out;
+    for (const std::string& cmd : m_project_cmd_list)
+        if (cmd.rfind("sw_Slicer", 0) == 0)
+            out.push_back(cmd);
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 std::unordered_set<std::string> SSWCP::m_login_cmd_list = {"sw_UserLogin", "sw_AskUserLogin", "sw_UserLogout", "sw_GetUserLoginState", "sw_SubscribeUserLoginState",
                                                            UPDATE_PRIVACY_STATUS,  GET_PRIVACY_STATUS,

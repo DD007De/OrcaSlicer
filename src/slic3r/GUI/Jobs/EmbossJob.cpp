@@ -26,6 +26,7 @@
 #include "slic3r/GUI/Jobs/Worker.hpp" 
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "slic3r/Utils/RaycastManager.hpp"
+#include "slic3r/GUI/SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
 
 // #define EXECUTE_UPDATE_ON_MAIN_THREAD // debug execution on main thread
 
@@ -1579,6 +1580,12 @@ bool start_create_volume_on_surface_job(CreateVolumeParams &input, DataBasePtr d
 }
 
 void create_message(const std::string &message) {
+    // SSWCP API mode: no error dialog (show_error), but a note in the API reply.
+    if (Slic3r::GUI::sswcp_api::active()) {
+        Slic3r::GUI::sswcp_api::note(message);
+        BOOST_LOG_TRIVIAL(warning) << message;
+        return;
+    }
     show_error(nullptr, message.c_str());
 }
 

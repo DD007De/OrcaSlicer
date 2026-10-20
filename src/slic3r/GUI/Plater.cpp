@@ -161,6 +161,7 @@
 #include "Gizmos/GLGizmoSimplify.hpp" // create suggestion notification
 #include "Gizmos/GLGizmoSVG.hpp" // Drop SVG file
 #include "Gizmos/GizmoObjectManipulation.hpp"
+#include "SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
 
 // BBS
 #include "Widgets/ProgressDialog.hpp"
@@ -230,9 +231,13 @@ static void handle_newer_3mf_schema(wxWindow* parent,
     BOOST_LOG_TRIVIAL(info) << "3MF project schema is newer than supported"
                             << ": file_version=" << file_schema
                             << ", supported_version=" << definition.current_version;
+    if (sswcp_api::active()) {
+        sswcp_api::note("3MF project schema is newer than supported: the file may not be fully loaded (message skipped)");
+    } else {
     show_info(parent,
               _L("The current version of Snapmaker Orca cannot fully load this 3MF file. Please update to the latest version and try again."),
               _L("Loading 3MF"));
+    }
 }
 
 // Defensive UTF-8 translation helper.
@@ -11861,8 +11866,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     if (en_3mf_file_type == En3mfType::From_Prusa) {
                         // do not reset the model config
                         load_config = false;
-                        if(load_type != LoadType::LoadGeometry)
+                        if(load_type != LoadType::LoadGeometry) {
+                            if (sswcp_api::active())
+                                sswcp_api::note("3MF not created by Snapmaker Orca: only geometry loaded (message skipped)");
+                            else
                             show_info(q, _L("The 3mf is not supported by Snapmaker Orca, load geometry data only."), _L("Load 3mf"));
+                        }
                     }
                     // else if (load_config && (file_version.maj() != app_version.maj())) {
                     //     // version mismatch, only load geometries
@@ -12007,7 +12016,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         PresetsConfigSubstitutions preset_substitutions;
                         PresetBundle &             preset_bundle = *wxGetApp().preset_bundle;
                         preset_substitutions                     = preset_bundle.load_project_embedded_presets(project_presets, ForwardCompatibilitySubstitutionRule::Enable);
-                        if (!preset_substitutions.empty()) show_substitutions_info(preset_substitutions);
+                        if (!preset_substitutions.empty()) {
+                            if (sswcp_api::active())
+                                sswcp_api::note("project presets loaded with substituted values (message skipped)");
+                            else
+                            show_substitutions_info(preset_substitutions);
+                        }
                     }
                     if (project_presets.size() > 0) {
                         for (unsigned int i = 0; i < project_presets.size(); i++) { delete project_presets[i]; }
@@ -12066,7 +12080,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             }
                         }
                     }
-                    if (!config_substitutions.empty()) show_substitutions_info(config_substitutions.substitutions, filename.string());
+                    if (!config_substitutions.empty()) {
+                        if (sswcp_api::active())
+                            sswcp_api::note("configuration loaded with substituted values (message skipped)");
+                        else
+                        show_substitutions_info(config_substitutions.substitutions, filename.string());
+                    }
 
                     // BBS
                     if (load_model && !load_config) {
@@ -12097,11 +12116,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     warning_message += "-" + *it + "\n";
                                 warning_message += "\n";
                                 //show_info(q, _L("The 3mf has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
+                                if (sswcp_api::active()) {
+                                    sswcp_api::note("3MF contains modified G-code in filament or printer presets (message skipped):" + warning_message);
+                                } else {
                                 MessageDialog dlg(q, _L("The 3mf has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
                                 dlg.show_dsa_button();
                                 auto  res = dlg.ShowModal();
                                 if (dlg.get_checkbox_state())
                                     wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                }
                             }
                             else if ((validated == VALIDATE_PRESETS_PRINTER_NOT_FOUND) || (validated == VALIDATE_PRESETS_FILAMENTS_NOT_FOUND)) {
                                 std::string warning_message;
@@ -12110,11 +12133,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     warning_message += "-" + *it + "\n";
                                 warning_message += "\n";
                                 //show_info(q, _L("The 3mf has the following customized filament or printer presets:") + warning_message + _L("Please confirm that the G-code within these presets is safe to prevent any damage to the machine!"), _L("Customized Preset"));
+                                if (sswcp_api::active()) {
+                                    sswcp_api::note("3MF contains customized filament or printer presets (message skipped):" + warning_message);
+                                } else {
                                 MessageDialog dlg(q, _L("The 3mf has the following customized filament or printer presets:") + from_u8(warning_message)+ _L("Please confirm that the G-code within these presets is safe to prevent any damage to the machine!"), _L("Customized Preset"));
                                 dlg.show_dsa_button();
                                 auto  res = dlg.ShowModal();
                                 if (dlg.get_checkbox_state())
                                     wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                }
                             }
                         }
 
@@ -12236,6 +12263,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 auto obj_color_fun = [this, &path](std::vector<RGBA> &input_colors, bool is_single_color, std::vector<unsigned char> &filament_ids,
                                                    unsigned char &first_extruder_id) {
                     if (!boost::iends_with(path.string(), ".obj")) { return; }
+                    if (sswcp_api::active()) {
+                        // Like cancelling the color dialog: do not assign colors.
+                        sswcp_api::note("OBJ colors not assigned to filaments (color dialog skipped)");
+                        filament_ids.clear();
+                        return;
+                    }
                     const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
                     ObjColorDialog                 color_dlg(nullptr, input_colors, is_single_color, extruder_colours, filament_ids, first_extruder_id);
                     if (color_dlg.ShowModal() != wxID_OK) { 
@@ -12261,7 +12294,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 cancel        = !cont;
                         },
                         [](int isUtf8StepFile) {
-                            if (!isUtf8StepFile) {
+                            if (!isUtf8StepFile && sswcp_api::active()) {
+                                sswcp_api::note("component names in the STEP file are not UTF-8 (message skipped)");
+                            } else if (!isUtf8StepFile) {
                                 const auto no_warn = wxGetApp().app_config->get_bool("step_not_utf8_no_warn");
                                 if (!no_warn) {
                                     MessageDialog dlg(nullptr, _L("Name of components inside step file is not UTF8 format!") + "\n\n" + _L("The name may show garbage characters!"),
@@ -12275,7 +12310,14 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             }
                         },
                         [this, &path, &is_user_cancel, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value, double& angle_value, bool& is_split)-> int {
-                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                            if (wxGetApp().app_config->get_bool("enable_step_mesh_setting") && sswcp_api::active()) {
+                                // Use the default mesh settings, do NOT cancel.
+                                sswcp_api::note("STEP mesh settings: default values used (dialog skipped)");
+                                linear_value = linear;
+                                angle_value  = angle;
+                                is_split     = split_compound;
+                                return 1;
+                            } else if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
                                 StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                                 if (mesh_dlg.ShowModal() == wxID_OK) {
                                     linear_value = mesh_dlg.get_linear_defletion();
@@ -12338,7 +12380,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     PresetsConfigSubstitutions preset_substitutions;
                     PresetBundle &             preset_bundle = *wxGetApp().preset_bundle;
                     preset_substitutions                     = preset_bundle.load_project_embedded_presets(project_presets, ForwardCompatibilitySubstitutionRule::Enable);
-                    if (!preset_substitutions.empty()) show_substitutions_info(preset_substitutions);
+                    if (!preset_substitutions.empty()) {
+                        if (sswcp_api::active())
+                            sswcp_api::note("project presets loaded with substituted values (message skipped)");
+                        else
+                        show_substitutions_info(preset_substitutions);
+                    }
 
                     for (unsigned int i = 0; i < project_presets.size(); i++) { delete project_presets[i]; }
                     project_presets.clear();
@@ -12346,11 +12393,18 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             }
         } catch (const ConfigurationError &e) {
             std::string message = GUI::format(_L("Failed loading file \"%1%\". An invalid configuration was found."), filename.string()) + "\n\n" + e.what();
+            if (sswcp_api::active())
+                sswcp_api::note("loading failed (error message skipped): " + message);
+            else
             GUI::show_error(q, message);
             continue;
         } catch (const std::exception &e) {
-            if (!is_user_cancel)
+            if (!is_user_cancel) {
+                if (sswcp_api::active())
+                    sswcp_api::note(std::string("loading failed (error message skipped): ") + e.what());
+                else
                 GUI::show_error(q, e.what());
+            }
             continue;
         }
 
@@ -12369,12 +12423,19 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             if ((!is_project_file) && (!load_old_project)) {
                 // if (!is_project_file) {
                 if (int deleted_objects = model.removed_objects_with_zero_volume(); deleted_objects > 0) {
+                    if (sswcp_api::active())
+                        sswcp_api::note("objects with zero volume removed (message skipped)");
+                    else
                     MessageDialog(q, _L("Objects with zero volume removed"), _L("The volume of the object is zero"), wxICON_INFORMATION | wxOK).ShowModal();
                 }
                 if (imperial_units)
                     // Convert even if the object is big.
                     convert_from_imperial_units(model, false);
                 else if (model.looks_like_saved_in_meters()) {
+                    if (sswcp_api::active()) {
+                        // Default answer: do not convert.
+                        sswcp_api::note("not converted from meters/inches");
+                    } else {
                     // BBS do not handle look like in meters
                     MessageDialog dlg(q,
                                       format_wxstr(_L("The object from file %s is too small, and maybe in meters or inches.\n Do you want to scale to millimeters?"),
@@ -12382,7 +12443,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                       _L("Object too small"), wxICON_QUESTION | wxYES_NO);
                     int           answer = dlg.ShowModal();
                     if (answer == wxID_YES) model.convert_from_meters(true);
+                    }
                 } else if (model.looks_like_imperial_units()) {
+                    if (sswcp_api::active()) {
+                        // Default answer: do not convert.
+                        sswcp_api::note("not converted from meters/inches");
+                    } else {
                     // BBS do not handle look like in meters
                     MessageDialog dlg(q,
                                       format_wxstr(_L("The object from file %s is too small, and maybe in meters or inches.\n Do you want to scale to millimeters?"),
@@ -12390,6 +12456,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                       _L("Object too small"), wxICON_QUESTION | wxYES_NO);
                     int           answer = dlg.ShowModal();
                     if (answer == wxID_YES) convert_from_imperial_units(model, true);
+                    }
                 }
                 // else if (model.looks_like_imperial_units()) {
                 // BBS do not handle look like in imperial
@@ -12416,6 +12483,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             }
 
              if (!is_project_file && model.looks_like_multipart_object()) {
+               if (sswcp_api::active()) {
+                // Default answer: do not merge.
+                sswcp_api::note("multipart object not merged");
+               } else {
                MessageDialog msg_dlg(q, _L(
                     "This file contains several objects positioned at multiple heights.\n"
                     "Instead of considering them as multiple objects, should \n"
@@ -12424,6 +12495,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 if (msg_dlg.ShowModal() == wxID_YES) {
                     model.convert_multipart_object(filaments_cnt);
                 }
+               }
             }
         }
         // else if ((wxGetApp().get_mode() == comSimple) && (type_3mf || type_any_amf) && model_has_advanced_features(model)) {
@@ -12658,8 +12730,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     if (tolal_model_count <= 0 && !q->m_exported_file) {
         dlg.Hide();
         if (!is_user_cancel) {
+            if (sswcp_api::active()) {
+                sswcp_api::note("the file does not contain any geometry (message skipped)");
+            } else {
             MessageDialog msg(wxGetApp().mainframe, _L("The file does not contain any geometry data."), _L("Warning"), wxYES | wxICON_WARNING);
             if (msg.ShowModal() == wxID_YES) {}
+            }
         }
     }
     return obj_idxs;
@@ -12711,9 +12787,14 @@ std::vector<size_t> Plater::priv::load_model_objects(const ModelObjectPtrs& mode
             const Vec3d ratio = size.cwiseQuotient(bed_size);
             const double max_ratio = std::max(ratio(0), ratio(1));
             if (max_ratio > 10000) {
+                if (sswcp_api::active()) {
+                    // The dialog only has OK: the object is scaled down in any case.
+                    sswcp_api::note("object extremely large: scaled down automatically");
+                } else {
                 MessageDialog dlg(q, _L("Your object appears to be too large, do you want to scale it down to fit the print bed automatically?"), _L("Object too large"),
                                   wxICON_QUESTION | wxYES);
                 int           answer = dlg.ShowModal();
+                }
                 // the size of the object is too big -> this could lead to overflow when moving to clipper coordinates,
                 // so scale down the mesh
                 object->scale_mesh_after_creation(1. / max_ratio);
@@ -12723,12 +12804,17 @@ std::vector<size_t> Plater::priv::load_model_objects(const ModelObjectPtrs& mode
                 break;
             }
             else if (max_ratio > 10) {
+                if (sswcp_api::active()) {
+                    // Default answer: do not scale down.
+                    sswcp_api::note("object larger than the plate: not scaled down");
+                } else {
                 MessageDialog dlg(q, _L("Your object appears to be too large, do you want to scale it down to fit the print bed automatically?"), _L("Object too large"),
                                   wxICON_QUESTION | wxYES_NO);
                 int           answer = dlg.ShowModal();
                 if (answer == wxID_YES) {
                     instance->set_scaling_factor(instance->get_scaling_factor() / max_ratio);
                     scaled_down = true;
+                }
                 }
             }
         }
@@ -13303,9 +13389,14 @@ void Plater::priv::split_object()
     wxBusyCursor wait;
     ModelObjectPtrs new_objects;
     current_model_object->split(&new_objects);
-    if (new_objects.size() == 1)
+    if (new_objects.size() == 1) {
         // #ysFIXME use notification
-        Slic3r::GUI::warning_catcher(q, _L("The selected object couldn't be split."));
+        if (sswcp_api::active()) {
+            sswcp_api::note("the selected object could not be split (message skipped)");
+        } else {
+            Slic3r::GUI::warning_catcher(q, _L("The selected object couldn't be split."));
+        }
+    }
     else
     {
         // BBS no solid parts removed
