@@ -741,7 +741,27 @@ private:
     void sw_SlicerExportGcode();
     void sw_SlicerExportSliced();
     void sw_SlicerSendToPrinter();
+
+    // Object settings and filament, presets, filament slots, plate settings.
+    void sw_SlicerGetObjectConfig();
+    void sw_SlicerSetObjectConfig();
+    void sw_SlicerSetFilament();
+    void sw_SlicerListPresets();
+    void sw_SlicerSelectPreset();
+    void sw_SlicerSetFilamentCount();
+    void sw_SlicerGetPlateSettings();
+    void sw_SlicerSetPlateSettings();
+
+    // Printer connection: list, connect through the app's device page, disconnect.
+    void sw_SlicerListPrinters();
+    void sw_SlicerConnectPrinter();
+    void sw_SlicerDisconnectPrinter();
 };
+
+// Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the
+// network (PrintHost::disconnect); call it on a worker thread. Everything that touches the
+// GUI or the AppConfig is queued with CallAfter. Returns false if the app reported a failure.
+bool sswcp_disconnect_current_machine(bool need_reload);
 
 // Main SSWCP class for managing communication instances
 class SSWCP

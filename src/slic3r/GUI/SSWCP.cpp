@@ -4492,6 +4492,22 @@ void SSWCP_MachineConnect_Instance::sw_get_connect_machine() {
     }
 }
 
+// Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the
+// network (PrintHost::disconnect); call it on a worker thread. Everything that touches the
+// GUI or the AppConfig is queued with CallAfter. Returns false if the app reported a failure.
+bool sswcp_disconnect_current_machine(bool need_reload)
+{
+    const bool res = wxGetApp().sm_disconnect_current_machine(need_reload);
+    SSWCP_Instance::m_first_connected = true;
+    wxGetApp().CallAfter([]() {
+
+        wxGetApp().app_config->clear_filament_extruder_map();
+        wxGetApp().preset_bundle->machine_filaments.clear();
+        wxGetApp().load_current_presets();
+    });
+    return res;
+}
+
 void SSWCP_MachineConnect_Instance::sw_disconnect() {
     bool need_reload = m_param_data.count("need_reload") ? m_param_data["need_reload"].get<bool>() : true;
 
@@ -4524,22 +4540,13 @@ void SSWCP_MachineConnect_Instance::sw_disconnect() {
 
 
 
-        bool res = wxGetApp().sm_disconnect_current_machine(need_reload);
-        m_first_connected = true;
+        bool res = sswcp_disconnect_current_machine(need_reload);
         if (!res) {
             if (self) {
                 self->m_status = 1;
                 self->m_msg    = "disconnected failed";
             }
         }
-
-
-        wxGetApp().CallAfter([]() {
-
-            wxGetApp().app_config->clear_filament_extruder_map();
-            wxGetApp().preset_bundle->machine_filaments.clear();
-            wxGetApp().load_current_presets();
-        });
 
         if (self) {
             self->send_to_js();
@@ -4666,6 +4673,28 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerExportSliced();
     } else if (m_cmd == "sw_SlicerSendToPrinter") {
         sw_SlicerSendToPrinter();
+    } else if (m_cmd == "sw_SlicerGetObjectConfig") {
+        sw_SlicerGetObjectConfig();
+    } else if (m_cmd == "sw_SlicerSetObjectConfig") {
+        sw_SlicerSetObjectConfig();
+    } else if (m_cmd == "sw_SlicerSetFilament") {
+        sw_SlicerSetFilament();
+    } else if (m_cmd == "sw_SlicerListPresets") {
+        sw_SlicerListPresets();
+    } else if (m_cmd == "sw_SlicerSelectPreset") {
+        sw_SlicerSelectPreset();
+    } else if (m_cmd == "sw_SlicerSetFilamentCount") {
+        sw_SlicerSetFilamentCount();
+    } else if (m_cmd == "sw_SlicerGetPlateSettings") {
+        sw_SlicerGetPlateSettings();
+    } else if (m_cmd == "sw_SlicerSetPlateSettings") {
+        sw_SlicerSetPlateSettings();
+    } else if (m_cmd == "sw_SlicerListPrinters") {
+        sw_SlicerListPrinters();
+    } else if (m_cmd == "sw_SlicerConnectPrinter") {
+        sw_SlicerConnectPrinter();
+    } else if (m_cmd == "sw_SlicerDisconnectPrinter") {
+        sw_SlicerDisconnectPrinter();
     } else {
         handle_general_fail();
     }
@@ -7975,6 +8004,11 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_SlicerNewProject", "sw_SlicerOpenProject", "sw_SlicerSaveProject",
     // Slice all, export, upload
     "sw_SlicerSliceAll", "sw_SlicerExportGcode", "sw_SlicerExportSliced", "sw_SlicerSendToPrinter",
+    // Object settings, filament, presets, plate settings, printer connection
+    "sw_SlicerGetObjectConfig", "sw_SlicerSetObjectConfig", "sw_SlicerSetFilament",
+    "sw_SlicerListPresets", "sw_SlicerSelectPreset", "sw_SlicerSetFilamentCount",
+    "sw_SlicerGetPlateSettings", "sw_SlicerSetPlateSettings",
+    "sw_SlicerListPrinters", "sw_SlicerConnectPrinter", "sw_SlicerDisconnectPrinter",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.

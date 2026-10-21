@@ -12,6 +12,7 @@
 // Header-only: inline functions with static locals. Everything runs on the GUI thread, so no
 // synchronization is needed.
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -33,11 +34,15 @@ inline std::vector<std::string>& notes_mut()
 // Is API mode active (inside at least one Scope)?
 inline bool active() { return detail::depth() > 0; }
 
-// Record an automatically made choice (only in API mode).
+// Record an automatically made choice (only in API mode). A text that is already recorded is not
+// added again (settings checks can run several times during one command).
 inline void note(const std::string& text)
 {
-    if (active())
-        detail::notes_mut().push_back(text);
+    if (!active())
+        return;
+    std::vector<std::string>& n = detail::notes_mut();
+    if (std::find(n.begin(), n.end(), text) == n.end())
+        n.push_back(text);
 }
 
 // The recorded choices of the current (or most recently closed) outermost scope.

@@ -11,8 +11,21 @@
 
 #include <wx/msgdlg.h>
 
+#include "SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
+
 namespace Slic3r {
 namespace GUI {
+
+// Show the dialog of a settings check. In API mode (sw_Slicer* commands) the dialog is never shown:
+// what the check does is recorded as a note and 'api_answer' (the dialog's default answer) is used.
+static int show_check_dialog(MessageDialog& dialog, const std::string& api_note, int api_answer = wxID_OK)
+{
+    if (sswcp_api::active()) {
+        sswcp_api::note(api_note + " (dialog skipped)");
+        return api_answer;
+    }
+    return dialog.ShowModal();
+}
 
 void ConfigManipulation::apply(DynamicPrintConfig* config, DynamicPrintConfig* new_config)
 {
@@ -73,7 +86,7 @@ void ConfigManipulation::check_nozzle_recommended_temperature_range(DynamicPrint
         msg_text += _L("Please check.\n");
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "filament settings: the recommended nozzle temperature range looks wrong; please check it");
         is_msg_dlg_already_exist = false;
     }
 }
@@ -93,7 +106,7 @@ void ConfigManipulation::check_nozzle_temperature_range(DynamicPrintConfig *conf
             msg_text += wxString::Format(_L("The recommended nozzle temperature for this filament type is [%d, %d] degrees Celsius."), temperature_range_low, temperature_range_high);
             MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
             is_msg_dlg_already_exist = true;
-            dialog.ShowModal();
+            show_check_dialog(dialog, "filament settings: the nozzle temperature is outside the recommended range");
             is_msg_dlg_already_exist = false;
         }
     }
@@ -116,7 +129,7 @@ void ConfigManipulation::check_nozzle_temperature_initial_layer_range(DynamicPri
             msg_text += wxString::Format(_L("The recommended nozzle temperature for this filament type is [%d, %d] degrees Celsius."), temperature_range_low, temperature_range_high);
             MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
             is_msg_dlg_already_exist = true;
-            dialog.ShowModal();
+            show_check_dialog(dialog, "filament settings: the first-layer nozzle temperature is outside the recommended range");
             is_msg_dlg_already_exist = false;
         }
     }
@@ -155,7 +168,7 @@ void ConfigManipulation::check_filament_max_volumetric_speed(DynamicPrintConfig 
             const wxString msg_text = _(L("Too small max volumetric speed.\nReset to 0.5."));
             MessageDialog  dialog(nullptr, msg_text, "", wxICON_WARNING | wxOK);
             is_msg_dlg_already_exist = true;
-            dialog.ShowModal();
+            show_check_dialog(dialog, "filament settings: max volumetric speed too small, reset to 0.5");
         }
         new_conf.set_key_value("filament_max_volumetric_speed", corrected.clone());
         apply(config, &new_conf);
@@ -184,7 +197,7 @@ void ConfigManipulation::check_chamber_temperature(DynamicPrintConfig* config)
                                                         "The maximum safe temperature for the material is %d"), iter->second);
                 MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
                 is_msg_dlg_already_exist = true;
-                dialog.ShowModal();
+                show_check_dialog(dialog, "filament settings: the chamber temperature is higher than the safe temperature of the material");
                 is_msg_dlg_already_exist = false;
             }
         }
@@ -212,7 +225,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: layer height too small, reset to 0.2");
         new_conf.set_key_value("layer_height", new ConfigOptionFloat(0.2));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -226,7 +239,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(nullptr, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: layer height too large, reset to the printer maximum");
         new_conf.set_key_value("layer_height", new ConfigOptionFloat(max_lh));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -239,7 +252,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(nullptr, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: ironing spacing too small, reset to 0.1");
         new_conf.set_key_value("ironing_spacing", new ConfigOptionFloat(0.1));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -250,7 +263,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(nullptr, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: support ironing spacing too small, reset to 0.1");
         new_conf.set_key_value("support_ironing_spacing", new ConfigOptionFloat(0.1));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -262,7 +275,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: zero first layer height, reset to 0.2");
         new_conf.set_key_value("initial_layer_print_height", new ConfigOptionFloat(0.2));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -277,7 +290,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: xy_hole_compensation reset to 0");
         new_conf.set_key_value("xy_hole_compensation", new ConfigOptionFloat(0));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -292,7 +305,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: xy_contour_compensation reset to 0");
         new_conf.set_key_value("xy_contour_compensation", new ConfigOptionFloat(0));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -307,7 +320,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: elefant_foot_compensation reset to 0");
         new_conf.set_key_value("elefant_foot_compensation", new ConfigOptionFloat(0));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -365,7 +378,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "",
                                wxICON_WARNING | (is_global_config ? wxYES | wxNO : wxOK));
         DynamicPrintConfig new_conf = *config;
-        auto answer = dialog.ShowModal();
+        auto answer = show_check_dialog(dialog, "print settings: ensure_vertical_shell_thickness set to Moderate to keep alternate_extra_wall", wxID_YES);
         if (!is_global_config || answer == wxID_YES) {
             new_conf.set_key_value("ensure_vertical_shell_thickness", new ConfigOptionEnum<EnsureVerticalShellThickness>(evstModerate));
             new_conf.set_key_value("alternate_extra_wall", new ConfigOptionBool(true));
@@ -489,7 +502,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
                     wxICON_WARNING | (is_global_config ? wxYES | wxNO : wxOK));
                 DynamicPrintConfig new_conf = *config;
                 is_msg_dlg_already_exist = true;
-                auto answer = dialog.ShowModal();
+                auto answer = show_check_dialog(dialog, "print settings: sparse infill pattern switched to rectilinear to keep 100% density", wxID_YES);
                 if (is_object_config || answer == wxID_YES) {
                     new_conf.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<InfillPattern>(ipRectilinear));
                     sparse_infill_density = 100;
@@ -525,7 +538,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog      dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist    = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: seam_slope_start_height reset to 0");
         new_conf.set_key_value("seam_slope_start_height", new ConfigOptionFloatOrPercent(0, false));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -538,7 +551,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog      dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxOK);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist    = true;
-        dialog.ShowModal();
+        show_check_dialog(dialog, "print settings: infill_lock_depth reset to 50% of skin_infill_depth");
         new_conf.set_key_value("infill_lock_depth", new ConfigOptionFloat(skin_depth / 2));
         apply(config, &new_conf);
         is_msg_dlg_already_exist = false;
@@ -553,7 +566,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
         MessageDialog dialog(m_msg_dlg_parent, msg_text, "", wxICON_WARNING | wxYES | wxNO);
         DynamicPrintConfig new_conf = *config;
         is_msg_dlg_already_exist = true;
-        auto answer = dialog.ShowModal();
+        auto answer = show_check_dialog(dialog, "print settings: Arachne wall generator enabled for the fuzzy skin mode", wxID_YES);
         if (answer == wxID_YES)
             new_conf.set_key_value("wall_generator", new ConfigOptionEnum<PerimeterGeneratorType>(PerimeterGeneratorType::Arachne));
         else 
@@ -1061,7 +1074,7 @@ int ConfigManipulation::show_spiral_mode_settings_dialog(bool is_object_config)
     MessageDialog dialog(m_msg_dlg_parent, msg_text, "",
         wxICON_WARNING | (!is_object_config ? wxYES | wxNO : wxOK));
     is_msg_dlg_already_exist = true;
-    auto answer = dialog.ShowModal();
+    auto answer = show_check_dialog(dialog, "spiral mode: wall loops, top shell layers, infill density, support and timelapse settings adjusted", wxID_YES);
     is_msg_dlg_already_exist = false;
     if (is_object_config)
         answer = wxID_YES;

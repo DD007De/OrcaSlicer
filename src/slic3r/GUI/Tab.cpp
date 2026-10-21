@@ -55,6 +55,7 @@
 #include "BedShapeDialog.hpp"
 #include "libslic3r/GCode/Thumbnails.hpp"
 #include "NotificationManager.hpp"
+#include "SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
 
 #include "BedShapeDialog.hpp"
 // #include "BonjourDialog.hpp"
@@ -5621,7 +5622,10 @@ void TabPrinter::toggle_options()
                 _(L("Firmware Retraction")), wxICON_WARNING | wxYES | wxNO);
 
             DynamicPrintConfig new_conf = *m_config;
-            if (dialog.ShowModal() == wxID_YES) {
+            // API mode (sw_Slicer* commands): no dialog; take the default answer "Yes".
+            if (sswcp_api::active())
+                sswcp_api::note("printer settings: wipe disabled because firmware retraction is used (dialog skipped)");
+            if (sswcp_api::active() || dialog.ShowModal() == wxID_YES) {
                 auto wipe = static_cast<ConfigOptionBools*>(m_config->option("wipe")->clone());
                 for (size_t w = 0; w < wipe->values.size(); w++)
                     wipe->values[w] = false;
@@ -6290,6 +6294,13 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
 bool Tab::may_discard_current_dirty_preset(PresetCollection* presets /*= nullptr*/, const std::string& new_printer_name /*= ""*/, bool no_transfer)
 {
     if (presets == nullptr) presets = m_presets;
+
+    // API mode (sw_Slicer* commands): never ask. The caller has already discarded the
+    // unsaved preset edits, so this is only a safety net: cancel the switch.
+    if (sswcp_api::active()) {
+        sswcp_api::note("preset switch cancelled: unsaved preset changes (dialog skipped)");
+        return false;
+    }
 
     UnsavedChangesDialog dlg(m_type, presets, new_printer_name, no_transfer);
 

@@ -46,6 +46,10 @@
 #include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/TextConfiguration.hpp"
 #include "libslic3r/EmbossShape.hpp"
+#include "libslic3r/ParameterUtils.hpp"
+#include "slic3r/GUI/ParamsPanel.hpp"
+#include "slic3r/GUI/ObjectDataViewModel.hpp"
+#include "slic3r/GUI/HttpServer.hpp"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -55,6 +59,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -71,7 +76,7 @@
 #include <wx/fontenum.h>
 #include <wx/weakref.h>
 #ifdef _WIN32
-// SetForegroundWindow() for the send dialog of a cloud-connected printer.
+// SetForegroundWindow() for the app's Flutter pages (send dialog, device page).
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -100,7 +105,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 7;
+        m_res_data["phase"]    = 8;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -209,10 +214,13 @@ void SSWCP_SliceProject_Instance::sw_SlicerSlice()
 // and the one-time result notification of a finished upload (shown here, on the GUI thread).
 static json sw_slicer_upload_status_json();
 static void sw_slicer_upload_notify();
+// Defined with sw_SlicerListPrinters: the connected printer and a running connect request.
+static json sw_slicer_printer_status_json();
 
 // Poll status: whether a slice is running, a rough progress (0/100, -1 = invalid),
 // and whether the slice result is valid. Also whether a G-code export or a "slice all" run is
-// in progress, the last upload to the printer (upload, if any) and with all:true every plate.
+// in progress, the last upload to the printer (upload, if any), the printer connection (printer)
+// and with all:true every plate.
 void SSWCP_SliceProject_Instance::sw_SlicerGetStatus()
 {
     try {
@@ -244,6 +252,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerGetStatus()
         if (!upload.is_null())
             m_res_data["upload"] = upload;
         sw_slicer_upload_notify();
+        m_res_data["printer"] = sw_slicer_printer_status_json();
         send_to_js();
         finish_job();
     } catch (std::exception& e) {
@@ -4533,6 +4542,32 @@ static std::string sw_slicer_printer_model_name()
     return name;
 }
 
+// The Flutter pages of the app (send dialog, device page) only work while the app is the active
+// application: bring the main window to the front. If Windows refuses, ask for the user's attention
+// and add a note that names 'what' needs the active window.
+static bool sw_slicer_bring_app_to_front(std::vector<std::string>& notes, const std::string& what)
+{
+    MainFrame* frame = wxGetApp().mainframe;
+    if (frame == nullptr)
+        return false;
+    if (frame->IsIconized())
+        frame->Iconize(false);
+    frame->Show(true);
+    frame->Raise();
+    bool in_front = true;
+#ifdef _WIN32
+    // Windows may refuse this while another application owns the foreground.
+    const HWND hwnd = static_cast<HWND>(frame->GetHandle());
+    ::SetForegroundWindow(hwnd);
+    in_front = ::GetForegroundWindow() == hwnd;
+#endif
+    if (!in_front) {
+        frame->RequestUserAttention();
+        notes.push_back("the app could not bring itself to the front; click the app window so that " + what + " works");
+    }
+    return in_front;
+}
+
 // Cloud (WAN) connection: hand the upload to the app's own send dialog, as Plater::send_gcode_legacy()
 // does for the U1 (WebPreprintDialog), but always on the "send only" page (preSend, path=5) and without
 // the PrintHostSendDialog (the API supplies the file name). The Flutter page uploads through the cloud
@@ -4553,21 +4588,7 @@ static void sw_slicer_send_via_app_dialog(int n, const std::string& filename, st
         throw std::runtime_error("the G-code of plate " + std::to_string(n) + " was not found; slice it again");
 
     // The Flutter page only works while the app is the active application: bring it to the front.
-    if (frame->IsIconized())
-        frame->Iconize(false);
-    frame->Show(true);
-    frame->Raise();
-    bool in_front = true;
-#ifdef _WIN32
-    // Windows may refuse this while another application owns the foreground.
-    const HWND hwnd = static_cast<HWND>(frame->GetHandle());
-    ::SetForegroundWindow(hwnd);
-    in_front = ::GetForegroundWindow() == hwnd;
-#endif
-    if (!in_front) {
-        frame->RequestUserAttention();
-        notes.push_back("the app could not bring itself to the front; click the app window so that the send dialog works");
-    }
+    sw_slicer_bring_app_to_front(notes, "the send dialog");
     notes.push_back("the printer is connected through the cloud; the app's send dialog was opened - confirm the upload there");
 
     const bool switch_to_device = wxGetApp().app_config->get_bool("open_device_tab_post_upload");
@@ -4816,6 +4837,1314 @@ void SSWCP_SliceProject_Instance::sw_SlicerSendToPrinter()
         m_res_data["notes"]    = notes;
         send_to_js();
         finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Object settings and filament -----------------------------------------------------
+
+// Keys that can be set per object (is_part false) or per part, exactly like the settings tab of the
+// object list (TabPrintObject / TabPrintPart): Preset::print_options() limited to PrintObjectConfig +
+// PrintRegionConfig (object) or to PrintRegionConfig (part). Without 'extruder': the filament is set
+// with sw_SlicerSetFilament, because the app also resets the part filaments for an object.
+static const std::set<std::string>& sw_slicer_model_keys(bool is_part)
+{
+    auto build = [](bool part) {
+        std::set<std::string> scope;
+        for (const std::string& k : PrintRegionConfig().keys())
+            scope.insert(k);
+        if (!part)
+            for (const std::string& k : PrintObjectConfig().keys())
+                scope.insert(k);
+        std::set<std::string> keys;
+        for (const std::string& k : Preset::print_options())
+            if (scope.count(k) != 0 && k != "extruder")
+                keys.insert(k);
+        return keys;
+    };
+    static const std::set<std::string> object_keys = build(false);
+    static const std::set<std::string> part_keys   = build(true);
+    return is_part ? part_keys : object_keys;
+}
+
+// {object, volume?} of the object settings and filament commands. 'object' is required (no
+// fallback to the selection); without 'volume' the object itself is the target (vol = -1).
+namespace {
+struct SwSlicerModelTarget
+{
+    int          obj = -1;
+    int          vol = -1;
+    ModelObject* mo  = nullptr;
+    ModelVolume* mv  = nullptr;
+};
+} // namespace
+
+static SwSlicerModelTarget sw_slicer_model_target(const json& params)
+{
+    if (!sw_slicer_has_param(params, "object"))
+        throw std::runtime_error("specify 'object' (0-based)");
+    sw_slicer_get_index(params, "object"); // type check
+    SwSlicerModelTarget t;
+    t.obj = sw_slicer_resolve_object(params);
+    t.vol = sw_slicer_has_param(params, "volume") ? sw_slicer_get_index(params, "volume") : -1;
+    sw_slicer_check_indices(t.obj, -1, t.vol);
+    t.mo = wxGetApp().plater()->model().objects[t.obj];
+    t.mv = (t.vol >= 0) ? t.mo->volumes[t.vol] : nullptr;
+    return t;
+}
+
+// The config that holds the overrides of the target: the object's or the part's.
+static ModelConfig& sw_slicer_target_config(int obj, int vol)
+{
+    ModelObject* mo = wxGetApp().plater()->model().objects[obj];
+    if (vol < 0)
+        return mo->config;
+    return mo->volumes[vol]->config;
+}
+
+// Effective value of 'key' for the target: the part's override, else the object's override, else
+// the active print preset (including unsaved edits, like sw_SlicerGetConfig). null if unknown.
+static json sw_slicer_effective_value(int obj, int vol, const std::string& key)
+{
+    if (vol >= 0) {
+        const ModelConfig& vcfg = sw_slicer_target_config(obj, vol);
+        if (vcfg.has(key))
+            return vcfg.opt_serialize(key);
+    }
+    const ModelConfig& ocfg = sw_slicer_target_config(obj, -1);
+    if (ocfg.has(key))
+        return ocfg.opt_serialize(key);
+    Tab* tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
+    if (tab == nullptr || tab->get_config() == nullptr || tab->get_config()->optptr(key) == nullptr)
+        return nullptr;
+    return tab->get_config()->opt_serialize(key);
+}
+
+// A part can only carry its own settings or filament if it is a solid part or a modifier (the same
+// types as in the object list) and the object list shows it as a separate item: an object with a
+// single part has no part item (and cut connectors are not listed), so the GUI cannot show or edit
+// part settings there.
+static void sw_slicer_require_editable_part(const SwSlicerModelTarget& t, const std::string& what)
+{
+    const ModelVolumeType type = t.mv->type();
+    if (type != ModelVolumeType::MODEL_PART && type != ModelVolumeType::PARAMETER_MODIFIER)
+        throw std::runtime_error(what + std::string(sw_slicer_volume_type(type)));
+    ObjectDataViewModel* list_model = wxGetApp().obj_list()->GetModel();
+    if (list_model == nullptr || !list_model->GetVolumeItem(list_model->GetObjectItem(t.mo), t.vol).IsOk())
+        throw std::runtime_error("volume " + std::to_string(t.vol) + " of object " + std::to_string(t.obj) +
+                                 " is not a separate part in the object list; set it on the object (omit 'volume')");
+}
+
+// The filament of a target: the 'extruder' override (0 = default for an object, or "follows the
+// object" for a part).
+static int sw_slicer_target_filament(const ModelConfig& cfg) { return cfg.has("extruder") ? cfg.opt_int("extruder") : 0; }
+
+// Read the overrides (own settings) of an object or part, its filament and, with 'keys', the
+// effective values. Read-only.
+void SSWCP_SliceProject_Instance::sw_SlicerGetObjectConfig()
+{
+    try {
+        if (wxGetApp().plater() == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        const SwSlicerModelTarget t   = sw_slicer_model_target(m_param_data);
+        const ModelConfig&        cfg = sw_slicer_target_config(t.obj, t.vol);
+        json                      overrides = json::object();
+        for (const std::string& key : cfg.keys())
+            if (key != "extruder")
+                overrides[key] = cfg.opt_serialize(key);
+        m_res_data["object"] = t.obj;
+        if (t.vol >= 0)
+            m_res_data["volume"] = t.vol;
+        m_res_data["overrides"] = overrides;
+        m_res_data["filament"]  = sw_slicer_target_filament(cfg);
+        if (sw_slicer_has_param(m_param_data, "keys")) {
+            const json& keys = m_param_data.at("keys");
+            if (!keys.is_array())
+                throw std::runtime_error("'keys' must be a list of strings");
+            const std::set<std::string>& allowed   = sw_slicer_model_keys(t.vol >= 0);
+            json                         effective = json::object();
+            for (const json& k : keys) {
+                if (!k.is_string())
+                    throw std::runtime_error("'keys' must be a list of strings");
+                const std::string key = k.get<std::string>();
+                effective[key]        = allowed.count(key) != 0 ? sw_slicer_effective_value(t.obj, t.vol, key) : json(nullptr);
+            }
+            m_res_data["effective"] = effective;
+        }
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Set or remove overrides of an object or part, with the key names of sw_SlicerSetConfig. All or
+// nothing: every key and value is validated before anything is written. One undo step
+// "API: Object settings"; a no-op takes no snapshot. The object is resliced afterwards.
+void SSWCP_SliceProject_Instance::sw_SlicerSetObjectConfig()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        // 1. Guards.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        const SwSlicerModelTarget t       = sw_slicer_model_target(m_param_data);
+        const bool                is_part = t.vol >= 0;
+
+        // 2. values and/or reset.
+        std::vector<std::pair<std::string, std::string>> values;
+        std::vector<std::string>                         reset;
+        if (sw_slicer_has_param(m_param_data, "values")) {
+            const json& j = m_param_data.at("values");
+            if (!j.is_object())
+                throw std::runtime_error("'values' must be an object {key: value}");
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                if (it.key().empty())
+                    throw std::runtime_error("'values' contains an empty key");
+                if (!it.value().is_string())
+                    throw std::runtime_error("the value of '" + it.key() + "' must be a string (like sw_SlicerSetConfig)");
+                values.emplace_back(it.key(), it.value().get<std::string>());
+            }
+        }
+        if (sw_slicer_has_param(m_param_data, "reset")) {
+            const json& j = m_param_data.at("reset");
+            if (!j.is_array())
+                throw std::runtime_error("'reset' must be a list of keys");
+            for (const json& k : j) {
+                if (!k.is_string() || k.get<std::string>().empty())
+                    throw std::runtime_error("'reset' must be a list of keys");
+                const std::string key = k.get<std::string>();
+                if (std::find(reset.begin(), reset.end(), key) != reset.end())
+                    throw std::runtime_error("'" + key + "' appears twice in reset");
+                reset.push_back(key);
+            }
+        }
+        if (values.empty() && reset.empty())
+            throw std::runtime_error("specify 'values' and/or 'reset'");
+        for (const std::string& key : reset)
+            for (const auto& kv : values)
+                if (kv.first == key)
+                    throw std::runtime_error("'" + key + "' appears in both values and reset");
+
+        // 3. Type of the part.
+        if (is_part)
+            sw_slicer_require_editable_part(t, "settings cannot be set on a ");
+
+        // 4. Validate everything before anything is written.
+        ModelConfig&                 cfg     = sw_slicer_target_config(t.obj, t.vol);
+        const std::set<std::string>& allowed = sw_slicer_model_keys(is_part);
+        const std::string            scope   = is_part ? "per part" : "per object";
+        // A key that is already an override (for example from an older project) may always be reset.
+        auto check_key = [&](const std::string& key, bool existing_ok) {
+            if (key == "extruder")
+                throw std::runtime_error("use sw_SlicerSetFilament to change the filament");
+            if (allowed.count(key) == 0 && !(existing_ok && cfg.has(key)))
+                throw std::runtime_error("'" + key + "' cannot be set " + scope);
+        };
+        DynamicPrintConfig probe;
+        for (const auto& kv : values) {
+            check_key(kv.first, false);
+            try {
+                probe.set_deserialize_strict(kv.first, kv.second);
+            } catch (std::exception& e) {
+                throw std::runtime_error("invalid value for '" + kv.first + "': " + e.what());
+            }
+            // set_deserialize may resolve a legacy name or a shortcut to other keys.
+            if (probe.option(kv.first) == nullptr)
+                throw std::runtime_error("invalid value for '" + kv.first + "': the key was not set");
+        }
+        for (const std::string& key : reset)
+            check_key(key, true);
+
+        // 5. What actually changes.
+        std::vector<std::string> notes;
+        std::vector<std::string> to_set;
+        std::vector<std::string> to_erase;
+        for (const auto& kv : values)
+            if (!cfg.has(kv.first) || cfg.opt_serialize(kv.first) != probe.opt_serialize(kv.first))
+                to_set.push_back(kv.first);
+        for (const std::string& key : reset) {
+            if (cfg.has(key))
+                to_erase.push_back(key);
+            else
+                notes.push_back("'" + key + "' had no override");
+        }
+        json changed    = json::object();
+        json reset_done = json::array();
+        auto reply      = [&]() {
+            m_res_data["object"] = t.obj;
+            if (is_part)
+                m_res_data["volume"] = t.vol;
+            m_res_data["changed"] = changed;
+            m_res_data["reset"]   = reset_done;
+            m_res_data["notes"]   = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (to_set.empty() && to_erase.empty()) {
+            notes.push_back("settings unchanged; nothing changed");
+            reply();
+            return;
+        }
+
+        // 6. Select the target, so the settings panel shows it.
+        sw_slicer_select(t.obj, -1, t.vol);
+        wxGetApp().obj_list()->select_item(ObjectVolumeID{t.mo, is_part ? t.mv : nullptr});
+
+        // 7. Write, 8. refresh like TabPrintModel::on_value_change() / notify_changed().
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Object settings");
+            for (const std::string& key : to_set) {
+                json e;
+                e["old"] = cfg.has(key) ? json(cfg.opt_serialize(key)) : json(nullptr);
+                cfg.set_key_value(key, probe.option(key)->clone());
+                e["new"]     = cfg.opt_serialize(key);
+                changed[key] = e;
+            }
+            for (const std::string& key : to_erase) {
+                cfg.erase(key);
+                reset_done.push_back(key);
+            }
+            wxGetApp().obj_list()->object_config_options_changed({t.mo, is_part ? t.mv : nullptr});
+            wxGetApp().params_panel()->notify_object_config_changed();
+            // The settings panel caches the values of the selection: rebuild it for the new values.
+            wxGetApp().obj_list()->part_selection_changed();
+            plater->notify_filament_usage_changed();
+            // 'new' after the refresh: a settings check may have corrected the value (see the notes).
+            for (const std::string& key : to_set)
+                changed[key]["new"] = cfg.has(key) ? json(cfg.opt_serialize(key)) : json(nullptr);
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        // Schedule the reslice afterwards (never reslice() here). The object is looked up again by
+        // its ID: its index may change if the user deletes an object in between.
+        const ObjectID object_id = t.mo->id();
+        wxGetApp().CallAfter([object_id]() {
+            Plater* p = wxGetApp().plater();
+            if (p == nullptr)
+                return;
+            for (ModelObject* o : p->model().objects)
+                if (o->id() == object_id) {
+                    p->changed_object(*o);
+                    return;
+                }
+        });
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Choose the filament of an object or part, like the filament column of the object list
+// (ObjectList::set_extruder_for_selected_items). 0 = default (object) or "use the object's
+// filament" (part). Setting the object's filament resets the filaments of its solid parts, as in
+// the app. One undo step "API: Change filament".
+void SSWCP_SliceProject_Instance::sw_SlicerSetFilament()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        const SwSlicerModelTarget t       = sw_slicer_model_target(m_param_data);
+        const bool                is_part = t.vol >= 0;
+
+        // Same limit as the app (set_extruder_for_selected_items silently ignores a larger number).
+        const int n = static_cast<int>(plater->get_extruder_colors_from_plater_config().size());
+        const json* jf = sw_slicer_has_param(m_param_data, "filament") ? &m_param_data.at("filament") : nullptr;
+        if (jf == nullptr || !jf->is_number_integer() || jf->get<long long>() < 0 || jf->get<long long>() > n)
+            throw std::runtime_error("filament must be between 0 and " + std::to_string(n) + " (0 = default)");
+        const int filament = jf->get<int>();
+        if (is_part)
+            sw_slicer_require_editable_part(t, "the filament of a ");
+
+        ModelConfig&             cfg     = sw_slicer_target_config(t.obj, t.vol);
+        const int                current = sw_slicer_target_filament(cfg);
+        std::vector<std::string> notes;
+        // For a solid part, 0 makes the app store the object's filament number as shown in the list;
+        // a modifier really stores 0 (it does not change the filament).
+        ObjectDataViewModel* list_model     = wxGetApp().obj_list()->GetModel();
+        const bool           follows_object = is_part && filament == 0 && t.mv->type() == ModelVolumeType::MODEL_PART;
+        const int object_filament = (list_model != nullptr) ? list_model->GetExtruderNumber(list_model->GetObjectItem(t.mo)) : 0;
+        const int expected        = follows_object ? object_filament : filament;
+        const char* zero_note     = follows_object ? "0 means: use the object's filament" : "0 means: the modifier does not change the filament";
+        auto      reply           = [&](int value) {
+            m_res_data["object"] = t.obj;
+            if (is_part)
+                m_res_data["volume"] = t.vol;
+            m_res_data["filament"] = value;
+            m_res_data["notes"]    = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (current == filament || current == expected) {
+            if (is_part && filament == 0)
+                notes.push_back(zero_note);
+            notes.push_back("filament unchanged; nothing changed");
+            reply(current);
+            return;
+        }
+        if (!is_part) {
+            for (const ModelVolume* mv : t.mo->volumes)
+                if (mv->type() == ModelVolumeType::MODEL_PART && mv->config.has("extruder")) {
+                    notes.push_back("part filaments reset to follow the object");
+                    break;
+                }
+        } else if (filament == 0) {
+            notes.push_back(zero_note);
+        }
+
+        // set_extruder_for_selected_items() works on the selection of the object list.
+        ObjectList* list = wxGetApp().obj_list();
+        list->select_item(ObjectVolumeID{t.mo, is_part ? t.mv : nullptr});
+        if (list->get_selected_obj_idx() != t.obj || (is_part ? list->get_selected_model_volume() != t.mv : list->get_selected_model_volume() != nullptr))
+            throw std::runtime_error("could not select the target in the object list");
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Change filament");
+            // The app's own snapshot "Change Filaments" is suppressed; it also updates the plater
+            // (reslice through the normal background process) and the filament usage.
+            list->set_extruder_for_selected_items(filament);
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        const int now = sw_slicer_target_filament(cfg);
+        if (now != expected)
+            throw std::runtime_error(sw_slicer_join_notes("the filament was not changed", notes));
+        reply(now);
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Presets ------------------------------------------------------------------------------
+
+static PresetCollection& sw_slicer_preset_collection(Preset::Type type)
+{
+    PresetBundle* bundle = wxGetApp().preset_bundle;
+    if (type == Preset::TYPE_PRINTER)
+        return bundle->printers;
+    if (type == Preset::TYPE_FILAMENT)
+        return bundle->filaments;
+    return bundle->prints;
+}
+
+// Required string parameter 'type' (printer/print/filament).
+static std::string sw_slicer_type_param(const json& params)
+{
+    if (!sw_slicer_has_param(params, "type") || !params.at("type").is_string())
+        throw std::runtime_error("specify 'type' (printer, print or filament)");
+    return params.at("type").get<std::string>();
+}
+
+// The presets of a type as in the sidebar combo boxes: visible and (print/filament) compatible
+// with the selected printer; with all:true every preset. 'selected' is the selected preset, for
+// filaments the list of the slots (slot 1 first). Read-only.
+void SSWCP_SliceProject_Instance::sw_SlicerListPresets()
+{
+    try {
+        const std::string  type = sw_slicer_type_param(m_param_data);
+        const Preset::Type pt   = sw_slicer_preset_type(type);
+        const bool         all  = sw_slicer_flag_true(m_param_data, "all");
+        const PresetCollection& collection = sw_slicer_preset_collection(pt);
+        json presets = json::array();
+        for (const Preset& preset : collection) {
+            if (preset.is_default)
+                continue;
+            if (!all && (!preset.is_visible || (pt != Preset::TYPE_PRINTER && !preset.is_compatible)))
+                continue;
+            json e;
+            e["name"]       = preset.name;
+            e["system"]     = preset.is_system;
+            e["user"]       = preset.is_user();
+            e["compatible"] = preset.is_compatible;
+            presets.push_back(e);
+        }
+        m_res_data["type"] = type;
+        if (pt == Preset::TYPE_FILAMENT)
+            m_res_data["selected"] = wxGetApp().preset_bundle->filament_presets;
+        else
+            m_res_data["selected"] = collection.get_selected_preset_name();
+        m_res_data["presets"] = presets;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Select a printer, print or filament preset (filament: per slot, 1-based), like the sidebar combo
+// boxes. Unsaved preset edits require preset_changes:'discard'. Presets are not part of the undo
+// stack: no snapshot; the reply holds 'previous' to switch back. A printer switch is refused while a
+// physical printer is selected; if the bed moved, the re-centred objects are reported.
+void SSWCP_SliceProject_Instance::sw_SlicerSelectPreset()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        // 1. Guards.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+
+        const std::string  type = sw_slicer_type_param(m_param_data);
+        const Preset::Type pt   = sw_slicer_preset_type(type);
+        if (!sw_slicer_has_param(m_param_data, "name") || !m_param_data.at("name").is_string() ||
+            m_param_data.at("name").get<std::string>().empty())
+            throw std::runtime_error("specify 'name' (see sw_SlicerListPresets)");
+        const std::string name = m_param_data.at("name").get<std::string>();
+
+        // 2. Filament slot (1-based).
+        PresetBundle*                   bundle = wxGetApp().preset_bundle;
+        const std::vector<std::string>& slots  = bundle->filament_presets;
+        int                             slot   = 1;
+        if (sw_slicer_has_param(m_param_data, "filament")) {
+            if (pt != Preset::TYPE_FILAMENT)
+                throw std::runtime_error("'filament' only applies to type 'filament'");
+            const json& j = m_param_data.at("filament");
+            if (!j.is_number_integer() || j.get<long long>() < 1 || j.get<long long>() > static_cast<long long>(slots.size()))
+                throw std::runtime_error("filament slot must be between 1 and " + std::to_string(slots.size()));
+            slot = j.get<int>();
+        }
+        if (pt == Preset::TYPE_FILAMENT && (slot < 1 || slot > static_cast<int>(slots.size())))
+            throw std::runtime_error("filament slot must be between 1 and " + std::to_string(slots.size()));
+
+        // 3. The preset exists (and is compatible).
+        PresetCollection& collection = sw_slicer_preset_collection(pt);
+        const Preset*     preset     = collection.find_preset(name, false, true);
+        if (preset == nullptr || preset->is_default || !preset->is_visible)
+            throw std::runtime_error("preset '" + name + "' does not exist");
+        if (pt != Preset::TYPE_PRINTER && !preset->is_compatible)
+            throw std::runtime_error("preset '" + name + "' is not compatible with the selected printer");
+
+        // 4. Already selected?
+        const std::string previous = (pt == Preset::TYPE_FILAMENT) ? slots[slot - 1] : collection.get_selected_preset_name();
+        std::vector<std::string> notes;
+        auto reply = [&](const json& moved_objects) {
+            m_res_data["type"] = type;
+            m_res_data["name"] = name;
+            if (pt == Preset::TYPE_FILAMENT)
+                m_res_data["filament"] = slot;
+            m_res_data["previous"] = previous;
+            if (!moved_objects.empty())
+                m_res_data["moved_objects"] = moved_objects;
+            m_res_data["notes"] = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (previous == name) {
+            notes.push_back("preset already selected; nothing changed");
+            reply(json::array());
+            return;
+        }
+
+        // 5. Physical printers are not supported by the API (decision F2-O1).
+        if (pt == Preset::TYPE_PRINTER && bundle->physical_printers.has_selection())
+            throw std::runtime_error("a physical printer is selected; switch printers in the app");
+
+        // 6. Unsaved preset edits: only on explicit request, and then all of them are discarded first,
+        // so the app's unsaved-changes dialog never comes up.
+        const std::string choice = sw_slicer_preset_choice(m_param_data, /*allow_keep=*/false);
+
+        // 7. Switch.
+        std::vector<int> moved;
+        bool             ok = false;
+        {
+            sswcp_api::Scope api_scope;
+            if (choice == "discard")
+                sw_slicer_discard_preset_changes();
+            ok = plater->select_preset_by_name(pt, name, slot - 1, &moved);
+            notes = sswcp_api::notes();
+        }
+        if (choice == "discard")
+            notes.insert(notes.begin(), "preset changes discarded");
+        // 8.
+        if (!ok)
+            throw std::runtime_error(sw_slicer_join_notes("the preset could not be selected", notes));
+
+        // 9. Not undoable; objects moved because the bed changed (decision F2-O2).
+        notes.push_back("not part of undo; use previous to switch back");
+        json moved_objects = json::array();
+        std::sort(moved.begin(), moved.end());
+        moved.erase(std::unique(moved.begin(), moved.end()), moved.end());
+        const ModelObjectPtrs& objects = plater->model().objects;
+        for (int i : moved)
+            if (i >= 0 && i < static_cast<int>(objects.size())) {
+                json e;
+                e["object"] = i;
+                e["name"]   = objects[i]->name;
+                moved_objects.push_back(e);
+            }
+        if (!moved_objects.empty())
+            notes.push_back("the bed changed: " + std::to_string(moved_objects.size()) +
+                            " object(s) were moved to the centre of their plate (not part of undo)");
+        reply(moved_objects);
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Filament slots ------------------------------------------------------------------------
+
+// Does any plate have a filament order per layer range? The app adjusts it to the filament count.
+static bool sw_slicer_any_other_layers_sequence()
+{
+    PartPlateList& plates = wxGetApp().plater()->get_partplate_list();
+    for (int i = 0; i < plates.get_plate_count(); ++i)
+        if (!plates.get_plate(i)->get_other_layers_print_sequence().empty())
+            return true;
+    return false;
+}
+
+static bool sw_slicer_is_hex_color(const std::string& s)
+{
+    if (s.size() != 7 || s[0] != '#')
+        return false;
+    return std::all_of(s.begin() + 1, s.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; });
+}
+
+// Add or remove physical filament slots, like the + and - buttons of the sidebar. Removing requires
+// replace_with (a remaining slot that takes over the objects of the removed slots). Not part of the
+// undo stack: no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerSetFilamentCount()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+
+        Sidebar&      sidebar = plater->sidebar();
+        PresetBundle* bundle  = wxGetApp().preset_bundle;
+        // The physical slots, as Sidebar::add_filament() counts them.
+        const int  previous = static_cast<int>(sidebar.combos_filament().size());
+        const int  max      = static_cast<int>(MAXIMUM_EXTRUDER_NUMBER);
+        const json* jc      = sw_slicer_has_param(m_param_data, "count") ? &m_param_data.at("count") : nullptr;
+        if (jc == nullptr || !jc->is_number_integer() || jc->get<long long>() < 1 || jc->get<long long>() > max)
+            throw std::runtime_error("count must be between 1 and " + std::to_string(max));
+        const int count = jc->get<int>();
+
+        std::string color;
+        if (sw_slicer_has_param(m_param_data, "color")) {
+            if (count <= previous)
+                throw std::runtime_error("'color' only applies when adding filaments");
+            const json& j = m_param_data.at("color");
+            color         = j.is_string() ? j.get<std::string>() : std::string();
+            if (!sw_slicer_is_hex_color(color))
+                throw std::runtime_error("color must look like #RRGGBB");
+        }
+        const bool has_replace = sw_slicer_has_param(m_param_data, "replace_with");
+        if (has_replace && count >= previous)
+            throw std::runtime_error("'replace_with' only applies when removing filaments");
+
+        std::vector<std::string> notes;
+        auto reply = [&]() {
+            const ConfigOptionStrings* colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+            json                       list    = json::array();
+            for (size_t i = 0; i < bundle->filament_presets.size(); ++i) {
+                json e;
+                e["slot"]   = static_cast<int>(i + 1);
+                e["preset"] = bundle->filament_presets[i];
+                e["color"]  = (colours != nullptr && i < colours->values.size()) ? colours->values[i] : std::string();
+                list.push_back(e);
+            }
+            m_res_data["count"]     = static_cast<int>(sidebar.combos_filament().size());
+            m_res_data["previous"]  = previous;
+            m_res_data["filaments"] = list;
+            m_res_data["notes"]     = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (count == previous) {
+            notes.push_back("filament count unchanged; nothing changed");
+            reply();
+            return;
+        }
+        const bool had_layer_sequences = sw_slicer_any_other_layers_sequence();
+
+        if (count > previous) {
+            // Add, like Sidebar::add_filament() (the same checks, in add_custom_filament()).
+            bool failed = false;
+            {
+                sswcp_api::Scope api_scope;
+                for (int i = previous; i < count; ++i) {
+                    const size_t before = sidebar.combos_filament().size();
+                    sidebar.add_custom_filament(color.empty() ? Plater::get_next_color_for_filament() : wxColour(wxString::FromUTF8(color)));
+                    if (sidebar.combos_filament().size() <= before) {
+                        failed = true;
+                        break;
+                    }
+                }
+                notes = sswcp_api::notes();
+            }
+            if (failed)
+                throw std::runtime_error(sw_slicer_join_notes("could not add a filament (maximum reached?); the app now has " +
+                                                                  std::to_string(sidebar.combos_filament().size()) + " filament(s)",
+                                                              notes));
+        } else {
+            // Remove, from the highest slot down, like the "delete filament" menu with a replacement.
+            const json* jr = has_replace ? &m_param_data.at("replace_with") : nullptr;
+            if (jr == nullptr || !jr->is_number_integer() || jr->get<long long>() < 1 || jr->get<long long>() > count)
+                throw std::runtime_error("removing filaments requires replace_with (a slot between 1 and " + std::to_string(count) + ")");
+            const int replace_with = jr->get<int>();
+            // Checked up front: with a replacement the app removes dependent mixed filaments without asking.
+            for (int slot = count + 1; slot <= previous; ++slot)
+                if (!bundle->mixed_filaments.mixed_filaments_using_physical(static_cast<unsigned int>(slot)).empty())
+                    throw std::runtime_error("filament " + std::to_string(slot) +
+                                             " is used by mixed filament configurations; change those in the app first");
+            // Removing the slot of the edited filament preset makes the filament tab switch presets
+            // (forced): unsaved edits of that preset would be lost.
+            if (bundle->filaments.current_is_dirty()) {
+                const std::string& edited = bundle->filaments.get_edited_preset().name;
+                for (int slot = count + 1; slot <= previous; ++slot)
+                    if (static_cast<size_t>(slot - 1) < bundle->filament_presets.size() && bundle->filament_presets[slot - 1] == edited)
+                        throw std::runtime_error("filament preset '" + edited +
+                                                 "' has unsaved changes and is used by a slot that would be removed; save or discard the changes first");
+            }
+            bool failed = false;
+            {
+                sswcp_api::Scope api_scope;
+                for (int slot = previous; slot > count; --slot) {
+                    const size_t before = sidebar.combos_filament().size();
+                    sidebar.delete_filament(static_cast<size_t>(slot - 1), replace_with - 1);
+                    if (sidebar.combos_filament().size() >= before) {
+                        failed = true;
+                        break;
+                    }
+                }
+                notes = sswcp_api::notes();
+            }
+            if (failed)
+                throw std::runtime_error(sw_slicer_join_notes("could not remove a filament; the app now has " +
+                                                                  std::to_string(sidebar.combos_filament().size()) + " filament(s)",
+                                                              notes));
+            notes.push_back("objects using removed filaments now use filament " + std::to_string(replace_with));
+        }
+        if (had_layer_sequences)
+            notes.push_back("the filament order per layer range was adjusted to the new filament count");
+        notes.push_back("not part of undo");
+        if (count < previous)
+            notes.push_back("removing filaments cannot be undone");
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Plate settings -----------------------------------------------------------------------
+
+// "To the end" of a layer range, as stored by the plate settings dialog.
+static constexpr int SW_SLICER_LAYER_END = std::numeric_limits<int>::max() - 1; // same as MAX_LAYER_VALUE in PlateSettingsDialog.cpp
+// The dialog accepts layer ranges from layer 2 (layer 1 has the first-layer sequence).
+static constexpr int SW_SLICER_MIN_OTHER_LAYER = 2; // same as MIN_LAYER_VALUE in PlateSettingsDialog.cpp
+
+static std::string sw_slicer_bed_type_name(BedType bt)
+{
+    if (bt == btDefault)
+        return "default";
+    for (const auto& kv : ConfigOptionEnum<BedType>::get_enum_values())
+        if (kv.second == static_cast<int>(bt))
+            return kv.first;
+    return "default";
+}
+
+static std::string sw_slicer_print_seq_name(PrintSequence ps)
+{
+    if (ps == PrintSequence::ByDefault)
+        return "default";
+    for (const auto& kv : ConfigOptionEnum<PrintSequence>::get_enum_values())
+        if (kv.second == static_cast<int>(ps))
+            return kv.first;
+    return "default";
+}
+
+static std::string sw_slicer_spiral_name(const PartPlate* pp)
+{
+    if (!pp->has_spiral_mode_config())
+        return "default";
+    return pp->get_spiral_vase_mode() ? "on" : "off";
+}
+
+static std::string sw_slicer_range_text(const LayerPrintSequence& r)
+{
+    return std::to_string(r.first.first) + "-" + (r.first.second >= SW_SLICER_LAYER_END ? std::string("end") : std::to_string(r.first.second));
+}
+
+static json sw_slicer_other_layers_json(const std::vector<LayerPrintSequence>& seqs)
+{
+    json list = json::array();
+    for (const LayerPrintSequence& s : seqs) {
+        json e;
+        e["from"]  = s.first.first;
+        e["to"]    = (s.first.second >= SW_SLICER_LAYER_END) ? json(nullptr) : json(s.first.second);
+        e["order"] = s.second;
+        list.push_back(e);
+    }
+    return list;
+}
+
+static json sw_slicer_plate_settings_json(int n)
+{
+    PartPlate* pp = wxGetApp().plater()->get_partplate_list().get_plate(n);
+    json       r;
+    r["plate"]                 = n;
+    // get_bed_type(false): the plate's own value (true would fall back to the global bed type).
+    r["bed_type"]              = sw_slicer_bed_type_name(pp->get_bed_type(false));
+    r["print_sequence"]        = sw_slicer_print_seq_name(pp->get_print_seq());
+    r["spiral_vase"]           = sw_slicer_spiral_name(pp);
+    r["first_layer_sequence"]  = pp->get_first_layer_print_sequence();
+    r["other_layers_sequence"] = sw_slicer_other_layers_json(pp->get_other_layers_print_sequence());
+    return r;
+}
+
+// first_layer_sequence: null/[] (clear) or unique filament numbers 1..n.
+static std::vector<int> sw_slicer_parse_first_layer_sequence(const json& j, int n)
+{
+    std::vector<int> seq;
+    if (j.is_null())
+        return seq;
+    if (!j.is_array())
+        throw std::runtime_error("first_layer_sequence must be null or a list of filament numbers");
+    for (const json& e : j) {
+        if (!e.is_number_integer() || e.get<long long>() < 1 || e.get<long long>() > n)
+            throw std::runtime_error("first_layer_sequence must contain filament numbers between 1 and " + std::to_string(n));
+        const int f = e.get<int>();
+        if (std::find(seq.begin(), seq.end(), f) != seq.end())
+            throw std::runtime_error("filament " + std::to_string(f) + " appears twice in first_layer_sequence");
+        seq.push_back(f);
+    }
+    return seq;
+}
+
+// other_layers_sequence: null/[] (clear) or [{from, to, order}], sorted by 'from', without overlap,
+// each order a full order of the filaments 1..n.
+static std::vector<LayerPrintSequence> sw_slicer_parse_other_layers_sequence(const json& j, int n)
+{
+    std::vector<LayerPrintSequence> seqs;
+    if (j.is_null())
+        return seqs;
+    if (!j.is_array())
+        throw std::runtime_error("other_layers_sequence must be null or a list of {from, to, order}");
+    for (size_t i = 0; i < j.size(); ++i) {
+        const json&       e      = j[i];
+        const std::string prefix = "other_layers_sequence[" + std::to_string(i) + "]";
+        if (!e.is_object())
+            throw std::runtime_error(prefix + " must be an object {from, to, order}");
+        for (auto it = e.begin(); it != e.end(); ++it)
+            if (it.key() != "from" && it.key() != "to" && it.key() != "order")
+                throw std::runtime_error(prefix + " has an unknown key '" + it.key() + "'");
+        if (e.count("from") == 0 || !e.at("from").is_number_integer() || e.at("from").get<long long>() < SW_SLICER_MIN_OTHER_LAYER ||
+            e.at("from").get<long long>() >= SW_SLICER_LAYER_END)
+            throw std::runtime_error(prefix + ".from must be an integer >= " + std::to_string(SW_SLICER_MIN_OTHER_LAYER));
+        const int from = e.at("from").get<int>();
+        int       to   = SW_SLICER_LAYER_END;
+        if (e.count("to") != 0 && !e.at("to").is_null()) {
+            const json& jt = e.at("to");
+            if (!jt.is_number_integer() || jt.get<long long>() < from || jt.get<long long>() >= SW_SLICER_LAYER_END)
+                throw std::runtime_error(prefix + ".to must be null or an integer >= from");
+            to = jt.get<int>();
+        } else if (e.count("to") == 0) {
+            throw std::runtime_error(prefix + ".to must be null or an integer >= from");
+        }
+        const std::string order_error = prefix + ".order must contain each filament 1.." + std::to_string(n) + " exactly once";
+        if (e.count("order") == 0 || !e.at("order").is_array() || static_cast<int>(e.at("order").size()) != n)
+            throw std::runtime_error(order_error);
+        std::vector<int>  order;
+        std::vector<bool> seen(static_cast<size_t>(n) + 1, false);
+        for (const json& f : e.at("order")) {
+            if (!f.is_number_integer() || f.get<long long>() < 1 || f.get<long long>() > n || seen[f.get<size_t>()])
+                throw std::runtime_error(order_error);
+            seen[f.get<size_t>()] = true;
+            order.push_back(f.get<int>());
+        }
+        seqs.push_back({{from, to}, order});
+    }
+    std::stable_sort(seqs.begin(), seqs.end(), [](const LayerPrintSequence& a, const LayerPrintSequence& b) { return a.first.first < b.first.first; });
+    for (size_t i = 1; i < seqs.size(); ++i)
+        if (seqs[i - 1].first.second >= seqs[i].first.first)
+            throw std::runtime_error("other_layers_sequence: layer ranges " + sw_slicer_range_text(seqs[i - 1]) + " and " +
+                                     sw_slicer_range_text(seqs[i]) + " overlap");
+    return seqs;
+}
+
+// Read the settings of a plate (default: the current plate). Read-only.
+void SSWCP_SliceProject_Instance::sw_SlicerGetPlateSettings()
+{
+    try {
+        if (wxGetApp().plater() == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        m_res_data = sw_slicer_plate_settings_json(sw_slicer_resolve_plate(m_param_data));
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Change the settings of a plate (default: the current plate), like the plate settings dialog, but
+// on plate n without selecting it. Only the given fields change; all or nothing. One undo step
+// "API: Plate settings" (the undo stack stores the plate config); a no-op takes no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerSetPlateSettings()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        // 1. Guards, plate, at least one field.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        const int  n  = sw_slicer_resolve_plate(m_param_data);
+        PartPlate* pp = plater->get_partplate_list().get_plate(n);
+        // Fields that are present (null counts as given for the two sequences: it clears them).
+        auto given = [this](const char* key) { return m_param_data.count(key) != 0 && (!m_param_data.at(key).is_null() ||
+                                                    std::string(key) == "first_layer_sequence" ||
+                                                    std::string(key) == "other_layers_sequence"); };
+        const bool has_bed = given("bed_type"), has_seq = given("print_sequence"), has_spiral = given("spiral_vase");
+        const bool has_first = given("first_layer_sequence"), has_other = given("other_layers_sequence");
+        if (!has_bed && !has_seq && !has_spiral && !has_first && !has_other)
+            throw std::runtime_error("specify at least one plate setting");
+
+        // 2. Validate everything first.
+        auto string_param = [this](const char* key) {
+            const json& j = m_param_data.at(key);
+            return j.is_string() ? j.get<std::string>() : std::string("?");
+        };
+        BedType bed_type = btDefault;
+        if (has_bed) {
+            const std::string v = string_param("bed_type");
+            if (v != "default" && (v == "Default Plate" || !ConfigOptionEnum<BedType>::from_string(v, bed_type) || bed_type == btDefault))
+                throw std::runtime_error("unknown bed_type '" + v + "'");
+            if (v == "default")
+                bed_type = btDefault;
+        }
+        PrintSequence print_seq = PrintSequence::ByDefault;
+        if (has_seq) {
+            const std::string v = string_param("print_sequence");
+            if (v != "default" && !ConfigOptionEnum<PrintSequence>::from_string(v, print_seq))
+                throw std::runtime_error("print_sequence must be 'default', 'by layer' or 'by object'");
+            if (v == "default")
+                print_seq = PrintSequence::ByDefault;
+        }
+        std::string spiral;
+        if (has_spiral) {
+            spiral = string_param("spiral_vase");
+            if (spiral != "default" && spiral != "on" && spiral != "off")
+                throw std::runtime_error("spiral_vase must be 'default', 'on' or 'off'");
+        }
+        // The same filament count as the dialog (including mixed filaments).
+        const int                       filaments = static_cast<int>(plater->get_extruder_colors_from_plater_config().size());
+        std::vector<int>                first_seq;
+        std::vector<LayerPrintSequence> other_seqs;
+        if (has_first)
+            first_seq = sw_slicer_parse_first_layer_sequence(m_param_data.at("first_layer_sequence"), filaments);
+        if (has_other)
+            other_seqs = sw_slicer_parse_other_layers_sequence(m_param_data.at("other_layers_sequence"), filaments);
+
+        // What actually changes.
+        const bool change_bed    = has_bed && pp->get_bed_type(false) != bed_type;
+        const bool change_first  = has_first && pp->get_first_layer_print_sequence() != first_seq;
+        const bool change_other  = has_other && pp->get_other_layers_print_sequence() != other_seqs;
+        const bool change_seq    = has_seq && pp->get_print_seq() != print_seq;
+        const bool change_spiral = has_spiral && sw_slicer_spiral_name(pp) != spiral;
+
+        std::vector<std::string> notes;
+        auto reply = [&]() {
+            m_res_data          = sw_slicer_plate_settings_json(n);
+            m_res_data["notes"] = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (!change_bed && !change_first && !change_other && !change_seq && !change_spiral) {
+            notes.push_back("plate settings unchanged; nothing changed");
+            reply();
+            return;
+        }
+
+        // 3. Apply to plate n (not necessarily the current plate), in the order of the callback of
+        // the plate settings dialog (Plater::open_platesettings_dialog). The plate is not selected.
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Plate settings");
+            if (change_bed) {
+                pp->set_bed_type(bed_type);
+                plater->update_project_dirty_from_presets();
+                plater->set_plater_dirty(true);
+            }
+            if (change_first)
+                pp->set_first_layer_print_sequence(first_seq);
+            if (change_other)
+                pp->set_other_layers_print_sequence(other_seqs);
+            if (change_seq) {
+                pp->set_print_seq(print_seq);
+                plater->sync_print_seq_warning_notification();
+            }
+            if (change_spiral) {
+                if (spiral == "on")
+                    pp->set_spiral_vase_mode(true, false);
+                else if (spiral == "off")
+                    pp->set_spiral_vase_mode(false, false);
+                else
+                    pp->set_spiral_vase_mode(false, true);
+            }
+            plater->update_project_dirty_from_presets();
+            plater->set_plater_dirty(true);
+            // The plate config is applied to the print of the plate when it is sliced; the sequences
+            // and spiral mode do not invalidate the slice result themselves.
+            pp->update_slice_result_valid_state(false);
+            plater->update();
+            wxGetApp().obj_list()->update_selections();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        if (change_spiral && sw_slicer_spiral_name(pp) != spiral)
+            notes.push_back("spiral_vase is '" + sw_slicer_spiral_name(pp) + "': the plate follows the global setting, which already uses spiral mode");
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Printer connection --------------------------------------------------------------------
+// Connecting is done by the app's own device page (Flutter): only that page holds the credentials
+// of a printer. The API prepares it (checks, app in front, Device tab open) and follows the progress
+// through DeviceInfo::connected. Disconnecting is done by the API, like sw_Disconnect.
+// Never return or accept credentials: printer JSON is built from a white list.
+
+// A known printer, without any credentials (white list).
+static json sw_slicer_printer_json(const DeviceInfo& d)
+{
+    json j;
+    j["dev_id"]      = d.dev_id;
+    j["dev_name"]    = d.dev_name;
+    j["model"]       = d.model_name;
+    j["preset_name"] = d.preset_name;
+    j["link_mode"]   = d.link_mode.empty() ? json(nullptr) : json(d.link_mode);
+    j["connected"]   = d.connected;
+    // Over the cloud (wan) the address is the cloud broker, not the printer.
+    if (d.link_mode == "lan")
+        j["ip"] = d.ip;
+    return j;
+}
+
+// The connected device, or nullptr.
+static const DeviceInfo* sw_slicer_connected_device(const std::vector<DeviceInfo>& devices)
+{
+    for (const DeviceInfo& d : devices)
+        if (d.connected)
+            return &d;
+    return nullptr;
+}
+
+static const DeviceInfo* sw_slicer_find_device(const std::vector<DeviceInfo>& devices, const std::string& dev_id)
+{
+    for (const DeviceInfo& d : devices)
+        if (d.dev_id == dev_id)
+            return &d;
+    return nullptr;
+}
+
+// Last connect request made through the API. Only touched on the GUI thread (all sw_Slicer*
+// handlers run there), so no mutex.
+namespace {
+struct SwSlicerConnectRequest
+{
+    std::string                           dev_id; // empty = none
+    std::chrono::steady_clock::time_point since;
+};
+} // namespace
+
+static SwSlicerConnectRequest& sw_slicer_connect_request()
+{
+    static SwSlicerConnectRequest request;
+    return request;
+}
+static constexpr std::chrono::seconds SW_SLICER_CONNECT_TIMEOUT{180};
+
+// {dev_id, state, seconds} of the connect request, or null if there is none. state: "connected"
+// (the requested printer is connected), "other_connected", "timeout" or "waiting". With consume,
+// a finished request is reported once and then cleared.
+static json sw_slicer_connect_request_json(bool consume)
+{
+    SwSlicerConnectRequest& request = sw_slicer_connect_request();
+    if (request.dev_id.empty())
+        return json();
+    const std::vector<DeviceInfo> devices   = wxGetApp().app_config->get_devices();
+    const DeviceInfo*             connected = sw_slicer_connected_device(devices);
+    const auto                    elapsed   = std::chrono::steady_clock::now() - request.since;
+    std::string                   state     = "waiting";
+    if (connected != nullptr && connected->dev_id == request.dev_id)
+        state = "connected";
+    else if (connected != nullptr)
+        state = "other_connected";
+    else if (elapsed > SW_SLICER_CONNECT_TIMEOUT)
+        state = "timeout";
+    json j;
+    j["dev_id"]  = request.dev_id;
+    j["state"]   = state;
+    j["seconds"] = static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+    if (consume && state != "waiting")
+        request.dev_id.clear();
+    return j;
+}
+
+// For sw_SlicerGetStatus: {connected: dev_id|null, connect_request?}. Does not clear a finished
+// request (sw_SlicerListPrinters reports it).
+static json sw_slicer_printer_status_json()
+{
+    json              j;
+    const auto        devices   = wxGetApp().app_config->get_devices();
+    const DeviceInfo* connected = sw_slicer_connected_device(devices);
+    j["connected"]              = connected != nullptr ? json(connected->dev_id) : json(nullptr);
+    const json request          = sw_slicer_connect_request_json(/*consume=*/false);
+    if (!request.is_null())
+        j["connect_request"] = request;
+    return j;
+}
+
+// The device page of the app (the "My Devices" list), as the app loads it after a connection.
+static void sw_slicer_load_device_page(MainFrame* frame)
+{
+    const wxString url = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) +
+                                            "/web/flutter_web/index.html?path=2");
+    frame->load_printer_url(wxGetApp().get_international_url(url));
+}
+
+// Guards shared by connect and disconnect: no upload and no send dialog of the app.
+static void sw_slicer_require_no_printer_traffic()
+{
+    {
+        const std::shared_ptr<SwSlicerUploadState>& state = sw_slicer_upload_state();
+        std::lock_guard<std::mutex>                 lock(state->mutex);
+        if (state->state == "uploading")
+            throw std::runtime_error("an upload is still running");
+    }
+    if (wxGetApp().get_web_preprint_dialog() != nullptr)
+        throw std::runtime_error("the app's send dialog is open");
+}
+
+// Only 'allowed' parameters, and the confirmation flag first.
+static void sw_slicer_require_printer_params(const json& params, const char* confirm_key, const std::string& confirm_error)
+{
+    if (!sw_slicer_flag_true(params, confirm_key))
+        throw std::runtime_error(confirm_error);
+    for (auto it = params.begin(); it != params.end(); ++it)
+        if (it.key() != "dev_id" && it.key() != confirm_key)
+            throw std::runtime_error("unknown parameter '" + it.key() + "'");
+}
+
+// Known printers (without credentials), the connected one, the login state and the progress of a
+// connect request. Read-only (a finished connect request is reported once).
+void SSWCP_SliceProject_Instance::sw_SlicerListPrinters()
+{
+    try {
+        const std::vector<DeviceInfo> devices   = wxGetApp().app_config->get_devices();
+        const DeviceInfo*             connected = sw_slicer_connected_device(devices);
+        const bool                    logged_in = wxGetApp().sm_get_userinfo()->is_user_login();
+        json                          printers  = json::array();
+        bool                          any_wan   = false;
+        for (const DeviceInfo& d : devices) {
+            printers.push_back(sw_slicer_printer_json(d));
+            any_wan = any_wan || d.link_mode == "wan";
+        }
+        std::vector<std::string> notes;
+        if (logged_in && !any_wan)
+            notes.push_back("cloud printers are not stored by the app between sessions; they appear here after the app's Device tab has shown them");
+        m_res_data["printers"]  = printers;
+        m_res_data["connected"] = connected != nullptr ? json(connected->dev_id) : json(nullptr);
+        m_res_data["logged_in"] = logged_in;
+        const json request      = sw_slicer_connect_request_json(/*consume=*/true);
+        if (!request.is_null())
+            m_res_data["connect_request"] = request;
+        m_res_data["notes"] = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Prepare connecting a printer through the app's device page: the app comes to the front with the
+// Device tab open; the printer is then selected under "My Devices" (by the user or by an
+// assistant that controls the desktop). Follow the progress with sw_SlicerListPrinters. Requires confirm_connect:true.
+// Nothing is started on the printer.
+void SSWCP_SliceProject_Instance::sw_SlicerConnectPrinter()
+{
+    try {
+        // 1. Confirmation and parameters first.
+        sw_slicer_require_printer_params(m_param_data, "confirm_connect", "connecting a printer requires confirm_connect:true");
+        if (!sw_slicer_has_param(m_param_data, "dev_id") || !m_param_data.at("dev_id").is_string() ||
+            m_param_data.at("dev_id").get<std::string>().empty())
+            throw std::runtime_error("dev_id is required (see sw_SlicerListPrinters)");
+        const std::string dev_id = m_param_data.at("dev_id").get<std::string>();
+
+        // 2. Guards.
+        sw_slicer_require_no_printer_traffic();
+        if (wxGetApp().get_web_device_dialog() != nullptr)
+            throw std::runtime_error("the app's add-device dialog is open");
+
+        const std::vector<DeviceInfo> devices   = wxGetApp().app_config->get_devices();
+        const DeviceInfo*             connected = sw_slicer_connected_device(devices);
+        const DeviceInfo*             device    = sw_slicer_find_device(devices, dev_id);
+        const bool                    logged_in = wxGetApp().sm_get_userinfo()->is_user_login();
+        std::vector<std::string>      notes;
+        auto reply = [&](const char* status) {
+            m_res_data["status"] = status;
+            m_res_data["dev_id"] = dev_id;
+            if (device != nullptr) {
+                m_res_data["dev_name"]  = device->dev_name;
+                m_res_data["link_mode"] = device->link_mode.empty() ? json(nullptr) : json(device->link_mode);
+            }
+            m_res_data["notes"] = notes;
+            send_to_js();
+            finish_job();
+        };
+
+        // 3./4. Already connected, or another printer is.
+        if (connected != nullptr && connected->dev_id == dev_id) {
+            notes.push_back("printer already connected; nothing changed");
+            reply("connected");
+            return;
+        }
+        if (connected != nullptr)
+            throw std::runtime_error("printer '" + connected->dev_name + "' is connected; disconnect it first (sw_SlicerDisconnectPrinter)");
+
+        // 5./6. Cloud login; unknown printers.
+        if (device != nullptr && device->link_mode == "wan" && !logged_in)
+            throw std::runtime_error("printer '" + device->dev_name +
+                                     "' is connected through the Snapmaker cloud; log in to your Snapmaker account in the app first");
+        if (device == nullptr) {
+            if (!logged_in)
+                throw std::runtime_error("unknown printer '" + dev_id + "' (see sw_SlicerListPrinters)");
+            notes.push_back("printer '" + dev_id + "' is not known to the app yet (cloud printers appear in the Device tab); select it there");
+        }
+
+        MainFrame* frame = wxGetApp().mainframe;
+        if (frame == nullptr || frame->m_printer_view == nullptr)
+            throw std::runtime_error("the app's device page is not available");
+
+        // 7. App to the front (the device page only works in the active window).
+        sw_slicer_bring_app_to_front(notes, "the device page");
+        // 8. Device tab with the device page (the same URL the app loads after a connection).
+        if (!frame->m_printer_view->isSnapmakerPage())
+            sw_slicer_load_device_page(frame);
+        frame->select_tab(size_t(MainFrame::tpMonitor));
+
+        // 9. Remember the request; the app's own threads do the connecting.
+        SwSlicerConnectRequest& request = sw_slicer_connect_request();
+        request.dev_id                  = dev_id;
+        request.since                   = std::chrono::steady_clock::now();
+
+        // 10.
+        const std::string shown = device != nullptr && !device->dev_name.empty() ? device->dev_name : dev_id;
+        notes.push_back("the app's Device tab is open; select '" + shown + "' under My Devices to connect");
+        notes.push_back("keep the app window in front until the printer is connected");
+        notes.push_back("connecting only links the app to the printer; nothing is started on the printer");
+        reply("waiting_for_app");
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Disconnect the app from the connected printer, like "Disconnect" on the Device tab. A print that
+// runs on the printer continues. Requires confirm_disconnect:true. The network part runs on a worker
+// thread; the reply is sent from the GUI thread.
+void SSWCP_SliceProject_Instance::sw_SlicerDisconnectPrinter()
+{
+    try {
+        // 1. Confirmation and parameters first.
+        sw_slicer_require_printer_params(m_param_data, "confirm_disconnect", "disconnecting a printer requires confirm_disconnect:true");
+        std::string requested;
+        if (sw_slicer_has_param(m_param_data, "dev_id")) {
+            const json& j = m_param_data.at("dev_id");
+            if (!j.is_string() || j.get<std::string>().empty())
+                throw std::runtime_error("dev_id must be a non-empty string (see sw_SlicerListPrinters)");
+            requested = j.get<std::string>();
+        }
+
+        // 2. Guards.
+        sw_slicer_require_no_printer_traffic();
+
+        const std::vector<DeviceInfo> devices   = wxGetApp().app_config->get_devices();
+        const DeviceInfo*             connected = sw_slicer_connected_device(devices);
+        // 3. Nothing connected (a pending connect request ends here as well).
+        if (connected == nullptr) {
+            sw_slicer_connect_request().dev_id.clear();
+            m_res_data["status"] = "disconnected";
+            if (!requested.empty())
+                m_res_data["dev_id"] = requested;
+            m_res_data["notes"] = std::vector<std::string>{"no printer connected; nothing changed"};
+            send_to_js();
+            finish_job();
+            return;
+        }
+        // 4. Another printer than the requested one.
+        if (!requested.empty() && requested != connected->dev_id)
+            throw std::runtime_error("printer '" + requested + "' is not the connected printer ('" + connected->dev_id + "')");
+        // 5. A pending connect request ends here.
+        sw_slicer_connect_request().dev_id.clear();
+
+        // 6. The worker thread only disconnects (PrintHost, AppConfig through CallAfter inside
+        // sswcp_disconnect_current_machine); it touches neither the GUI, the Plater nor the model.
+        const std::string             dev_id    = connected->dev_id;
+        const std::string             dev_name  = connected->dev_name;
+        std::weak_ptr<SSWCP_Instance> weak_self = shared_from_this();
+        if (m_work_thread.joinable())
+            m_work_thread.join();
+        m_work_thread = std::thread([weak_self, dev_id, dev_name]() {
+            bool ok = false;
+            try {
+                ok = sswcp_disconnect_current_machine(true);
+            } catch (...) {
+                ok = false;
+            }
+            // Queued after the CallAfter calls of the disconnect itself (AppConfig, presets).
+            wxGetApp().CallAfter([weak_self, ok, dev_id, dev_name]() {
+                std::shared_ptr<SSWCP_Instance> self = weak_self.lock();
+                if (!ok) {
+                    if (self)
+                        self->handle_general_fail(-1, "the app reported a failure while disconnecting");
+                    return;
+                }
+                // Reload the U1 device page, so that it lets go of its "current printer" and does not
+                // connect it again when the app comes back to the foreground.
+                MainFrame* frame = wxGetApp().mainframe;
+                if (frame != nullptr && frame->m_printer_view != nullptr && frame->m_printer_view->is_u1_device_page())
+                    sw_slicer_load_device_page(frame);
+                if (!self)
+                    return;
+                self->m_res_data["status"]   = "disconnected";
+                self->m_res_data["dev_id"]   = dev_id;
+                self->m_res_data["dev_name"] = dev_name;
+                self->m_res_data["notes"]    = std::vector<std::string>{"a print that is running on the printer continues", "not part of undo"};
+                self->send_to_js();
+                self->finish_job();
+            });
+        });
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
     }

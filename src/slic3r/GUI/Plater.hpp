@@ -309,6 +309,12 @@ public:
     bool is_presets_dirty() const;
     void set_plater_dirty(bool is_dirty);
     void update_project_dirty_from_presets();
+    // Select a preset by name, like picking it in the sidebar combo box. For filaments,
+    // 'filament_idx' is the 0-based slot. Returns false if the tab refused the switch.
+    // If the bed moved, the indices of the objects that were re-centred on their plate
+    // are added to 'moved_objects' (when given).
+    bool select_preset_by_name(Preset::Type type, const std::string& name, int filament_idx = 0,
+                               std::vector<int>* moved_objects = nullptr);
     int  save_project_if_dirty(const wxString& reason);
     void reset_project_dirty_after_save();
     void reset_project_dirty_initial_presets();

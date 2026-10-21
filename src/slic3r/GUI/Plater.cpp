@@ -8578,6 +8578,13 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id,
 
             msg += _L("\nDeleting this filament will invalidate these mixed filament configurations. Continue?");
 
+            // API mode (sw_Slicer* commands): never ask. The caller checks this beforehand, so this
+            // is only a safety net: keep the filament (the answer "Cancel").
+            if (sswcp_api::active()) {
+                sswcp_api::note("filament not removed: it is used by mixed filaments (dialog skipped)");
+                return;
+            }
+
             MessageDialog dlg(wxGetApp().plater(), msg, _L("Warning"), wxOK | wxCANCEL | wxICON_WARNING);
             int ret = dlg.ShowModal();
             if (ret != wxID_OK)
@@ -10506,6 +10513,17 @@ struct Plater::priv
     void on_combobox_select(wxCommandEvent&);
     void on_select_bed_type(wxCommandEvent&);
     void on_select_preset(wxCommandEvent&);
+    // The steps of a preset switch that do not depend on the sidebar combo box, shared by
+    // on_select_preset() and Plater::select_preset_by_name().
+    struct PresetSwitchPlates
+    {
+        Vec3d                         old_plate_pos;
+        std::vector<std::vector<int>> plate_object;
+    };
+    PresetSwitchPlates remember_plates_for_preset_switch();
+    void select_filament_slot_preset(int idx, const std::string& preset_name);
+    void finish_preset_switch(Preset::Type preset_type, int idx, const PresetSwitchPlates& plates,
+                              PlaterPresetComboBox* combo, std::vector<int>* moved_objects);
     void on_slicing_update(SlicingStatusEvent&);
     void on_slicing_completed(wxCommandEvent&);
     void on_process_completed(SlicingProcessCompletedEvent&);
@@ -15112,24 +15130,8 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     auto idx = combo->get_filament_idx();
 
     // BBS:Save the plate parameters before switching
-    PartPlateList& old_plate_list = this->partplate_list;
-    PartPlate* old_plate = old_plate_list.get_selected_plate();
-    Vec3d old_plate_pos = old_plate->get_center_origin();
+    const PresetSwitchPlates plates = remember_plates_for_preset_switch();
 
-    // BBS: Save the model in the current platelist
-    std::vector<vector<int> > plate_object;
-    for (size_t i = 0; i < old_plate_list.get_plate_count(); ++i) {
-        PartPlate* plate = old_plate_list.get_plate(i);
-        std::vector<int> obj_idxs;
-        for (int obj_idx = 0; obj_idx < model.objects.size(); obj_idx++) {
-            if (plate && plate->contain_instance(obj_idx, 0)) {
-                obj_idxs.emplace_back(obj_idx);
-            }
-        }
-        plate_object.emplace_back(obj_idxs);
-    }
-
-    bool flag = is_support_filament(idx);
     //! Because of The MSW and GTK version of wxBitmapComboBox derived from wxComboBox,
     //! but the OSX version derived from wxOwnerDrawnCombo.
     //! So, to get selected string we do
@@ -15140,17 +15142,8 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     std::string preset_name = wxGetApp().preset_bundle->get_preset_name_by_alias(preset_type,
         Preset::remove_suffix_modified(combo->GetString(selection).ToUTF8().data()));
 
-    if (preset_type == Preset::TYPE_FILAMENT) {
-        wxGetApp().preset_bundle->set_filament_preset(idx, preset_name);
-        wxGetApp().plater()->update_project_dirty_from_presets();
-        wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
-        sidebar->update_dynamic_filament_list();
-        sidebar->update_color_mix_panel();
-        bool flag_is_change = is_support_filament(idx);
-        if (flag != flag_is_change) {
-            sidebar->auto_calc_flushing_volumes(idx);
-        }
-    }
+    if (preset_type == Preset::TYPE_FILAMENT)
+        select_filament_slot_preset(idx, preset_name);
     bool select_preset = !combo->selection_is_changed_according_to_physical_printers();
     // TODO: ?
     if (preset_type == Preset::TYPE_FILAMENT && sidebar->is_multifilament()) {
@@ -15181,6 +15174,60 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
         wxGetApp().get_tab(preset_type)->select_preset(preset_name);
     }
 
+    finish_preset_switch(preset_type, idx, plates, combo, nullptr);
+}
+
+// BBS: the plate positions and the objects per plate before a preset switch (a printer switch can
+// move the bed; finish_preset_switch() then puts the objects back in the centre of their plate).
+Plater::priv::PresetSwitchPlates Plater::priv::remember_plates_for_preset_switch()
+{
+    PresetSwitchPlates plates;
+
+    // BBS:Save the plate parameters before switching
+    PartPlateList& old_plate_list = this->partplate_list;
+    PartPlate* old_plate = old_plate_list.get_selected_plate();
+    plates.old_plate_pos = old_plate->get_center_origin();
+
+    // BBS: Save the model in the current platelist
+    std::vector<vector<int> >& plate_object = plates.plate_object;
+    for (size_t i = 0; i < old_plate_list.get_plate_count(); ++i) {
+        PartPlate* plate = old_plate_list.get_plate(i);
+        std::vector<int> obj_idxs;
+        for (int obj_idx = 0; obj_idx < model.objects.size(); obj_idx++) {
+            if (plate && plate->contain_instance(obj_idx, 0)) {
+                obj_idxs.emplace_back(obj_idx);
+            }
+        }
+        plate_object.emplace_back(obj_idxs);
+    }
+    return plates;
+}
+
+// Store the filament preset of slot 'idx' (0-based) and refresh the filament UI.
+void Plater::priv::select_filament_slot_preset(int idx, const std::string& preset_name)
+{
+    bool flag = is_support_filament(idx);
+    wxGetApp().preset_bundle->set_filament_preset(idx, preset_name);
+    wxGetApp().plater()->update_project_dirty_from_presets();
+    wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
+    sidebar->update_dynamic_filament_list();
+    sidebar->update_color_mix_panel();
+    bool flag_is_change = is_support_filament(idx);
+    if (flag != flag_is_change) {
+        sidebar->auto_calc_flushing_volumes(idx);
+    }
+}
+
+// Everything after the tab switched (or refused to switch) the preset. 'combo' is the sidebar combo
+// box that started the switch (nullptr for Plater::select_preset_by_name()). If the bed moved, the
+// indices of the objects that were put back in the centre of their plate are added to
+// 'moved_objects' (when given).
+void Plater::priv::finish_preset_switch(Preset::Type preset_type, int idx, const PresetSwitchPlates& plates,
+                                        PlaterPresetComboBox* combo, std::vector<int>* moved_objects)
+{
+    const Vec3d&                         old_plate_pos = plates.old_plate_pos;
+    std::vector<std::vector<int>>        plate_object  = plates.plate_object; // select_object_from_idx() takes a non-const reference
+
     // update plater with new config
     q->on_config_change(wxGetApp().preset_bundle->full_config());
     if (preset_type == Preset::TYPE_PRINTER) {
@@ -15201,6 +15248,8 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
                 view3D->select_object_from_idx(plate_object[i]);
                 this->sidebar->obj_list()->update_selections();
                 view3D->center_selected_plate(i);
+                if (moved_objects != nullptr)
+                    moved_objects->insert(moved_objects->end(), plate_object[i].begin(), plate_object[i].end());
             }
 
             view3D->deselect_all();
@@ -15217,7 +15266,8 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     // From the Win 2004 preset combobox lose a focus after change the preset selection
     // and that is why the up/down arrow doesn't work properly
     // So, set the focus to the combobox explicitly
-    combo->SetFocus();
+    if (combo != nullptr)
+        combo->SetFocus();
 #endif
     if (preset_type == Preset::TYPE_FILAMENT && wxGetApp().app_config->get("auto_calculate_when_filament_change") == "true") {
         wxGetApp().plater()->sidebar().auto_calc_flushing_volumes(idx);
@@ -17735,6 +17785,36 @@ bool Plater::is_project_dirty() const { return p->is_project_dirty(); }
 bool Plater::is_presets_dirty() const { return p->is_presets_dirty(); }
 void Plater::set_plater_dirty(bool is_dirty) { p->set_plater_dirty(is_dirty); }
 void Plater::update_project_dirty_from_presets() { p->update_project_dirty_from_presets(); }
+
+bool Plater::select_preset_by_name(Preset::Type type, const std::string& name, int filament_idx, std::vector<int>* moved_objects)
+{
+    // Same steps as Plater::priv::on_select_preset(), without the combo box specific parts
+    // (physical printers, the "printer models" item, the focus).
+    const priv::PresetSwitchPlates plates = p->remember_plates_for_preset_switch();
+    if (type == Preset::TYPE_FILAMENT)
+        p->select_filament_slot_preset(filament_idx, name);
+    bool ok = true;
+    if (type == Preset::TYPE_FILAMENT && p->sidebar->is_multifilament()) {
+        // Only update the plater UI for the 2nd and other filaments, like on_select_preset().
+        std::vector<PlaterPresetComboBox*>& combos = p->sidebar->combos_filament();
+        if (filament_idx >= 0 && filament_idx < int(combos.size()) && combos[filament_idx] != nullptr)
+            combos[filament_idx]->update();
+        const std::vector<std::string>& slots = wxGetApp().preset_bundle->filament_presets;
+        ok = filament_idx >= 0 && filament_idx < int(slots.size()) && slots[filament_idx] == name;
+    } else {
+        Tab* tab = wxGetApp().get_tab(type);
+        {
+            wxWindowUpdateLocker noUpdates2(p->sidebar->filament_panel());
+            ok = tab->select_preset(name);
+        }
+        // Tab::select_preset() returns false if the switch was cancelled; also make sure the
+        // preset it ended up with is the requested one.
+        ok = ok && tab->get_presets()->get_edited_preset().name == name;
+    }
+    p->finish_preset_switch(type, filament_idx, plates, nullptr, moved_objects);
+    return ok;
+}
+
 int  Plater::save_project_if_dirty(const wxString& reason) { return p->save_project_if_dirty(reason); }
 void Plater::reset_project_dirty_after_save() { p->reset_project_dirty_after_save(); }
 void Plater::reset_project_dirty_initial_presets() { p->reset_project_dirty_initial_presets(); }
