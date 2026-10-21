@@ -2179,6 +2179,51 @@ void GCodeViewer::set_layers_z_range(const std::array<unsigned int, 2>& layers_z
     update_moves_slider(true);
 }
 
+std::vector<GCodeViewer::EViewType> GCodeViewer::get_selectable_view_types() const
+{
+    // Only the items with a label are shown in the combo box (update_by_mode).
+    const size_t n = std::min(view_type_items.size(), view_type_items_str.size());
+    return std::vector<EViewType>(view_type_items.begin(), view_type_items.begin() + n);
+}
+
+bool GCodeViewer::select_view_type(EViewType type)
+{
+    const size_t n = std::min(view_type_items.size(), view_type_items_str.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (view_type_items[i] != type)
+            continue;
+        // Same steps as selecting the item in the combo box (render_legend).
+        m_view_type_sel = static_cast<int>(i);
+        set_view_type(type);
+        reset_visible(type);
+        refresh_render_paths(false, false);
+        update_moves_slider();
+        return true;
+    }
+    return false;
+}
+
+bool GCodeViewer::is_filament_visible(size_t extruder_id) const
+{
+    return extruder_id < m_tools.m_tool_visibles.size() && m_tools.m_tool_visibles[extruder_id];
+}
+
+void GCodeViewer::set_filament_visible(size_t extruder_id, bool visible)
+{
+    if (extruder_id < m_tools.m_tool_visibles.size())
+        m_tools.m_tool_visibles[extruder_id] = visible;
+}
+
+void GCodeViewer::refresh_after_visibility_change(bool travel_changed)
+{
+    // m_gcode_result is only set once a result has been loaded (has_data()).
+    if (travel_changed && m_view_type == EViewType::Feedrate && has_data() && m_gcode_result != nullptr)
+        refresh(*m_gcode_result, wxGetApp().plater()->get_extruder_colors_from_plater_config(m_gcode_result));
+    else
+        refresh_render_paths(false, false);
+    update_moves_slider();
+}
+
 void GCodeViewer::export_toolpaths_to_obj(const char* filename) const
 {
     if (filename == nullptr)

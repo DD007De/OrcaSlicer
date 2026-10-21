@@ -3186,8 +3186,55 @@ void GLCanvas3D::render(bool only_init)
 
     wxGetApp().imgui()->render();
 
+    if (m_frame_capture != nullptr)
+        _capture_back_buffer(*m_frame_capture);
+
     m_canvas->SwapBuffers();
     m_render_stats.increment_fps_counter();
+}
+
+bool GLCanvas3D::capture_frame(std::vector<unsigned char>& rgba, unsigned int& width, unsigned int& height)
+{
+    if (m_canvas == nullptr || m_in_render || !_is_shown_on_screen())
+        return false;
+    // Two plain frames first: slider changes are applied after the G-code is drawn and
+    // auto-resizing ImGui windows (the legend) get their final size one frame later.
+    render();
+    render();
+    FrameCapture capture;
+    m_frame_capture = &capture;
+    Slic3r::ScopeGuard reset_capture([this]() { m_frame_capture = nullptr; });
+    render();
+    if (!capture.done || capture.width == 0 || capture.height == 0)
+        return false;
+    rgba   = std::move(capture.rgba);
+    width  = capture.width;
+    height = capture.height;
+    return true;
+}
+
+void GLCanvas3D::_capture_back_buffer(FrameCapture& capture)
+{
+    const Size cnv_size = get_canvas_size();
+    if (cnv_size.get_width() <= 0 || cnv_size.get_height() <= 0)
+        return;
+    const unsigned int w = static_cast<unsigned int>(cnv_size.get_width());
+    const unsigned int h = static_cast<unsigned int>(cnv_size.get_height());
+    // Read the window's own back buffer, whatever offscreen buffer was bound last.
+    if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Arb)
+        glsafe(::glBindFramebuffer(GL_FRAMEBUFFER, 0));
+    else if (OpenGLManager::get_framebuffers_type() == OpenGLManager::EFramebufferType::Ext)
+        glsafe(::glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0));
+    glsafe(::glReadBuffer(GL_BACK));
+    GLint pack_alignment = 4;
+    glsafe(::glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment));
+    glsafe(::glPixelStorei(GL_PACK_ALIGNMENT, 1));
+    capture.rgba.resize(static_cast<size_t>(w) * h * 4);
+    glsafe(::glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE, capture.rgba.data()));
+    glsafe(::glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment));
+    capture.width  = w;
+    capture.height = h;
+    capture.done   = true;
 }
 
 void GLCanvas3D::render_thumbnail(ThumbnailData &         thumbnail_data,
@@ -8728,7 +8775,6 @@ void GLCanvas3D::_render_gcode(int canvas_width, int canvas_height)
 {
     m_gcode_viewer.render(canvas_width, canvas_height, SLIDER_RIGHT_MARGIN * GCODE_VIEWER_SLIDER_SCALE);
     IMSlider *layers_slider = m_gcode_viewer.get_layers_slider();
-    IMSlider *moves_slider  = m_gcode_viewer.get_moves_slider();
 
     if (layers_slider->is_need_post_tick_event()) {
         auto evt = new wxCommandEvent(EVT_CUSTOMEVT_TICKSCHANGED, m_canvas->GetId());
@@ -8736,6 +8782,14 @@ void GLCanvas3D::_render_gcode(int canvas_width, int canvas_height)
         wxPostEvent(m_canvas, *evt);
         layers_slider->reset_post_tick_event();
     }
+
+    apply_gcode_slider_changes();
+}
+
+void GLCanvas3D::apply_gcode_slider_changes()
+{
+    IMSlider *layers_slider = m_gcode_viewer.get_layers_slider();
+    IMSlider *moves_slider  = m_gcode_viewer.get_moves_slider();
 
     if (layers_slider->is_dirty()) {
         set_volumes_z_range({layers_slider->GetLowerValueD(), layers_slider->GetHigherValueD()});

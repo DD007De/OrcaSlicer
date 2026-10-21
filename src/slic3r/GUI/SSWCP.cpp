@@ -4721,6 +4721,18 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerConnectPrinter();
     } else if (m_cmd == "sw_SlicerDisconnectPrinter") {
         sw_SlicerDisconnectPrinter();
+    } else if (m_cmd == "sw_SlicerGetPreviewState") {
+        sw_SlicerGetPreviewState();
+    } else if (m_cmd == "sw_SlicerSetPreview") {
+        sw_SlicerSetPreview();
+    } else if (m_cmd == "sw_SlicerSetLayerRange") {
+        sw_SlicerSetLayerRange();
+    } else if (m_cmd == "sw_SlicerSetMove") {
+        sw_SlicerSetMove();
+    } else if (m_cmd == "sw_SlicerSetCamera") {
+        sw_SlicerSetCamera();
+    } else if (m_cmd == "sw_SlicerScreenshot") {
+        sw_SlicerScreenshot();
     } else {
         handle_general_fail();
     }
@@ -8040,6 +8052,9 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_SlicerSetPrintable", "sw_SlicerScaleToFit",
     "sw_SlicerListPlates", "sw_SlicerSelectPlate", "sw_SlicerDuplicatePlate", "sw_SlicerSetPlate",
     "sw_SlicerListPrinters", "sw_SlicerConnectPrinter", "sw_SlicerDisconnectPrinter",
+    // Preview controls and screenshot
+    "sw_SlicerGetPreviewState", "sw_SlicerSetPreview", "sw_SlicerSetLayerRange", "sw_SlicerSetMove",
+    "sw_SlicerSetCamera", "sw_SlicerScreenshot",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.

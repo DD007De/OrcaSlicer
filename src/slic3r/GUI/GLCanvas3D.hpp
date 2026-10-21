@@ -818,6 +818,13 @@ public:
     void reset_gcode_toolpaths() { m_gcode_viewer.reset(); }
     const GCodeViewer::SequentialView& get_gcode_sequential_view() const { return m_gcode_viewer.get_sequential_view(); }
     void update_gcode_sequential_view_current(unsigned int first, unsigned int last) { m_gcode_viewer.update_sequential_view_current(first, last); }
+    // Apply pending layer/move slider changes of the G-code preview now instead of after the
+    // next frame (_render_gcode). Used when the sliders are set programmatically.
+    void apply_gcode_slider_changes();
+    // Render one frame and read back the composed back buffer (scene, toolpaths and ImGui
+    // overlays) right before it is swapped. GUI thread only. Returns false if no frame was
+    // rendered (canvas not shown on screen, already rendering, not initialized).
+    bool capture_frame(std::vector<unsigned char>& rgba, unsigned int& width, unsigned int& height);
 
     void toggle_selected_volume_visibility(bool selected_visible);
     void toggle_sla_auxiliaries_visibility(bool visible, const ModelObject* mo = nullptr, int instance_idx = -1);
@@ -1211,6 +1218,17 @@ public:
     bool make_current_for_postinit();
 
 private:
+    // Target of capture_frame(): filled by render() right before SwapBuffers().
+    struct FrameCapture
+    {
+        std::vector<unsigned char> rgba;
+        unsigned int               width{ 0 };
+        unsigned int               height{ 0 };
+        bool                       done{ false };
+    };
+    FrameCapture* m_frame_capture{ nullptr };
+    void _capture_back_buffer(FrameCapture& capture);
+
     bool _is_shown_on_screen() const;
 
     const GLTexture* _get_shared_toolbar_background_texture();

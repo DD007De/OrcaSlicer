@@ -731,7 +731,7 @@ private:
     unsigned int m_last_result_id{ 0 };
     size_t m_moves_count{ 0 };
     //BBS: save m_gcode_result as well
-    const GCodeProcessorResult* m_gcode_result;
+    const GCodeProcessorResult* m_gcode_result{ nullptr };
     //BBS: add only gcode mode
     bool m_only_gcode_in_preview {false};
     bool m_loading{ false };
@@ -875,6 +875,21 @@ public:
             m_tools.m_tool_visibles.assign(m_tools.m_tool_visibles.size(), true);
         }
     }
+
+    // --- Used by the SSWCP API: the same state changes as the legend's controls. ---
+    // View types offered by the legend's combo box, in combo order (no Tool, no FilamentId).
+    std::vector<EViewType> get_selectable_view_types() const;
+    // Select a view type exactly like the combo box in render_legend(); false if it is not offered.
+    bool select_view_type(EViewType type);
+    // Extrusion roles present in the loaded result (legend order).
+    const std::vector<ExtrusionRole>& get_roles() const { return m_roles; }
+    // Filaments (0-based extruder ids) used by the loaded result.
+    const std::vector<unsigned char>& get_extruder_ids() const { return m_extruder_ids; }
+    bool is_filament_visible(size_t extruder_id) const;
+    void set_filament_visible(size_t extruder_id, bool visible);
+    // Refresh after a visibility change, like the legend's checkboxes do. In the speed view a
+    // travel change also recomputes the color ranges (as the legend's travel checkbox does).
+    void refresh_after_visibility_change(bool travel_changed);
 
     bool is_toolpath_move_type_visible(EMoveType type) const;
     void set_toolpath_move_type_visible(EMoveType type, bool visible);

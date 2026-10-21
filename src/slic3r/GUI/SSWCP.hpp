@@ -771,6 +771,14 @@ private:
     void sw_SlicerListPrinters();
     void sw_SlicerConnectPrinter();
     void sw_SlicerDisconnectPrinter();
+
+    // Preview controls and canvas screenshot.
+    void sw_SlicerGetPreviewState();
+    void sw_SlicerSetPreview();
+    void sw_SlicerSetLayerRange();
+    void sw_SlicerSetMove();
+    void sw_SlicerSetCamera();
+    void sw_SlicerScreenshot();
 };
 
 // Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the

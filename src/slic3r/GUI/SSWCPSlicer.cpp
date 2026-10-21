@@ -9,6 +9,7 @@
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
+#include "slic3r/GUI/GUI_Preview.hpp"
 #include "slic3r/GUI/IMSlider.hpp"
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/Selection.hpp"
@@ -75,7 +76,9 @@
 #include <boost/log/trivial.hpp>
 #include <wx/font.h>
 #include <wx/fontenum.h>
+#include <wx/image.h>
 #include <wx/weakref.h>
+#include <wx/glcanvas.h> // after the slic3r headers (GLEW must come before gl.h)
 #ifdef _WIN32
 // SetForegroundWindow() for the app's Flutter pages (send dialog, device page).
 #ifndef NOMINMAX
@@ -106,7 +109,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 9;
+        m_res_data["phase"]    = 10;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -348,6 +351,10 @@ void SSWCP_SliceProject_Instance::sw_SlicerGoToLayer()
         if (tick < 0) tick = 0;
         if (tick > maxv) tick = maxv;
         slider->SetHigherValue(tick);
+        // Applied right away so a following command sees the new layer (only once the
+        // viewer has G-code; before that it still holds no result to read).
+        if (canvas->get_gcode_viewer().has_data())
+            canvas->apply_gcode_slider_changes();
         canvas->set_as_dirty();
         canvas->request_extra_frame();
         m_res_data["layer"]       = tick + 1;
@@ -7118,6 +7125,770 @@ void SSWCP_SliceProject_Instance::sw_SlicerSetPlate()
         }
         sw_slicer_canvas()->set_as_dirty();
         reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Preview controls and canvas screenshot ---------------------------------------
+// View state only: none of these commands takes an undo snapshot or marks the project dirty.
+
+// The preview canvas. Throws if it is not available (yet).
+static GLCanvas3D* sw_slicer_preview_canvas()
+{
+    GLCanvas3D* canvas = wxGetApp().plater()->get_preview_canvas3D();
+    if (canvas == nullptr)
+        throw std::runtime_error("no preview canvas available");
+    return canvas;
+}
+
+// The preview must hold a loaded G-code result.
+static void sw_slicer_require_preview_data()
+{
+    if (!sw_slicer_preview_canvas()->get_gcode_viewer().has_data())
+        throw std::runtime_error("no preview loaded (slice the plate and open the Preview first)");
+}
+
+template<class T> struct SwSlicerNamed
+{
+    const char* name;
+    T           value;
+};
+
+// View types in the order of the legend's combo box.
+static const SwSlicerNamed<GCodeViewer::EViewType> sw_slicer_view_type_names[] = {
+    { "feature_type", GCodeViewer::EViewType::FeatureType },
+    { "filament", GCodeViewer::EViewType::ColorPrint },
+    { "speed", GCodeViewer::EViewType::Feedrate },
+    { "layer_height", GCodeViewer::EViewType::Height },
+    { "line_width", GCodeViewer::EViewType::Width },
+    { "flow", GCodeViewer::EViewType::VolumetricRate },
+    { "layer_time", GCodeViewer::EViewType::LayerTime },
+    { "layer_time_log", GCodeViewer::EViewType::LayerTimeLog },
+    { "fan_speed", GCodeViewer::EViewType::FanSpeed },
+    { "temperature", GCodeViewer::EViewType::Temperature },
+};
+
+// Extrusion roles shown as line types in the legend.
+static const SwSlicerNamed<ExtrusionRole> sw_slicer_role_names[] = {
+    { "inner_wall", erPerimeter },
+    { "outer_wall", erExternalPerimeter },
+    { "overhang_wall", erOverhangPerimeter },
+    { "sparse_infill", erInternalInfill },
+    { "internal_solid_infill", erSolidInfill },
+    { "top_surface", erTopSolidInfill },
+    { "bottom_surface", erBottomSurface },
+    { "ironing", erIroning },
+    { "bridge", erBridgeInfill },
+    { "internal_bridge", erInternalBridgeInfill },
+    { "gap_infill", erGapFill },
+    { "skirt", erSkirt },
+    { "brim", erBrim },
+    { "support", erSupportMaterial },
+    { "support_interface", erSupportMaterialInterface },
+    { "support_transition", erSupportTransition },
+    { "prime_tower", erWipeTower },
+    { "custom", erCustom },
+};
+
+// Preview options (bits of Preview::OptionType). Tool changes, color changes, pause prints and
+// custom G-code are not offered: the legend does not show them either.
+static const SwSlicerNamed<Preview::OptionType> sw_slicer_option_names[] = {
+    { "travel", Preview::OptionType::Travel },
+    { "retract", Preview::OptionType::Retractions },
+    { "unretract", Preview::OptionType::Unretractions },
+    { "wipe", Preview::OptionType::Wipe },
+    { "seams", Preview::OptionType::Seams },
+    { "shells", Preview::OptionType::Shells },
+    { "tool_marker", Preview::OptionType::ToolMarker },
+    { "legend", Preview::OptionType::Legend },
+};
+
+template<class T, size_t N> static std::string sw_slicer_named_list(const SwSlicerNamed<T> (&table)[N])
+{
+    std::string out;
+    for (const SwSlicerNamed<T>& e : table)
+        out += (out.empty() ? "" : "|") + std::string(e.name);
+    return out;
+}
+
+// Value for a name; throws "unknown <what> '<name>' (expected a|b|...)".
+template<class T, size_t N>
+static T sw_slicer_named_value(const SwSlicerNamed<T> (&table)[N], const std::string& name, const char* what)
+{
+    for (const SwSlicerNamed<T>& e : table)
+        if (name == e.name)
+            return e.value;
+    throw std::runtime_error("unknown " + std::string(what) + " '" + name + "' (expected " + sw_slicer_named_list(table) + ")");
+}
+
+// Name for a value, nullptr if the value has no name.
+template<class T, size_t N> static const char* sw_slicer_value_name(const SwSlicerNamed<T> (&table)[N], T value)
+{
+    for (const SwSlicerNamed<T>& e : table)
+        if (e.value == value)
+            return e.name;
+    return nullptr;
+}
+
+static unsigned int sw_slicer_option_bit(Preview::OptionType option) { return 1u << static_cast<unsigned int>(option); }
+
+// "3D", "Preview" or "Assemble".
+static std::string sw_slicer_canvas_view_name(GLCanvas3D* canvas)
+{
+    if (canvas == nullptr)
+        return "";
+    switch (canvas->get_canvas_type()) {
+    case GLCanvas3D::ECanvasType::CanvasPreview: return "Preview";
+    case GLCanvas3D::ECanvasType::CanvasAssembleView: return "Assemble";
+    default: return "3D";
+    }
+}
+
+// 0-based layer tick for params[layer_key] (1-based integer) or params[z_key] (closest layer,
+// in mm); -1 if neither is given. Out-of-range layers are clamped with a note.
+static int sw_slicer_layer_tick(const json& params, const char* layer_key, const char* z_key, const std::vector<double>& zs,
+                                int max_tick, std::vector<std::string>& notes)
+{
+    const bool has_layer = sw_slicer_has_param(params, layer_key);
+    const bool has_z     = sw_slicer_has_param(params, z_key);
+    if (has_layer && has_z)
+        throw std::runtime_error("pass either '" + std::string(layer_key) + "' or '" + std::string(z_key) + "', not both");
+    if (!has_layer && !has_z)
+        return -1;
+    if (has_layer) {
+        const json& j = params.at(layer_key);
+        if (!j.is_number_integer())
+            throw std::runtime_error("'" + std::string(layer_key) + "' must be an integer (1-based layer)");
+        const long long n    = j.get<long long>();
+        const long long tick = std::max(0LL, std::min(n - 1, static_cast<long long>(max_tick)));
+        if (tick != n - 1)
+            notes.push_back("layer " + std::to_string(n) + " clamped to " + std::to_string(tick + 1));
+        return static_cast<int>(tick);
+    }
+    const json& j = params.at(z_key);
+    if (!j.is_number() || !std::isfinite(j.get<double>()))
+        throw std::runtime_error("'" + std::string(z_key) + "' must be a finite number (mm)");
+    const double z    = j.get<double>();
+    int          tick = 0;
+    double       best = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < zs.size(); ++i) {
+        const double d = std::abs(zs[i] - z);
+        if (d < best) {
+            best = d;
+            tick = static_cast<int>(i);
+        }
+    }
+    return std::max(0, std::min(tick, max_tick));
+}
+
+static json sw_slicer_layer_z(const std::vector<double>& zs, int tick)
+{
+    return (tick >= 0 && tick < static_cast<int>(zs.size())) ? json(zs[tick]) : json(nullptr);
+}
+
+static json sw_slicer_camera_json()
+{
+    const Camera& camera = wxGetApp().plater()->get_camera();
+    json          j;
+    j["type"] = camera.get_type_as_string();
+    j["zoom"] = camera.get_zoom();
+    return j;
+}
+
+// The current state of the preview (shared reply part of all preview commands).
+static json sw_slicer_preview_state_json()
+{
+    Plater*      plater = wxGetApp().plater();
+    GLCanvas3D*  canvas = sw_slicer_preview_canvas();
+    GCodeViewer& gv     = canvas->get_gcode_viewer();
+    const bool   loaded = gv.has_data();
+    PartPlate*   plate  = plater->get_partplate_list().get_curr_plate();
+
+    json j;
+    j["view"]           = sw_slicer_canvas_view_name(plater->get_current_canvas3D());
+    j["preview_loaded"] = loaded;
+    j["sliced"]         = plate != nullptr && plate->is_slice_result_valid();
+    j["plate"]          = plater->get_partplate_list().get_curr_plate_index();
+
+    const char* view_type = sw_slicer_value_name(sw_slicer_view_type_names, gv.get_view_type());
+    j["view_type"]        = view_type != nullptr ? view_type : "other";
+    json view_types       = json::array();
+    for (GCodeViewer::EViewType t : gv.get_selectable_view_types())
+        if (const char* name = sw_slicer_value_name(sw_slicer_view_type_names, t))
+            view_types.push_back(name);
+    j["view_types"] = view_types;
+
+    if (loaded) {
+        const unsigned int role_flags = gv.get_toolpath_role_visibility_flags();
+        json               roles      = json::array();
+        for (ExtrusionRole role : gv.get_roles())
+            if (const char* name = sw_slicer_value_name(sw_slicer_role_names, role))
+                roles.push_back({ { "role", name }, { "visible", ((role_flags >> static_cast<unsigned int>(role)) & 1u) != 0 } });
+        j["roles"] = roles;
+
+        json filaments = json::array();
+        for (unsigned char id : gv.get_extruder_ids())
+            filaments.push_back({ { "filament", static_cast<int>(id) + 1 }, { "visible", gv.is_filament_visible(id) } });
+        j["filaments"] = filaments;
+    } else {
+        j["roles"]     = nullptr;
+        j["filaments"] = nullptr;
+    }
+
+    const unsigned int option_flags = gv.get_options_visibility_flags();
+    json               options      = json::object();
+    for (const SwSlicerNamed<Preview::OptionType>& e : sw_slicer_option_names)
+        options[e.name] = (option_flags & sw_slicer_option_bit(e.value)) != 0;
+    j["options"] = options;
+
+    if (loaded) {
+        IMSlider*                  ls = gv.get_layers_slider();
+        const std::vector<double>& zs = canvas->get_gcode_layers_zs();
+        j["layers"] = { { "count", ls->GetMaxValue() + 1 },
+                        { "bottom", ls->GetLowerValue() + 1 },
+                        { "top", ls->GetHigherValue() + 1 },
+                        { "z_bottom", sw_slicer_layer_z(zs, ls->GetLowerValue()) },
+                        { "z_top", sw_slicer_layer_z(zs, ls->GetHigherValue()) },
+                        { "one_layer", ls->is_one_layer() } };
+
+        IMSlider*                           ms = gv.get_moves_slider();
+        const GCodeViewer::SequentialView& sv = gv.get_sequential_view();
+        const size_t                        last = sv.current.last;
+        j["moves"] = { { "count", ms->GetMaxValue() + 1 },
+                       { "current", ms->GetHigherValue() + 1 },
+                       { "gcode_line", last < sv.gcode_ids.size() ? json(sv.gcode_ids[last]) : json(nullptr) },
+                       { "position", { sv.current_position.x(), sv.current_position.y(), sv.current_position.z() } } };
+    } else {
+        j["layers"] = nullptr;
+        j["moves"]  = nullptr;
+    }
+
+    j["camera"] = sw_slicer_camera_json();
+    return j;
+}
+
+// Read-only state of the preview: view type, line types, filaments, options, sliders, camera.
+void SSWCP_SliceProject_Instance::sw_SlicerGetPreviewState()
+{
+    try {
+        m_res_data = sw_slicer_preview_state_json();
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Exactly true or false, otherwise throws "<what> '<name>' must be true or false".
+static bool sw_slicer_bool_value(const json& j, const std::string& what, const std::string& name)
+{
+    if (!j.is_boolean())
+        throw std::runtime_error(what + " '" + name + "' must be true or false");
+    return j.get<bool>();
+}
+
+// Preview settings like the legend: view type, line types, filaments and options. Everything is
+// validated before anything is changed.
+void SSWCP_SliceProject_Instance::sw_SlicerSetPreview()
+{
+    try {
+        const json& p              = m_param_data;
+        const bool  has_view_type  = sw_slicer_has_param(p, "view_type");
+        const bool  has_roles      = sw_slicer_has_param(p, "roles");
+        const bool  has_only_roles = sw_slicer_has_param(p, "only_roles");
+        const bool  has_filaments  = sw_slicer_has_param(p, "filaments");
+        const bool  has_options    = sw_slicer_has_param(p, "options");
+        if (!has_view_type && !has_roles && !has_only_roles && !has_filaments && !has_options)
+            throw std::runtime_error("specify at least one of view_type, roles, only_roles, filaments, options");
+        if (has_roles && has_only_roles)
+            throw std::runtime_error("pass either 'roles' or 'only_roles', not both");
+        sw_slicer_require_preview_data();
+        sw_slicer_require_not_slicing();
+
+        GLCanvas3D*  canvas = sw_slicer_preview_canvas();
+        GCodeViewer& gv     = canvas->get_gcode_viewer();
+
+        // --- Validate everything first. ---
+        GCodeViewer::EViewType view_type = gv.get_view_type();
+        if (has_view_type) {
+            if (!p.at("view_type").is_string())
+                throw std::runtime_error("'view_type' must be a string (expected " + sw_slicer_named_list(sw_slicer_view_type_names) + ")");
+            const std::string name = p.at("view_type").get<std::string>();
+            view_type              = sw_slicer_named_value(sw_slicer_view_type_names, name, "view_type");
+            const std::vector<GCodeViewer::EViewType> selectable = gv.get_selectable_view_types();
+            if (std::find(selectable.begin(), selectable.end(), view_type) == selectable.end())
+                throw std::runtime_error("view_type '" + name + "' is not available");
+        }
+
+        std::vector<std::pair<ExtrusionRole, bool>> role_changes;
+        std::vector<std::string>                    role_names;
+        if (has_roles) {
+            const json& j = p.at("roles");
+            if (!j.is_object() || j.empty())
+                throw std::runtime_error("'roles' must be a non-empty object {line type: true|false}");
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                const ExtrusionRole role = sw_slicer_named_value(sw_slicer_role_names, it.key(), "role");
+                role_changes.emplace_back(role, sw_slicer_bool_value(it.value(), "role", it.key()));
+                role_names.push_back(it.key());
+            }
+        }
+        if (has_only_roles) {
+            const json& j = p.at("only_roles");
+            if (!j.is_array() || j.empty())
+                throw std::runtime_error("'only_roles' must be a non-empty list of line types");
+            std::set<std::string> seen;
+            for (const json& e : j) {
+                if (!e.is_string())
+                    throw std::runtime_error("'only_roles' must contain line type names (expected " + sw_slicer_named_list(sw_slicer_role_names) + ")");
+                const std::string name = e.get<std::string>();
+                const ExtrusionRole role = sw_slicer_named_value(sw_slicer_role_names, name, "role");
+                if (!seen.insert(name).second)
+                    throw std::runtime_error("role '" + name + "' is listed twice in 'only_roles'");
+                role_changes.emplace_back(role, true);
+                role_names.push_back(name);
+            }
+        }
+
+        std::vector<std::pair<int, bool>> filament_changes; // 1-based filament, visible
+        if (has_filaments) {
+            const json& j = p.at("filaments");
+            const int   n = wxGetApp().filaments_cnt();
+            if (!j.is_object() || j.empty())
+                throw std::runtime_error("'filaments' must be a non-empty object {\"<filament 1.." + std::to_string(n) + ">\": true|false}");
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                const std::string& key   = it.key();
+                const bool         digits = !key.empty() && key.size() <= 4 &&
+                                    std::all_of(key.begin(), key.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+                const int          f      = digits ? std::stoi(key) : 0;
+                if (f < 1 || f > n)
+                    throw std::runtime_error("filament '" + key + "' does not exist (1.." + std::to_string(n) + ")");
+                filament_changes.emplace_back(f, sw_slicer_bool_value(it.value(), "filament", key));
+            }
+        }
+
+        std::vector<std::pair<Preview::OptionType, bool>> option_changes;
+        if (has_options) {
+            const json& j = p.at("options");
+            if (!j.is_object() || j.empty())
+                throw std::runtime_error("'options' must be a non-empty object {option: true|false} (options: " + sw_slicer_named_list(sw_slicer_option_names) + ")");
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                const Preview::OptionType option = sw_slicer_named_value(sw_slicer_option_names, it.key(), "option");
+                option_changes.emplace_back(option, sw_slicer_bool_value(it.value(), "option", it.key()));
+            }
+        }
+
+        // --- Apply. ---
+        json                     changed = json::array();
+        std::vector<std::string> notes;
+
+        // 1. View type first: choosing a type in the app makes all line types (and, for the
+        //    filament view, all filaments) visible again; roles/filaments are applied after it.
+        if (has_view_type && view_type != gv.get_view_type()) {
+            gv.select_view_type(view_type);
+            changed.push_back("view_type");
+            if (view_type == GCodeViewer::EViewType::FeatureType && !has_roles && !has_only_roles)
+                notes.push_back("all line types are visible again (as when choosing the type in the app)");
+            else if (view_type == GCodeViewer::EViewType::ColorPrint && !has_roles && !has_only_roles && !has_filaments)
+                notes.push_back("all line types and filaments are visible again (as when choosing the type in the app)");
+        }
+        const GCodeViewer::EViewType final_type = gv.get_view_type();
+
+        // 2. Line types.
+        if (has_roles || has_only_roles) {
+            const unsigned int old_flags = gv.get_toolpath_role_visibility_flags();
+            unsigned int       flags     = old_flags;
+            if (has_only_roles)
+                for (const SwSlicerNamed<ExtrusionRole>& e : sw_slicer_role_names)
+                    flags &= ~(1u << static_cast<unsigned int>(e.value));
+            for (const std::pair<ExtrusionRole, bool>& rc : role_changes) {
+                const unsigned int bit = 1u << static_cast<unsigned int>(rc.first);
+                flags                  = rc.second ? (flags | bit) : (flags & ~bit);
+            }
+            const std::vector<ExtrusionRole>& present = gv.get_roles();
+            for (size_t i = 0; i < role_changes.size(); ++i)
+                if (std::find(present.begin(), present.end(), role_changes[i].first) == present.end())
+                    notes.push_back("line type '" + role_names[i] + "' does not occur in this slice");
+            if (flags != old_flags) {
+                gv.set_toolpath_role_visibility_flags(flags);
+                changed.push_back("roles");
+            }
+            if (final_type != GCodeViewer::EViewType::FeatureType)
+                notes.push_back("line type visibility applies in every view; the legend shows it only in feature_type");
+        }
+
+        // 3. Filaments.
+        if (has_filaments) {
+            bool                              any = false;
+            const std::vector<unsigned char>& used = gv.get_extruder_ids();
+            for (const std::pair<int, bool>& fc : filament_changes) {
+                const size_t id     = static_cast<size_t>(fc.first - 1);
+                const bool   before = gv.is_filament_visible(id);
+                if (before != fc.second) {
+                    gv.set_filament_visible(id, fc.second);
+                    any = any || gv.is_filament_visible(id) != before;
+                }
+                if (std::find(used.begin(), used.end(), static_cast<unsigned char>(id)) == used.end())
+                    notes.push_back("filament " + std::to_string(fc.first) + " is not used in this slice");
+            }
+            if (any)
+                changed.push_back("filaments");
+            if (final_type != GCodeViewer::EViewType::ColorPrint)
+                notes.push_back("filament visibility applies in the filament view");
+        }
+
+        // 4. Options (only the offered bits change).
+        bool travel_changed = false;
+        if (has_options) {
+            const unsigned int old_flags = gv.get_options_visibility_flags();
+            unsigned int       flags     = old_flags;
+            for (const std::pair<Preview::OptionType, bool>& oc : option_changes) {
+                const unsigned int bit = sw_slicer_option_bit(oc.first);
+                flags                  = oc.second ? (flags | bit) : (flags & ~bit);
+                if (oc.first == Preview::OptionType::Legend && !oc.second)
+                    notes.push_back("the legend stays hidden until you show it again with options.legend:true");
+            }
+            if (flags != old_flags) {
+                canvas->set_gcode_options_visibility_from_flags(flags);
+                travel_changed = ((flags ^ old_flags) & sw_slicer_option_bit(Preview::OptionType::Travel)) != 0;
+                changed.push_back("options");
+            }
+        }
+
+        if (!changed.empty()) {
+            gv.refresh_after_visibility_change(travel_changed);
+            canvas->set_as_dirty();
+            canvas->request_extra_frame();
+        } else {
+            notes.push_back("preview settings unchanged; nothing changed");
+        }
+
+        m_res_data            = sw_slicer_preview_state_json();
+        m_res_data["changed"] = changed;
+        m_res_data["notes"]   = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Layer range of the preview (the vertical slider): bottom and top (1-based) or z in mm, and the
+// one-layer mode. Applied right away so a following command sees the new range.
+void SSWCP_SliceProject_Instance::sw_SlicerSetLayerRange()
+{
+    try {
+        const json& p          = m_param_data;
+        const bool  has_top    = sw_slicer_has_param(p, "top") || sw_slicer_has_param(p, "z_top");
+        const bool  has_bottom = sw_slicer_has_param(p, "bottom") || sw_slicer_has_param(p, "z_bottom");
+        const bool  has_one    = sw_slicer_has_param(p, "one_layer");
+        if (!has_top && !has_bottom && !has_one)
+            throw std::runtime_error("specify at least one of top, z_top, bottom, z_bottom, one_layer");
+        sw_slicer_require_preview_data();
+        sw_slicer_require_not_slicing();
+
+        GLCanvas3D*  canvas = sw_slicer_preview_canvas();
+        GCodeViewer& gv     = canvas->get_gcode_viewer();
+        IMSlider*    s      = gv.get_layers_slider();
+        if (s == nullptr)
+            throw std::runtime_error("no layer slider available");
+        const int                  max_tick = s->GetMaxValue();
+        const std::vector<double>& zs       = canvas->get_gcode_layers_zs();
+
+        std::vector<std::string> notes;
+        int top_tick    = sw_slicer_layer_tick(p, "top", "z_top", zs, max_tick, notes);
+        int bottom_tick = sw_slicer_layer_tick(p, "bottom", "z_bottom", zs, max_tick, notes);
+        if (has_one && !p.at("one_layer").is_boolean())
+            throw std::runtime_error("'one_layer' must be true or false");
+        const bool cur_one = s->is_one_layer();
+        const bool one     = has_one ? p.at("one_layer").get<bool>() : cur_one;
+        if (one && has_bottom)
+            throw std::runtime_error("one_layer shows a single layer; pass only 'top' or 'z_top'");
+        // Leaving the one-layer mode shows the whole range again, like the slider's button;
+        // a given top or bottom still applies.
+        const bool leaving_one = cur_one && !one;
+        if (top_tick < 0)
+            top_tick = leaving_one ? max_tick : s->GetHigherValue();
+        if (bottom_tick < 0)
+            bottom_tick = leaving_one ? s->GetMinValue() : s->GetLowerValue();
+        if (!one && bottom_tick > top_tick)
+            throw std::runtime_error("bottom must not be above top");
+
+        auto reply = [&]() {
+            m_res_data["bottom"]      = s->GetLowerValue() + 1;
+            m_res_data["top"]         = s->GetHigherValue() + 1;
+            m_res_data["layer_count"] = s->GetMaxValue() + 1;
+            m_res_data["z_bottom"]    = sw_slicer_layer_z(zs, s->GetLowerValue());
+            m_res_data["z_top"]       = sw_slicer_layer_z(zs, s->GetHigherValue());
+            m_res_data["one_layer"]   = s->is_one_layer();
+            m_res_data["notes"]       = notes;
+            send_to_js();
+            finish_job();
+        };
+
+        if (one == cur_one && top_tick == s->GetHigherValue() && (one || bottom_tick == s->GetLowerValue())) {
+            notes.push_back("layer range unchanged; nothing changed");
+            reply();
+            return;
+        }
+
+        if (one != cur_one && !s->switch_one_layer_mode())
+            throw std::runtime_error("the layer slider is busy (close the custom G-code window in the app first)");
+        if (one)
+            s->SetHigherValue(top_tick); // the slider keeps bottom = top in one-layer mode
+        else
+            s->SetSelectionSpan(bottom_tick, top_tick);
+        canvas->apply_gcode_slider_changes();
+        canvas->set_as_dirty();
+        canvas->request_extra_frame();
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Horizontal slider of the preview: the move within the top visible layer.
+void SSWCP_SliceProject_Instance::sw_SlicerSetMove()
+{
+    try {
+        const json& p        = m_param_data;
+        const bool  has_move = sw_slicer_has_param(p, "move");
+        const bool  has_pos  = sw_slicer_has_param(p, "position");
+        if (has_move == has_pos)
+            throw std::runtime_error("specify either 'move' (1-based) or position:'first'|'last'");
+        long long   move = 0;
+        std::string position;
+        if (has_move) {
+            const json& j = p.at("move");
+            if (!j.is_number_integer() || j.get<long long>() < 1)
+                throw std::runtime_error("'move' must be an integer >= 1 (1-based)");
+            move = j.get<long long>();
+        } else {
+            const json& j = p.at("position");
+            position      = j.is_string() ? j.get<std::string>() : std::string();
+            if (position != "first" && position != "last")
+                throw std::runtime_error("position must be 'first' or 'last'");
+        }
+        sw_slicer_require_preview_data();
+        sw_slicer_require_not_slicing();
+
+        GLCanvas3D*  canvas = sw_slicer_preview_canvas();
+        GCodeViewer& gv     = canvas->get_gcode_viewer();
+        IMSlider*    ms     = gv.get_moves_slider();
+        if (ms == nullptr)
+            throw std::runtime_error("no move slider available");
+        const int max_tick = ms->GetMaxValue();
+
+        std::vector<std::string> notes;
+        int                      idx = 0;
+        if (has_move) {
+            idx = static_cast<int>(std::min(move - 1, static_cast<long long>(max_tick)));
+            if (idx != move - 1)
+                notes.push_back("move " + std::to_string(move) + " clamped to " + std::to_string(max_tick + 1));
+        } else {
+            idx = position == "first" ? ms->GetMinValue() : max_tick;
+        }
+
+        if (idx == ms->GetHigherValue()) {
+            notes.push_back("move unchanged; nothing changed");
+        } else {
+            ms->SetHigherValue(idx);
+            // Updates the sequential view and the tool marker right away.
+            canvas->apply_gcode_slider_changes();
+            canvas->set_as_dirty();
+            canvas->request_extra_frame();
+            if (ms->GetHigherValue() != idx)
+                notes.push_back("moved to the nearest visible move");
+        }
+
+        const GCodeViewer::SequentialView& sv   = gv.get_sequential_view();
+        const size_t                        last = sv.current.last;
+        m_res_data["move"]       = ms->GetHigherValue() + 1;
+        m_res_data["move_count"] = ms->GetMaxValue() + 1;
+        m_res_data["gcode_line"] = last < sv.gcode_ids.size() ? json(sv.gcode_ids[last]) : json(nullptr);
+        m_res_data["position"]   = { sv.current_position.x(), sv.current_position.y(), sv.current_position.z() };
+        m_res_data["notes"]      = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Camera presets like the View menu, and zoom. The camera is shared by the 3D view and the Preview.
+void SSWCP_SliceProject_Instance::sw_SlicerSetCamera()
+{
+    try {
+        static const char* const presets[] = { "default", "iso", "top", "bottom", "front", "rear", "left", "right", "topfront" };
+        static const char* const zooms[]   = { "fit", "bed", "plate", "objects", "selection", "gcode" };
+        auto                     join      = [](const char* const* b, const char* const* e) {
+            std::string out;
+            for (; b != e; ++b)
+                out += (out.empty() ? "" : "|") + std::string(*b);
+            return out;
+        };
+        auto contains = [](const char* const* b, const char* const* e, const std::string& v) {
+            return std::any_of(b, e, [&v](const char* s) { return v == s; });
+        };
+
+        const json& p          = m_param_data;
+        const bool  has_preset = sw_slicer_has_param(p, "preset");
+        const bool  has_zoom   = sw_slicer_has_param(p, "zoom");
+        if (!has_preset && !has_zoom)
+            throw std::runtime_error("specify at least one of preset, zoom");
+        std::string preset, zoom;
+        if (has_preset) {
+            preset = p.at("preset").is_string() ? p.at("preset").get<std::string>() : p.at("preset").dump();
+            if (!p.at("preset").is_string() || !contains(std::begin(presets), std::end(presets), preset))
+                throw std::runtime_error("unknown preset '" + preset + "' (expected " + join(std::begin(presets), std::end(presets)) + ")");
+        }
+        if (has_zoom) {
+            zoom = p.at("zoom").is_string() ? p.at("zoom").get<std::string>() : p.at("zoom").dump();
+            if (!p.at("zoom").is_string() || !contains(std::begin(zooms), std::end(zooms), zoom))
+                throw std::runtime_error("unknown zoom '" + zoom + "' (expected " + join(std::begin(zooms), std::end(zooms)) + ")");
+        }
+
+        Plater*     plater = wxGetApp().plater();
+        GLCanvas3D* c      = plater->get_current_canvas3D();
+        if (c == nullptr || c->get_wxglcanvas() == nullptr || !c->get_wxglcanvas()->IsShownOnScreen())
+            throw std::runtime_error("the 3D view is not shown (select the Prepare or Preview tab first)");
+        const bool in_preview_with_data = c->get_canvas_type() == GLCanvas3D::ECanvasType::CanvasPreview &&
+                                          c->get_gcode_viewer().has_data();
+        const bool has_objects = !plater->model().objects.empty();
+
+        std::vector<std::string> notes;
+        std::string              zoom_target = zoom;
+        if (zoom == "fit") {
+            zoom_target = in_preview_with_data ? "gcode" : (has_objects ? "objects" : "plate");
+            notes.push_back("fit zoomed to '" + zoom_target + "'");
+        }
+        if (zoom_target == "selection" && c->get_selection().is_empty())
+            throw std::runtime_error("nothing is selected");
+        if (zoom_target == "gcode" && !in_preview_with_data)
+            throw std::runtime_error("zoom 'gcode' needs the Preview with a sliced plate");
+        if (zoom_target == "objects" && !has_objects)
+            throw std::runtime_error("no objects to zoom to");
+
+        Camera&                 camera      = plater->get_camera();
+        const Camera::EType     type_before = camera.get_type();
+        const double            zoom_before = camera.get_zoom();
+        const Transform3d       view_before = camera.get_view_matrix();
+
+        if (preset == "default") {
+            // Like View > Default View.
+            plater->select_view("plate");
+            c->zoom_to_bed();
+        } else if (!preset.empty()) {
+            plater->select_view(preset);
+        }
+
+        if (zoom_target == "bed")
+            c->zoom_to_bed();
+        else if (zoom_target == "plate")
+            c->zoom_to_plate(REQUIRES_ZOOM_TO_CUR_PLATE);
+        else if (zoom_target == "objects")
+            c->zoom_to_volumes();
+        else if (zoom_target == "selection")
+            c->zoom_to_selection();
+        else if (zoom_target == "gcode")
+            c->zoom_to_gcode();
+
+        c->set_as_dirty();
+        c->request_extra_frame();
+
+        const double matrix_diff = (camera.get_view_matrix().matrix() - view_before.matrix()).cwiseAbs().maxCoeff();
+        if (camera.get_type() != type_before)
+            notes.push_back("projection switched to " + camera.get_type_as_string() +
+                            " (auto perspective is on in the app preferences)");
+        else if (matrix_diff < 1e-9 && std::abs(camera.get_zoom() - zoom_before) < 1e-9)
+            notes.push_back("camera unchanged; nothing changed");
+
+        m_res_data["view"] = sw_slicer_canvas_view_name(c);
+        if (has_preset)
+            m_res_data["preset"] = preset;
+        if (has_zoom)
+            m_res_data["zoom"] = zoom;
+        m_res_data["camera"] = sw_slicer_camera_json();
+        m_res_data["notes"]  = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// PNG of the visible canvas (3D view, Preview or assembly view), written to 'path'. The reply holds
+// only metadata, never image data.
+void SSWCP_SliceProject_Instance::sw_SlicerScreenshot()
+{
+    try {
+        const json&                   p      = m_param_data;
+        const boost::filesystem::path target = sw_slicer_output_path(p, "path", { ".png" });
+        sw_slicer_require_overwrite_allowed(target, p);
+        int max_size = 1280;
+        if (sw_slicer_has_param(p, "max_size")) {
+            const json& j = p.at("max_size");
+            if (!j.is_number_integer() || j.get<long long>() < 64 || j.get<long long>() > 4096)
+                throw std::runtime_error("max_size must be an integer between 64 and 4096");
+            max_size = j.get<int>();
+        }
+        if (wxGetApp().mainframe != nullptr && wxGetApp().mainframe->IsIconized())
+            throw std::runtime_error("the app window is minimized; restore it first");
+
+        GLCanvas3D* c = wxGetApp().plater()->get_current_canvas3D();
+        if (c == nullptr || c->get_wxglcanvas() == nullptr || !c->get_wxglcanvas()->IsShownOnScreen())
+            throw std::runtime_error("the 3D view is not shown (select the Prepare or Preview tab first)");
+        std::vector<unsigned char> rgba;
+        unsigned int               w = 0, h = 0;
+        if (!c->capture_frame(rgba, w, h))
+            throw std::runtime_error("the 3D view could not be rendered (is the app window visible?)");
+
+        // Convert on the GUI thread; no GL needed from here on.
+        wxImage        img(static_cast<int>(w), static_cast<int>(h), false);
+        unsigned char* dst     = img.GetData();
+        bool           uniform = true;
+        for (unsigned int y = 0; y < h; ++y) {
+            // OpenGL rows start at the bottom.
+            const unsigned char* src = rgba.data() + static_cast<size_t>(h - 1 - y) * w * 4;
+            for (unsigned int x = 0; x < w; ++x, src += 4, dst += 3) {
+                dst[0]  = src[0];
+                dst[1]  = src[1];
+                dst[2]  = src[2];
+                uniform = uniform && src[0] == rgba[0] && src[1] == rgba[1] && src[2] == rgba[2];
+            }
+        }
+        rgba.clear();
+        rgba.shrink_to_fit();
+        const unsigned int longest = std::max(w, h);
+        if (longest > static_cast<unsigned int>(max_size)) {
+            const double f = double(max_size) / double(longest);
+            img.Rescale(std::max(1, int(std::lround(w * f))), std::max(1, int(std::lround(h * f))), wxIMAGE_QUALITY_HIGH);
+        }
+
+        boost::system::error_code ec;
+        const bool                existed = boost::filesystem::exists(target, ec);
+        sw_slicer_write_via_temp(target, [&img](const boost::filesystem::path& tmp) {
+            wxLogNull no_log_dialog; // a write error is reported as an API error, not a log dialog
+            return img.SaveFile(from_path(tmp), wxBITMAP_TYPE_PNG);
+        });
+
+        std::vector<std::string> notes;
+        if (uniform)
+            notes.push_back("the image is uniform; the window may be covered or not drawn yet");
+        if (existed)
+            notes.push_back("existing file replaced");
+
+        const uintmax_t bytes = boost::filesystem::file_size(target, ec);
+        m_res_data["path"]          = sw_slicer_path_to_utf8(target);
+        m_res_data["width"]         = img.GetWidth();
+        m_res_data["height"]        = img.GetHeight();
+        m_res_data["canvas_width"]  = w;
+        m_res_data["canvas_height"] = h;
+        m_res_data["bytes"]         = ec ? json(nullptr) : json(static_cast<unsigned long long>(bytes));
+        m_res_data["view"]          = sw_slicer_canvas_view_name(c);
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
     }
