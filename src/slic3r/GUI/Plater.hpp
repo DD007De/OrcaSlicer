@@ -513,6 +513,11 @@ public:
     void export_core_3mf();
     static TriangleMesh combine_mesh_fff(const ModelObject& mo, int instance_id, std::function<void(const std::string&)> notify_func = {});
     void export_stl(bool extended = false, bool selection_only = false, bool multi_stls = false);
+    // Export meshes as STL without a file dialog: the work of export_stl() after its dialog. With
+    // multi_stls, path_u8 is a folder ending in a separator and every object gets its own file (an
+    // existing name gets "(n)" appended). Returns false if there was nothing to export. Note:
+    // store_stl() does not report write errors; callers that need certainty should check the file.
+    bool export_stl_to(const std::string& path_u8, bool extended, bool selection_only, bool multi_stls = false);
     //BBS: remove amf
     //void export_amf();
     //BBS add extra param for exporting 3mf silence

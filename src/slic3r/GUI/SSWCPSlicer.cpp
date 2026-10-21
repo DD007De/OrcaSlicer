@@ -109,7 +109,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 10;
+        m_res_data["phase"]    = 11;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -7887,6 +7887,957 @@ void SSWCP_SliceProject_Instance::sw_SlicerScreenshot()
         m_res_data["bytes"]         = ec ? json(nullptr) : json(static_cast<unsigned long long>(bytes));
         m_res_data["view"]          = sw_slicer_canvas_view_name(c);
         m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Object clipboard, visibility, instances, plates and model export ---------------------
+// Copy/paste through the app's internal clipboard (the selection's clipboard, not the clipboard of
+// the operating system), hide/show in the assembly view, the number of instances, instance to
+// object, moving to another plate, and exporting STL / generic 3MF without a file dialog.
+
+// 'objects' parameter: a non-empty list of existing object indices without duplicates.
+static std::vector<int> sw_slicer_parse_objects(const json& params, const char* key)
+{
+    const std::string k = key;
+    const int         n = static_cast<int>(wxGetApp().plater()->model().objects.size());
+    if (!sw_slicer_has_param(params, key) || !params.at(key).is_array() || params.at(key).empty())
+        throw std::runtime_error("'" + k + "' must be a non-empty list of object indices");
+    std::vector<int> objs;
+    for (const json& j : params.at(key)) {
+        if (!j.is_number_integer() || j.get<long long>() < 0 || j.get<long long>() >= n)
+            throw std::runtime_error("object index " + j.dump() + " in '" + k + "' does not exist (there are " +
+                                     std::to_string(n) + " objects, 0-based)");
+        const int obj = j.get<int>();
+        if (std::find(objs.begin(), objs.end(), obj) != objs.end())
+            throw std::runtime_error("object index " + std::to_string(obj) + " appears twice in '" + k + "'");
+        objs.push_back(obj);
+    }
+    return objs;
+}
+
+// After changing the canvas selection: the object list and the gizmos follow it (as in sw_slicer_select).
+static void sw_slicer_selection_changed(GLCanvas3D* canvas)
+{
+    wxGetApp().obj_list()->update_selections();
+    canvas->update_gizmos_on_off_state();
+    canvas->set_as_dirty();
+}
+
+// Select the instances (object, instance) in the 3D canvas and the object list.
+static void sw_slicer_select_instances(const std::vector<std::pair<int, int>>& items)
+{
+    GLCanvas3D* canvas = sw_slicer_canvas();
+    Selection&  s      = canvas->get_selection();
+    s.clear();
+    for (size_t i = 0; i < items.size(); ++i)
+        s.add_instance(static_cast<unsigned int>(items[i].first), static_cast<unsigned int>(items[i].second), i == 0);
+    sw_slicer_selection_changed(canvas);
+}
+
+// Select whole objects (all instances) in the 3D canvas and the object list.
+static void sw_slicer_select_whole_objects(const std::vector<int>& objs)
+{
+    GLCanvas3D* canvas = sw_slicer_canvas();
+    Selection&  s      = canvas->get_selection();
+    s.clear();
+    for (size_t i = 0; i < objs.size(); ++i)
+        s.add_object(static_cast<unsigned int>(objs[i]), i == 0);
+    sw_slicer_selection_changed(canvas);
+}
+
+// ObjectIDs of the volumes of an object, to find the volumes a paste added.
+static std::set<size_t> sw_slicer_volume_ids(const ModelObject* mo)
+{
+    std::set<size_t> ids;
+    for (const ModelVolume* mv : mo->volumes)
+        ids.insert(mv->id().id);
+    return ids;
+}
+
+// The objects of a selection (the wipe tower, object_idx >= 1000, is skipped).
+static std::vector<int> sw_slicer_selected_objects(const Selection& s)
+{
+    std::vector<int> objs;
+    for (const auto& content : s.get_content())
+        if (content.first >= 0 && content.first < 1000)
+            objs.push_back(content.first);
+    return objs;
+}
+
+// Copy objects or parts to the app's internal clipboard, like Ctrl+C: exactly one of {object,
+// instance?, volumes?}, {objects:[...]} or {scope:'selection'}. Of an object one instance (default 0)
+// is copied: pasting puts every instance of a copy at the same spot. The model does not change: no
+// undo step. The clipboard of the operating system is not touched.
+void SSWCP_SliceProject_Instance::sw_SlicerCopy()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        const bool has_object  = sw_slicer_has_param(m_param_data, "object");
+        const bool has_objects = sw_slicer_has_param(m_param_data, "objects");
+        const bool has_scope   = sw_slicer_has_param(m_param_data, "scope");
+        const bool scope_ok    = has_scope && m_param_data.at("scope").is_string() &&
+                              m_param_data.at("scope").get<std::string>() == "selection";
+        if (int(has_object) + int(has_objects) + int(has_scope) != 1 || (has_scope && !scope_ok))
+            throw std::runtime_error("specify exactly one of: object, objects, scope:'selection'");
+        const bool has_inst = sw_slicer_has_param(m_param_data, "instance");
+        const bool has_vols = sw_slicer_has_param(m_param_data, "volumes");
+        if (!has_object && (has_inst || has_vols))
+            throw std::runtime_error("'instance' and 'volumes' can only be used with 'object'");
+
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_not_loading();
+        // Plater::can_copy_to_clipboard() requires the 3D view.
+        sw_slicer_require_3d_view();
+        Model&                   model  = plater->model();
+        GLCanvas3D*              canvas = sw_slicer_canvas();
+        Selection&               sel    = canvas->get_selection();
+        std::vector<std::string> notes;
+        // Copying changes no model data: the selection changes take no (selection) snapshot, which would
+        // discard the redo branch.
+        Plater::SuppressSnapshots no_snapshots(plater);
+
+        if (has_object) {
+            const int          obj  = sw_slicer_required_object(m_param_data);
+            const int          inst = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+            const ModelObject* mo   = model.objects[obj];
+            if (has_vols) {
+                const json& arr = m_param_data.at("volumes");
+                if (!arr.is_array() || arr.empty())
+                    throw std::runtime_error("'volumes' must be a non-empty list of volume indices");
+                std::vector<int> vols;
+                for (const json& j : arr) {
+                    if (!j.is_number_integer() || j.get<long long>() < 0 || j.get<long long>() >= (long long) mo->volumes.size())
+                        throw std::runtime_error("volume " + j.dump() + " does not exist (object " + std::to_string(obj) + " has " +
+                                                 std::to_string(mo->volumes.size()) + " volume(s))");
+                    const int vol = j.get<int>();
+                    if (std::find(vols.begin(), vols.end(), vol) != vols.end())
+                        throw std::runtime_error("volume index " + std::to_string(vol) + " appears twice in 'volumes'");
+                    vols.push_back(vol);
+                }
+                // As the user would click the parts in the object list (all solid parts allowed: the copy
+                // is a parts copy, not an object copy).
+                sel.clear();
+                for (size_t i = 0; i < vols.size(); ++i)
+                    sel.add_volume(static_cast<unsigned int>(obj), static_cast<unsigned int>(vols[i]), inst, i == 0);
+                sw_slicer_selection_changed(canvas);
+            } else {
+                // One instance: paste_objects_from_clipboard() puts all instances of a copy at the same spot.
+                sw_slicer_select(obj, inst, -1);
+                if (mo->instances.size() > 1)
+                    notes.push_back("the object has " + std::to_string(mo->instances.size()) + " instances; only instance " +
+                                    std::to_string(inst) + " was copied");
+            }
+        } else if (has_objects) {
+            const std::vector<int>           objs = sw_slicer_parse_objects(m_param_data, "objects");
+            std::vector<std::pair<int, int>> items;
+            for (int obj : objs) {
+                items.emplace_back(obj, 0);
+                if (model.objects[obj]->instances.size() > 1)
+                    notes.push_back("object " + std::to_string(obj) + " has " + std::to_string(model.objects[obj]->instances.size()) +
+                                    " instances; only instance 0 was copied");
+            }
+            sw_slicer_select_instances(items);
+        } else if (sel.is_empty()) {
+            throw std::runtime_error("nothing is selected");
+        }
+        // Selection::copy_to_clipboard() indexes model.objects with every selected object index; the wipe
+        // tower (object_idx >= 1000) would read past the end (Plater::can_copy_to_clipboard() allows it).
+        if (sel.is_wipe_tower() || sw_slicer_selected_objects(sel).size() != sel.get_content().size())
+            throw std::runtime_error("the wipe tower cannot be copied; select objects or parts only");
+
+        if (!plater->can_copy_to_clipboard())
+            throw std::runtime_error("the selection cannot be copied");
+        {
+            sswcp_api::Scope api_scope;
+            // The app route of Ctrl+C: the object list's clipboard is reset (the list selection is now an
+            // object or part), then the selection's clipboard is filled. No snapshot (the app takes none).
+            plater->copy_selection_to_clipboard();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        const Selection::Clipboard& cb = sel.get_clipboard();
+        if (cb.is_empty())
+            throw std::runtime_error(sw_slicer_join_notes("nothing was copied", notes));
+        const bool parts = cb.get_mode() == Selection::Volume;
+        if (parts) {
+            std::set<int> vols;
+            for (unsigned int idx : sel.get_volume_idxs()) {
+                const GLVolume* v = sel.get_volume(idx);
+                if (v != nullptr && v->volume_idx() >= 0 && v->object_idx() == sel.get_object_idx())
+                    vols.insert(v->volume_idx());
+            }
+            m_res_data["mode"]     = "parts";
+            m_res_data["object"]   = sel.get_object_idx();
+            m_res_data["instance"] = sel.get_instance_idx();
+            m_res_data["volumes"]  = std::vector<int>(vols.begin(), vols.end());
+            notes.insert(notes.begin(), "the app's internal copy/paste clipboard now holds " +
+                                            std::to_string(cb.get_objects().front()->volumes.size()) +
+                                            " part(s); the Windows clipboard is not changed");
+        } else {
+            json objs      = json::array();
+            json instances = json::array();
+            for (const auto& content : sel.get_content()) {
+                if (content.first < 0 || content.first >= 1000 || content.second.empty())
+                    continue;
+                objs.push_back(content.first);
+                instances.push_back(*content.second.begin());
+                if (content.second.size() > 1)
+                    notes.push_back("object " + std::to_string(content.first) + ": " + std::to_string(content.second.size()) +
+                                    " instances were copied; pasting puts them at the same spot");
+            }
+            m_res_data["mode"]      = "objects";
+            m_res_data["objects"]   = objs;
+            m_res_data["instances"] = instances;
+            notes.insert(notes.begin(), "the app's internal copy/paste clipboard now holds " + std::to_string(cb.get_objects().size()) +
+                                            " object(s); the Windows clipboard is not changed");
+        }
+        m_res_data["notes"] = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Paste the app's internal clipboard, like Ctrl+V. Objects go to the nearest free spot of the current
+// plate, or of 'plate' (which then becomes the current plate); parts go into 'object' (instance
+// 'instance', default 0). One undo step "API: Paste" per call.
+void SSWCP_SliceProject_Instance::sw_SlicerPaste()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        // The paste code uses plater()->canvas3D(), the current canvas.
+        sw_slicer_require_3d_view();
+        Model&                      model  = plater->model();
+        PartPlateList&              plates = plater->get_partplate_list();
+        GLCanvas3D*                 canvas = sw_slicer_canvas();
+        Selection&                  sel    = canvas->get_selection();
+        const Selection::Clipboard& cb     = sel.get_clipboard();
+        if (cb.is_empty())
+            throw std::runtime_error("the clipboard is empty (copy first with sw_SlicerCopy, or Ctrl+C in the app)");
+        const bool               has_object = sw_slicer_has_param(m_param_data, "object");
+        const bool               has_inst   = sw_slicer_has_param(m_param_data, "instance");
+        std::vector<std::string> notes;
+
+        if (cb.get_mode() == Selection::Instance) {
+            if (has_object || has_inst)
+                throw std::runtime_error("the clipboard holds objects; 'object' and 'instance' are only for pasting parts");
+            const int plate = sw_slicer_resolve_plate(m_param_data);
+            if (plates.get_plate(plate)->is_locked())
+                throw std::runtime_error("plate " + std::to_string(plate) + " is locked");
+            // The free-spot search of the paste works on the current plate.
+            sw_slicer_select_plate(plate);
+            const size_t n_before = model.objects.size();
+            {
+                sswcp_api::Scope     api_scope;
+                Plater::TakeSnapshot snapshot(plater, "API: Paste");
+                // Objects are only pasted in instance mode (Selection::paste_from_clipboard). Cleared after
+                // the snapshot, so undo restores the user's selection; clear() keeps the mode.
+                sel.clear();
+                wxGetApp().obj_list()->update_selections();
+                sel.set_mode(Selection::Instance);
+                // The selection's clipboard only: Plater::paste_from_clipboard() would first paste settings or
+                // layer ranges that were copied in the object list.
+                sel.paste_from_clipboard();
+                const std::vector<std::string>& api_notes = sswcp_api::notes();
+                notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+            }
+            const size_t n_after = model.objects.size();
+            if (n_after <= n_before)
+                throw std::runtime_error(sw_slicer_join_notes("pasting produced nothing", notes));
+            json added = json::array();
+            for (size_t i = n_before; i < n_after; ++i)
+                added.push_back(static_cast<int>(i));
+            const int on_plate = sw_slicer_instance_plate(static_cast<int>(n_before), 0);
+            if (on_plate < 0)
+                notes.push_back("no free spot on the plate; the copy was placed off the plate (use sw_SlicerArrange)");
+            else
+                notes.push_back("placed in the nearest free spot of plate " + std::to_string(on_plate));
+            m_res_data["mode"]          = "objects";
+            m_res_data["plate"]         = on_plate;
+            m_res_data["objects_added"] = added;
+            m_res_data["objects"]       = sw_slicer_objects_json();
+            m_res_data["notes"]         = notes;
+            send_to_js();
+            finish_job();
+            return;
+        }
+
+        // A parts copy.
+        if (!has_object)
+            throw std::runtime_error("the clipboard holds parts; pass 'object' to paste them into");
+        if (sw_slicer_has_param(m_param_data, "plate"))
+            throw std::runtime_error("'plate' is only for pasting objects");
+        const int    obj  = sw_slicer_required_object(m_param_data);
+        const int    inst = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+        ModelObject* mo   = model.objects[obj];
+        // The app allows pasting parts into a cut object; the API, like sw_SlicerAddVolume, refuses solid
+        // and negative parts there (they change one half of the cut without the other).
+        if (mo->is_cut())
+            for (const ModelObject* src : cb.get_objects())
+                for (const ModelVolume* mv : src->volumes)
+                    if (mv->is_model_part() || mv->is_negative_volume())
+                        throw std::runtime_error("solid or negative parts cannot be pasted into a cut object");
+        sw_slicer_select(obj, inst, -1);
+        if (!sel.is_from_single_instance() || sel.get_object_idx() != obj || sel.get_instance_idx() != inst)
+            throw std::runtime_error("could not select instance " + std::to_string(inst) + " of object " + std::to_string(obj));
+        const std::set<size_t> ids_before = sw_slicer_volume_ids(mo);
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Paste");
+            // The selection's clipboard only: Plater::paste_from_clipboard() would first paste settings or
+            // layer ranges that were copied in the object list.
+            sel.paste_from_clipboard();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        // The indices after the app has reordered the volumes (reorder_volumes_and_get_selection).
+        json added = json::array();
+        for (size_t v = 0; v < mo->volumes.size(); ++v)
+            if (ids_before.count(mo->volumes[v]->id().id) == 0)
+                added.push_back(static_cast<int>(v));
+        if (added.empty())
+            throw std::runtime_error(sw_slicer_join_notes("pasting produced nothing", notes));
+        m_res_data["mode"]          = "parts";
+        m_res_data["object"]        = obj;
+        m_res_data["instance"]      = inst;
+        m_res_data["volumes_added"] = added;
+        m_res_data["objects"]       = sw_slicer_objects_json();
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Hide or show an object, instance or solid part, like "Hide"/"Show" in the right-click menu of the
+// assembly view (the only place where the app offers it). It is a view setting of the assembly
+// canvas (GLVolume::visible): slicing and printing do not change, and the undo stack does not store
+// it, so there is no undo step.
+void SSWCP_SliceProject_Instance::sw_SlicerSetVisible()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        if (!sw_slicer_has_param(m_param_data, "visible") || !m_param_data.at("visible").is_boolean())
+            throw std::runtime_error("'visible' must be true or false");
+        const bool visible = m_param_data.at("visible").get<bool>();
+        const int  obj     = sw_slicer_required_object(m_param_data);
+        const int  inst    = sw_slicer_optional_sub_index(m_param_data, "instance", obj, -1);
+        const int  vol     = sw_slicer_optional_sub_index(m_param_data, "volume", obj, -1);
+        sw_slicer_require_free_gizmo();
+        // The menu cancels running jobs (Plater::set_selected_visible); the API refuses instead.
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        GLCanvas3D* ac = plater->get_assmeble_canvas3D();
+        if (ac == nullptr || plater->get_current_canvas3D() != ac || ac->get_canvas_type() != GLCanvas3D::CanvasAssembleView)
+            throw std::runtime_error("hide/show only exists in the assembly view (sw_SlicerShowView Assemble)");
+        // The assembly view only loads solid parts.
+        if (vol >= 0 && !plater->model().objects[obj]->volumes[vol]->is_model_part())
+            throw std::runtime_error("only solid parts are shown in the assembly view");
+
+        // A view setting: the selection changes take no (selection) snapshot, which would discard the redo branch.
+        Plater::SuppressSnapshots no_snapshots(plater);
+        // Select on the assembly canvas; the object list follows that selection there (scene_selection).
+        Selection& s = ac->get_selection();
+        s.clear();
+        if (vol >= 0)
+            s.add_volume(static_cast<unsigned int>(obj), static_cast<unsigned int>(vol), std::max(inst, 0), true);
+        else if (inst >= 0)
+            s.add_instance(static_cast<unsigned int>(obj), static_cast<unsigned int>(inst), true);
+        else
+            s.add_object(static_cast<unsigned int>(obj), true);
+        wxGetApp().obj_list()->update_selections();
+        ac->set_as_dirty();
+        if (s.is_empty())
+            throw std::runtime_error("could not select object " + std::to_string(obj) + " in the assembly view");
+
+        // Same reading as the menu (append_menu_item_set_visible).
+        int n_visible = 0;
+        int n_total   = 0;
+        for (unsigned int i : s.get_volume_idxs()) {
+            const GLVolume* v = s.get_volume(i);
+            if (v == nullptr)
+                continue;
+            ++n_total;
+            n_visible += v->visible ? 1 : 0;
+        }
+        const json previous = (n_visible == n_total) ? json(true) : (n_visible == 0) ? json(false) : json("mixed");
+
+        std::vector<std::string> notes;
+        if ((visible && n_visible == n_total) || (!visible && n_visible == 0)) {
+            notes.push_back("visibility unchanged; nothing changed");
+        } else {
+            sswcp_api::Scope api_scope;
+            // GLCanvas3D::set_selected_visible() without the snapshot of Plater::set_selected_visible(): the
+            // undo stack does not store GLVolume::visible, so that snapshot would be an empty undo step.
+            ac->set_selected_visible(visible);
+            ac->set_as_dirty();
+            ac->request_extra_frame();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        notes.push_back("visibility is a view setting of the assembly view: it does not change printing and is not an undo step");
+
+        m_res_data["object"] = obj;
+        if (vol >= 0)
+            m_res_data["instance"] = std::max(inst, 0);
+        else if (inst >= 0)
+            m_res_data["instance"] = inst;
+        if (vol >= 0)
+            m_res_data["volume"] = vol;
+        m_res_data["visible"]  = visible;
+        m_res_data["previous"] = previous;
+        m_res_data["view"]     = sw_slicer_canvas_view_name(ac);
+        m_res_data["notes"]    = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Set the number of instances of an object. Only lowering is possible: the app makes copies as
+// separate objects (its "set number of instances" is disabled), see sw_SlicerClone. The highest
+// instances are deleted (the route of sw_SlicerDelete with 'instance'). One undo step
+// "API: Set instances"; the same count takes no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerSetInstanceCount()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        const json* jc = sw_slicer_has_param(m_param_data, "count") ? &m_param_data.at("count") : nullptr;
+        // Same limit as the clone dialog (sw_SlicerClone).
+        if (jc == nullptr || !jc->is_number_integer() || jc->get<long long>() < 1 || jc->get<long long>() > 1000)
+            throw std::runtime_error("count must be between 1 and 1000");
+        const int count = jc->get<int>();
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_3d_view();
+        Model&    model = plater->model();
+        const int obj   = sw_slicer_required_object(m_param_data);
+        const int n     = static_cast<int>(model.objects[obj]->instances.size());
+        // Same rule as can_increase_instances()/can_decrease_instances().
+        if (model.objects[obj]->is_cut())
+            throw std::runtime_error("the instances of a cut object cannot be changed");
+
+        std::vector<std::string> notes;
+        if (count == n) {
+            notes.push_back("instance count unchanged; nothing changed");
+        } else if (count > n) {
+            throw std::runtime_error("the app makes copies as separate objects; use sw_SlicerClone (count) to add copies");
+        } else {
+            // Never the last instance (count >= 1): ObjectList::del_subobject_from_object() would show an
+            // error dialog for it.
+            std::vector<std::pair<int, int>> items;
+            for (int i = count; i < n; ++i)
+                items.emplace_back(obj, i);
+            sw_slicer_select_instances(items);
+            if (!plater->can_delete())
+                throw std::runtime_error("these instances cannot be deleted");
+            {
+                sswcp_api::Scope     api_scope;
+                Plater::TakeSnapshot snapshot(plater, "API: Set instances");
+                // The app's own snapshot "Delete Selected Objects" is suppressed.
+                plater->remove_selected();
+                const std::vector<std::string>& api_notes = sswcp_api::notes();
+                notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+            }
+            if (obj >= static_cast<int>(model.objects.size()) || static_cast<int>(model.objects[obj]->instances.size()) != count)
+                throw std::runtime_error(sw_slicer_join_notes("the instance count could not be set", notes));
+        }
+        m_res_data["object"]   = obj;
+        m_res_data["count"]    = static_cast<int>(model.objects[obj]->instances.size());
+        m_res_data["previous"] = n;
+        m_res_data["objects"]  = sw_slicer_objects_json();
+        m_res_data["notes"]    = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Make an instance a separate object, like "Set as an individual object" (ObjectList::split_instances);
+// without 'instance' every instance becomes its own object ("Set as individual objects"). The new
+// objects are appended to the model. One undo step "API: Instance to object".
+void SSWCP_SliceProject_Instance::sw_SlicerInstanceToObject()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        // split_instances() reads scene_selection(): the 3D canvas must be the current one.
+        sw_slicer_require_3d_view();
+        Model&    model = plater->model();
+        const int obj   = sw_slicer_required_object(m_param_data);
+        const int inst  = sw_slicer_optional_sub_index(m_param_data, "instance", obj, -1);
+        const int n     = static_cast<int>(model.objects[obj]->instances.size());
+        // Checked up front (the menu is disabled then, can_set_instance_to_object()): otherwise
+        // del_subobject_from_object() would show an error dialog for the last instance.
+        if (n < 2)
+            throw std::runtime_error("object " + std::to_string(obj) + " has only one instance; nothing to separate");
+        // The app allows it, but the copy would share the cut link of the original.
+        if (model.objects[obj]->is_cut())
+            throw std::runtime_error("instances of a cut object cannot be separated through the API");
+
+        sw_slicer_select(obj, inst, -1);
+        const Selection& sel = sw_slicer_canvas()->get_selection();
+        if (sel.get_object_idx() != obj || (inst >= 0 ? sel.get_instance_idx() != inst : !sel.is_single_full_object()))
+            throw std::runtime_error("could not select object " + std::to_string(obj));
+        const size_t             n_before = model.objects.size();
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Instance to object");
+            // The app's own snapshot "Instances to Separated Objects" is suppressed.
+            wxGetApp().obj_list()->split_instances();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        const size_t n_after = model.objects.size();
+        if (n_after <= n_before)
+            throw std::runtime_error(sw_slicer_join_notes("no instance was separated", notes));
+        json added = json::array();
+        for (size_t i = n_before; i < n_after; ++i)
+            added.push_back(static_cast<int>(i));
+        if (inst >= 0)
+            notes.push_back("instance " + std::to_string(inst) + " is now object " + std::to_string(n_before) +
+                            "; the remaining instances keep their indices shifted down");
+        else
+            // instances_to_separated_objects() works from the last instance down.
+            notes.push_back("instance 0 stays object " + std::to_string(obj) + "; instance i is now object " + std::to_string(n_before) +
+                            " + " + std::to_string(n - 1) + " - i");
+        m_res_data["objects_added"] = added;
+        m_res_data["objects"]       = sw_slicer_objects_json();
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Move an instance (default 0) to another plate. place:'free' (default) puts it in the nearest free
+// spot of the target plate, like pasting (that search works on the current plate, so the target plate
+// becomes the current plate); place:'center' puts it in the middle, like Center (it may overlap).
+// Locked plates are refused. One undo step "API: Move to plate"; already on the plate takes no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerMoveToPlate()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        if (!sw_slicer_has_param(m_param_data, "plate"))
+            throw std::runtime_error("specify 'plate' (0-based)");
+        const int         plate = sw_slicer_resolve_plate(m_param_data);
+        const std::string place = !sw_slicer_has_param(m_param_data, "place") ? std::string("free") :
+                                  m_param_data.at("place").is_string()        ? m_param_data.at("place").get<std::string>() :
+                                                                                std::string("?");
+        if (place != "free" && place != "center")
+            throw std::runtime_error("place must be 'free' or 'center'");
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_3d_view();
+        const int      obj    = sw_slicer_required_object(m_param_data);
+        const int      inst   = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+        PartPlateList& plates = plater->get_partplate_list();
+        GLCanvas3D*    canvas = sw_slicer_canvas();
+        const int      from   = sw_slicer_instance_plate(obj, inst);
+
+        std::vector<std::string> notes;
+        auto reply = [&]() {
+            m_res_data["object"]        = obj;
+            m_res_data["instance"]      = inst;
+            m_res_data["plate"]         = plate;
+            m_res_data["from_plate"]    = from;
+            m_res_data["position"]      = sw_slicer_vec3(plater->model().objects[obj]->instances[inst]->get_offset());
+            m_res_data["current_plate"] = plates.get_curr_plate_index();
+            m_res_data["notes"]         = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (from == plate) {
+            notes.push_back("already on plate " + std::to_string(plate) + "; nothing changed");
+            reply();
+            return;
+        }
+        // Dragging in the app ignores the lock; the API does not touch a locked plate.
+        if (plates.get_plate(plate)->is_locked())
+            throw std::runtime_error("plate " + std::to_string(plate) + " is locked");
+        if (from >= 0 && plates.get_plate(from)->is_locked())
+            throw std::runtime_error("plate " + std::to_string(from) + " is locked");
+
+        // Everything is checked before the current plate changes.
+        Selection& sel           = canvas->get_selection();
+        auto       instance_only = [&]() {
+            return !sel.is_empty() && sel.get_object_idx() == obj && sel.get_instance_idx() == inst;
+        };
+        sw_slicer_select(obj, inst, -1);
+        if (!instance_only())
+            throw std::runtime_error("could not select instance " + std::to_string(inst) + " of object " + std::to_string(obj));
+        if (place == "free") {
+            // get_nearest_empty_cell() only searches the current plate.
+            sw_slicer_select_plate(plate);
+            notes.push_back("plate " + std::to_string(plate) + " is now the current plate (the free-spot search works on the current plate)");
+            // Selecting a plate may change the selection: select the instance again.
+            sw_slicer_select(obj, inst, -1);
+            if (!instance_only())
+                throw std::runtime_error("could not select instance " + std::to_string(inst) + " of object " + std::to_string(obj) +
+                                         " after making plate " + std::to_string(plate) + " the current plate");
+        }
+        const BoundingBoxf3 bbox   = sel.get_bounding_box();
+        const BoundingBoxf3 volume = plates.get_plate(plate)->get_build_volume();
+        if (bbox.size().x() > volume.size().x() || bbox.size().y() > volume.size().y())
+            notes.push_back("the object is larger than the plate");
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Move to plate");
+            if (place == "free") {
+                // Same call as Selection::paste_objects_from_clipboard(), then the move of Selection::center_plate().
+                const Vec3d center = plates.get_plate(plate)->get_center_origin();
+                const Vec2f cell   = canvas->get_nearest_empty_cell({float(center.x()), float(center.y())},
+                                                                    {float(bbox.size().x() + 1), float(bbox.size().y() + 1)});
+                sel.move_to_center(Vec3d(cell.x() - bbox.center().x(), cell.y() - bbox.center().y(), 0.0));
+                // do_move() updates the plate assignment of the instance; no snapshot of its own.
+                canvas->do_move("");
+            } else {
+                // The route of sw_SlicerCenter; the app's own snapshot "Move Object" is suppressed.
+                canvas->do_center_plate(plate);
+            }
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        if (place == "center")
+            notes.push_back("centered on plate " + std::to_string(plate) + "; it may overlap other objects (use sw_SlicerArrange with scope 'plate')");
+        const int after = sw_slicer_instance_plate(obj, inst);
+        if (after != plate)
+            notes.push_back(after >= 0 ? "the app placed the object on plate " + std::to_string(after) :
+                                         std::string("the app placed the object on no plate"));
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Output folder parameter: an absolute path to an existing folder.
+static boost::filesystem::path sw_slicer_output_dir(const json& params, const char* key)
+{
+    const std::string k   = key;
+    const std::string msg = "'" + k + "' must be an absolute path to an existing folder";
+    if (!sw_slicer_has_param(params, key) || !params.at(key).is_string() || params.at(key).get<std::string>().empty())
+        throw std::runtime_error(msg);
+    const boost::filesystem::path p = sw_slicer_path_from_utf8(params.at(key).get<std::string>());
+    boost::system::error_code     ec;
+    if (!p.is_absolute() || !boost::filesystem::is_directory(p, ec))
+        throw std::runtime_error(msg);
+    return p;
+}
+
+// A file name stem from an object name: no folder or forbidden characters, trimmed, without a
+// trailing ".stl", never empty or a reserved Windows device name.
+static std::string sw_slicer_safe_file_stem(const std::string& name)
+{
+    std::string s = name;
+    for (char& c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7f || std::string("<>:/\\|?*\"").find(c) != std::string::npos)
+            c = '_';
+    }
+    if (boost::algorithm::iends_with(s, ".stl"))
+        s.resize(s.size() - 4);
+    // Windows drops trailing dots and spaces from file names.
+    const size_t b = s.find_first_not_of(' ');
+    const size_t e = s.find_last_not_of(" .");
+    s              = (b == std::string::npos || e == std::string::npos || e < b) ? std::string() : s.substr(b, e - b + 1);
+    if (s.empty())
+        return "object";
+    static const char* const reserved[] = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+                                           "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+    const std::string base = s.substr(0, s.find('.'));
+    for (const char* r : reserved)
+        if (boost::algorithm::iequals(base, r))
+            return "_" + s;
+    return s;
+}
+
+// stem.stl in dir, or stem(1).stl, stem(2).stl, ... if that exists (the scheme of Plater::export_stl).
+static boost::filesystem::path sw_slicer_unique_file(const boost::filesystem::path& dir, const std::string& stem)
+{
+    boost::filesystem::path p = dir / sw_slicer_path_from_utf8(stem + ".stl");
+    for (int n = 1;; ++n) {
+        // exists(p, ec) also sets ec for a file that is not there, so look at the status type instead.
+        boost::system::error_code          ec;
+        const boost::filesystem::file_status st = boost::filesystem::status(p, ec);
+        if (st.type() == boost::filesystem::file_not_found)
+            return p;
+        if (ec || st.type() == boost::filesystem::status_error)
+            throw std::runtime_error("cannot check whether the file exists: " + sw_slicer_path_to_utf8(p));
+        if (n > 100000)
+            throw std::runtime_error("no free file name for " + stem + ".stl");
+        p = dir / sw_slicer_path_from_utf8(stem + "(" + std::to_string(n) + ").stl");
+    }
+}
+
+// Export objects as STL without a file dialog, the work of "Export all objects as one STL / as STLs"
+// (MainFrame) and "Export as one STL / as STLs" (object menu): scope 'all' (default), 'plate',
+// 'objects' or 'selection' (whole objects); one file, or with split one file per object in a folder,
+// never replacing a file (an existing name gets "(n)"). Without split another existing file is only
+// replaced with overwrite:true. Writes through temporary files. No undo step.
+void SSWCP_SliceProject_Instance::sw_SlicerExportStl()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        const std::string scope = !sw_slicer_has_param(m_param_data, "scope") ? std::string("all") :
+                                  m_param_data.at("scope").is_string()        ? m_param_data.at("scope").get<std::string>() :
+                                                                                std::string("?");
+        if (scope != "all" && scope != "plate" && scope != "objects" && scope != "selection")
+            throw std::runtime_error("scope must be 'all', 'plate', 'objects' or 'selection'");
+        if (sw_slicer_has_param(m_param_data, "plate") && scope != "plate")
+            throw std::runtime_error("'plate' can only be used with scope:'plate'");
+        if (sw_slicer_has_param(m_param_data, "objects") && scope != "objects")
+            throw std::runtime_error("'objects' can only be used with scope:'objects'");
+        if (sw_slicer_has_param(m_param_data, "split") && !m_param_data.at("split").is_boolean())
+            throw std::runtime_error("'split' must be true or false");
+        const bool split = sw_slicer_flag_true(m_param_data, "split");
+        if (split && sw_slicer_flag_true(m_param_data, "overwrite"))
+            throw std::runtime_error("split never replaces files; 'overwrite' cannot be used with split");
+
+        // The handler changes the selection.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        Model& model = plater->model();
+        if (model.objects.empty())
+            throw std::runtime_error("the project is empty; nothing to export");
+        // The SLA branch of export_stl() reads slice results.
+        if (plater->printer_technology() != ptFFF)
+            throw std::runtime_error("only FFF printers are supported");
+        // Exporting changes no model data: the selection changes take no (selection) snapshot, which would
+        // discard the redo branch.
+        Plater::SuppressSnapshots no_snapshots(plater);
+
+        std::vector<std::string> notes;
+        GLCanvas3D*              canvas = sw_slicer_canvas();
+        const Selection&         sel    = canvas->get_selection();
+        // The condition of export_stl(): whole objects only.
+        auto whole_objects = [&sel]() { return !sel.is_wipe_tower() && (sel.is_single_full_object() || sel.is_multiple_full_object()); };
+
+        std::vector<int> objs;
+        if (scope == "all") {
+            for (size_t i = 0; i < model.objects.size(); ++i)
+                objs.push_back(static_cast<int>(i));
+        } else if (scope == "plate") {
+            const int  n = sw_slicer_resolve_plate(m_param_data);
+            PartPlate* p = plater->get_partplate_list().get_plate(n);
+            for (size_t o = 0; o < model.objects.size(); ++o) {
+                const ModelObject* mo = model.objects[o];
+                int                on = 0;
+                for (size_t j = 0; j < mo->instances.size(); ++j)
+                    on += p->contain_instance(static_cast<int>(o), static_cast<int>(j)) ? 1 : 0;
+                if (on == 0)
+                    continue;
+                objs.push_back(static_cast<int>(o));
+                if (on < static_cast<int>(mo->instances.size()))
+                    notes.push_back("object " + std::to_string(o) + " also has instances on other plates; all its instances are exported");
+            }
+            if (objs.empty())
+                throw std::runtime_error("plate " + std::to_string(n) + " has no objects");
+        } else if (scope == "objects") {
+            objs = sw_slicer_parse_objects(m_param_data, "objects");
+        } else {
+            if (sel.is_empty())
+                throw std::runtime_error("nothing is selected");
+            if (!whole_objects())
+                throw std::runtime_error("select whole objects in the app first (parts or single instances are not exported as STL)");
+            objs = sw_slicer_selected_objects(sel);
+        }
+        std::sort(objs.begin(), objs.end());
+
+        const bool any_negative = std::any_of(objs.begin(), objs.end(), [&model](int o) {
+            const ModelVolumePtrs& vols = model.objects[o]->volumes;
+            return std::any_of(vols.begin(), vols.end(), [](const ModelVolume* mv) { return mv->is_negative_volume(); });
+        });
+        if (any_negative)
+            notes.push_back("negative parts were subtracted; if that fails the app shows a notification and exports only the positive parts");
+
+        // export_stl_to() always reports success (store_stl() does not check the write): check the file.
+        auto write_stl = [plater](const boost::filesystem::path& tmp, bool selection_only) {
+            const bool                ok = plater->export_stl_to(sw_slicer_path_to_utf8(tmp), false, selection_only, false);
+            boost::system::error_code ec;
+            return ok && boost::filesystem::is_regular_file(tmp, ec) && boost::filesystem::file_size(tmp, ec) > 0 && !ec;
+        };
+        auto file_json = [](const boost::filesystem::path& p, const std::vector<int>& file_objs) {
+            boost::system::error_code ec;
+            const uintmax_t           bytes = boost::filesystem::file_size(p, ec);
+            json                      f;
+            f["path"]    = sw_slicer_path_to_utf8(p);
+            f["bytes"]   = ec ? json(nullptr) : json(static_cast<unsigned long long>(bytes));
+            f["objects"] = file_objs;
+            return f;
+        };
+        json files = json::array();
+
+        if (!split) {
+            const boost::filesystem::path target = sw_slicer_output_path(m_param_data, "path", {".stl"});
+            sw_slicer_require_overwrite_allowed(target, m_param_data);
+            boost::system::error_code ec;
+            const bool                replaces       = boost::filesystem::exists(target, ec);
+            const bool                selection_only = scope != "all";
+            if (selection_only) {
+                // Selected as the user would before the menu item; the selection stays visible.
+                sw_slicer_select_whole_objects(objs);
+                if (!whole_objects() || sw_slicer_selected_objects(sel).size() != objs.size())
+                    throw std::runtime_error("the objects could not be selected for export");
+            }
+            {
+                sswcp_api::Scope api_scope;
+                sw_slicer_write_via_temp(target, [&](const boost::filesystem::path& tmp) { return write_stl(tmp, selection_only); });
+                const std::vector<std::string>& api_notes = sswcp_api::notes();
+                notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+            }
+            files.push_back(file_json(target, objs));
+            // export_stl() moves a single object with one instance by -origin_translation.
+            if (selection_only && objs.size() == 1 && model.objects[objs.front()]->instances.size() == 1)
+                notes.push_back("coordinates are relative to the object (as the app's STL export does)");
+            if (replaces)
+                notes.push_back("existing file replaced");
+        } else {
+            const boost::filesystem::path dir = sw_slicer_output_dir(m_param_data, "path");
+            // One object at a time, each through a temporary file: the app route (multi_stls) writes
+            // directly, the API never replaces a file.
+            std::vector<std::string> written;
+            bool                     relative = false;
+            for (int o : objs) {
+                try {
+                    sw_slicer_select_whole_objects({o});
+                    if (!sel.is_single_full_object() || sel.get_object_idx() != o)
+                        throw std::runtime_error("object " + std::to_string(o) + " could not be selected for export");
+                    const boost::filesystem::path file = sw_slicer_unique_file(dir, sw_slicer_safe_file_stem(model.objects[o]->name));
+                    {
+                        sswcp_api::Scope api_scope;
+                        sw_slicer_write_via_temp(file, [&](const boost::filesystem::path& tmp) { return write_stl(tmp, true); });
+                        const std::vector<std::string>& api_notes = sswcp_api::notes();
+                        notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+                    }
+                    files.push_back(file_json(file, {o}));
+                    written.push_back(sw_slicer_path_to_utf8(file));
+                    relative = relative || model.objects[o]->instances.size() == 1;
+                } catch (std::exception& e) {
+                    sw_slicer_select_whole_objects(objs);
+                    std::string msg = "exported " + std::to_string(written.size()) + " of " + std::to_string(objs.size()) +
+                                      " objects before the error: " + e.what();
+                    if (!written.empty()) {
+                        msg += "; written:";
+                        for (const std::string& w : written)
+                            msg += " " + w;
+                    }
+                    throw std::runtime_error(msg);
+                }
+            }
+            // Show what was exported.
+            sw_slicer_select_whole_objects(objs);
+            if (relative)
+                notes.push_back("coordinates of objects with one instance are relative to the object (as the app's STL export does)");
+        }
+
+        m_res_data["scope"] = scope;
+        m_res_data["files"] = files;
+        m_res_data["notes"] = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Export the whole project as a generic 3MF without the app's extensions, like "Export Generic 3MF"
+// (Plater::export_core_3mf: export_3mf with SaveStrategy::Silence). The project file, title and saved
+// state do not change. Another existing file is only replaced with overwrite:true. No undo step.
+void SSWCP_SliceProject_Instance::sw_SlicerExport3mf()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        // The thumbnails are rendered on the GUI thread, as in sw_SlicerSaveProject.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        if (plater->model().objects.empty())
+            throw std::runtime_error("the project is empty; nothing to export");
+        if (plater->using_exported_file() || plater->only_gcode_mode())
+            throw std::runtime_error("a G-code or sliced file is open; it cannot be exported as a model");
+
+        const boost::filesystem::path target = sw_slicer_output_path(m_param_data, "path", {".3mf"});
+        if (boost::algorithm::iends_with(m_param_data.at("path").get<std::string>(), ".gcode.3mf"))
+            throw std::runtime_error("use a .3mf name without .gcode (sw_SlicerExportSliced writes sliced files)");
+        const boost::filesystem::path own = into_path(plater->get_project_filename(".3mf"));
+        boost::system::error_code     ec;
+        if (!own.empty() && boost::filesystem::exists(target, ec) && boost::filesystem::equivalent(target, own, ec) && !ec)
+            throw std::runtime_error("this is the project's own file; use sw_SlicerSaveProject to save it");
+        sw_slicer_require_overwrite_allowed(target, m_param_data);
+        const bool replaces = boost::filesystem::exists(target, ec);
+        const bool new_svg  = sw_slicer_has_new_svg_files(plater->model());
+
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope api_scope;
+            // Exactly Plater::export_core_3mf() after its file dialog. Silence: no project file name is
+            // recorded and publish() skips the SVG question. None of the follow-up steps of saving a project.
+            sw_slicer_write_via_temp(target, [plater](const boost::filesystem::path& tmp) {
+                return plater->export_3mf(tmp, SaveStrategy::Silence) >= 0;
+            });
+            notes = sswcp_api::notes();
+        }
+        if (new_svg)
+            notes.push_back("original SVG files stored in the file with their local paths (dialog skipped)");
+        if (replaces)
+            notes.push_back("existing file replaced");
+
+        const uintmax_t bytes = boost::filesystem::file_size(target, ec);
+        m_res_data["path"]    = sw_slicer_path_to_utf8(target);
+        m_res_data["bytes"]   = ec ? json(nullptr) : json(static_cast<unsigned long long>(bytes));
+        m_res_data["objects"] = static_cast<int>(plater->model().objects.size());
+        m_res_data["plates"]  = plater->get_partplate_list().get_plate_count();
+        m_res_data["notes"]   = notes;
         send_to_js();
         finish_job();
     } catch (std::exception& e) {

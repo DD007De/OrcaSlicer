@@ -779,6 +779,16 @@ private:
     void sw_SlicerSetMove();
     void sw_SlicerSetCamera();
     void sw_SlicerScreenshot();
+
+    // Object clipboard, visibility, instances, plates and model export.
+    void sw_SlicerCopy();
+    void sw_SlicerPaste();
+    void sw_SlicerSetVisible();
+    void sw_SlicerSetInstanceCount();
+    void sw_SlicerInstanceToObject();
+    void sw_SlicerMoveToPlate();
+    void sw_SlicerExportStl();
+    void sw_SlicerExport3mf();
 };
 
 // Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the

@@ -20996,7 +20996,12 @@ void Plater::export_stl(bool extended, bool selection_only, bool multi_stls)
         path = p->get_export_file(FT_STL);
     }
     if (path.empty()) { return; }
-    const std::string path_u8 = into_u8(path);
+    export_stl_to(into_u8(path), extended, selection_only, multi_stls);
+}
+
+bool Plater::export_stl_to(const std::string& path_u8, bool extended, bool selection_only, bool multi_stls)
+{
+    if (p->model.objects.empty() || path_u8.empty()) return false;
 
     wxBusyCursor wait;
     const auto& selection = p->get_selection();
@@ -21004,15 +21009,15 @@ void Plater::export_stl(bool extended, bool selection_only, bool multi_stls)
 
 #if EXPORT_WITH_BOOLEAN
     if (selection_only && (obj_idx == -1 || selection.is_wipe_tower()))
-        return;
+        return false;
 #else
     // BBS support selecting multiple objects
-    if (selection_only && selection.is_wipe_tower()) return;
+    if (selection_only && selection.is_wipe_tower()) return false;
 
     // BBS
     if (selection_only) {
         // only support selection single full object and mulitiple full object
-        if (!selection.is_single_full_object() && !selection.is_multiple_full_object()) return;
+        if (!selection.is_single_full_object() && !selection.is_multiple_full_object()) return false;
     }
 
     // Following lambda generates a combined mesh for export with normals pointing outwards.
@@ -21171,15 +21176,16 @@ void Plater::export_stl(bool extended, bool selection_only, bool multi_stls)
             }
         }
         else if (selection.is_multiple_full_object() && multi_stls) {
+            bool all_ok = true;
             const std::set<std::pair<int, int>> &instances_idxs = p->get_selection().get_selected_object_instances();
             for (const std::pair<int, int> &i : instances_idxs) {
                 ModelObject *object = p->model.objects[i.first];
                 auto mesh = mesh_to_export(*object, i.second);
                 mesh.translate(-object->origin_translation.cast<float>());
 
-                Slic3r::store_stl(get_save_file(path_u8, object->name).c_str(), &mesh, true);
+                all_ok = Slic3r::store_stl(get_save_file(path_u8, object->name).c_str(), &mesh, true) && all_ok;
             }
-            return;
+            return all_ok;
         }
     }
     else if (!multi_stls) {
@@ -21187,15 +21193,16 @@ void Plater::export_stl(bool extended, bool selection_only, bool multi_stls)
             mesh.merge(mesh_to_export(*o, -1));
         }
     } else {
+        bool all_ok = true;
         for (const ModelObject* o : p->model.objects) {
             auto mesh = mesh_to_export(*o, -1);
             mesh.translate(-o->origin_translation.cast<float>());
-            Slic3r::store_stl(get_save_file(path_u8, o->name).c_str(), &mesh, true);
+            all_ok = Slic3r::store_stl(get_save_file(path_u8, o->name).c_str(), &mesh, true) && all_ok;
         }
-        return;
+        return all_ok;
     }
 
-    Slic3r::store_stl(path_u8.c_str(), &mesh, true);
+    return Slic3r::store_stl(path_u8.c_str(), &mesh, true);
 }
 
 //BBS: remove amf export

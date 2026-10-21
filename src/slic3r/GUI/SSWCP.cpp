@@ -4733,6 +4733,22 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerSetCamera();
     } else if (m_cmd == "sw_SlicerScreenshot") {
         sw_SlicerScreenshot();
+    } else if (m_cmd == "sw_SlicerCopy") {
+        sw_SlicerCopy();
+    } else if (m_cmd == "sw_SlicerPaste") {
+        sw_SlicerPaste();
+    } else if (m_cmd == "sw_SlicerSetVisible") {
+        sw_SlicerSetVisible();
+    } else if (m_cmd == "sw_SlicerSetInstanceCount") {
+        sw_SlicerSetInstanceCount();
+    } else if (m_cmd == "sw_SlicerInstanceToObject") {
+        sw_SlicerInstanceToObject();
+    } else if (m_cmd == "sw_SlicerMoveToPlate") {
+        sw_SlicerMoveToPlate();
+    } else if (m_cmd == "sw_SlicerExportStl") {
+        sw_SlicerExportStl();
+    } else if (m_cmd == "sw_SlicerExport3mf") {
+        sw_SlicerExport3mf();
     } else {
         handle_general_fail();
     }
@@ -8055,6 +8071,9 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     // Preview controls and screenshot
     "sw_SlicerGetPreviewState", "sw_SlicerSetPreview", "sw_SlicerSetLayerRange", "sw_SlicerSetMove",
     "sw_SlicerSetCamera", "sw_SlicerScreenshot",
+    // Object management and model export
+    "sw_SlicerCopy", "sw_SlicerPaste", "sw_SlicerSetVisible", "sw_SlicerSetInstanceCount",
+    "sw_SlicerInstanceToObject", "sw_SlicerMoveToPlate", "sw_SlicerExportStl", "sw_SlicerExport3mf",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.
