@@ -752,6 +752,21 @@ private:
     void sw_SlicerGetPlateSettings();
     void sw_SlicerSetPlateSettings();
 
+    // Parts, object actions and plates.
+    void sw_SlicerAddVolume();
+    void sw_SlicerChangeVolumeType();
+    void sw_SlicerRename();
+    void sw_SlicerClone();
+    void sw_SlicerMirror();
+    void sw_SlicerDrop();
+    void sw_SlicerCenter();
+    void sw_SlicerSetPrintable();
+    void sw_SlicerScaleToFit();
+    void sw_SlicerListPlates();
+    void sw_SlicerSelectPlate();
+    void sw_SlicerDuplicatePlate();
+    void sw_SlicerSetPlate();
+
     // Printer connection: list, connect through the app's device page, disconnect.
     void sw_SlicerListPrinters();
     void sw_SlicerConnectPrinter();

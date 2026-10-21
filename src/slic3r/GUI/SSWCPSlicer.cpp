@@ -31,6 +31,7 @@
 #include "slic3r/Utils/PrintHost.hpp"
 #include "slic3r/Utils/ASCIIFolding.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/CutUtils.hpp"
@@ -105,7 +106,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 8;
+        m_res_data["phase"]    = 9;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -494,6 +495,17 @@ static void sw_slicer_require_view3D()
         throw std::runtime_error("no active plater");
     if (!plater->is_view3D_shown())
         throw std::runtime_error("undo/redo is only possible in the 3D view (open the 3D view first)");
+}
+
+// Object actions that go through the current canvas (Plater::canvas3D(), for example when creating
+// primitives or pasting clones) need the 3D view to be shown.
+static void sw_slicer_require_3d_view()
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater == nullptr)
+        throw std::runtime_error("no active plater");
+    if (!plater->is_view3D_shown())
+        throw std::runtime_error("switch to the 3D view first (sw_SlicerShowView)");
 }
 
 // The current selection as JSON: {empty, object, instance, volumes:[model volume idx...],
@@ -6145,6 +6157,967 @@ void SSWCP_SliceProject_Instance::sw_SlicerDisconnectPrinter()
                 self->finish_job();
             });
         });
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Parts, object actions and plates ---------------------------------------------------
+// The actions of the right-click menus of the object list and the 3D view. Where the app has a
+// function without a dialog, the handler calls it inside one "API: ..." snapshot; where the menu opens
+// a choice or input dialog (change part type, rename, clone), the handler does the work after that
+// dialog itself, with the same app calls.
+
+// Changing the model while a project is being loaded is refused (the loading progress dialog lets
+// other requests through).
+static void sw_slicer_require_not_loading()
+{
+    if (wxGetApp().plater()->is_loading_project())
+        throw std::runtime_error("not possible while a project is being loaded");
+}
+
+// Volume type of the API ("part", "negative", ...); the reverse of sw_slicer_volume_type().
+static ModelVolumeType sw_slicer_parse_volume_type(const std::string& type)
+{
+    if (type == "part")             return ModelVolumeType::MODEL_PART;
+    if (type == "negative")         return ModelVolumeType::NEGATIVE_VOLUME;
+    if (type == "modifier")         return ModelVolumeType::PARAMETER_MODIFIER;
+    if (type == "support_blocker")  return ModelVolumeType::SUPPORT_BLOCKER;
+    if (type == "support_enforcer") return ModelVolumeType::SUPPORT_ENFORCER;
+    throw std::runtime_error("unknown type '" + type + "' (expected part|negative|modifier|support_blocker|support_enforcer)");
+}
+
+// Primitive of the API -> the shape name of create_mesh() in GUI_ObjectList.cpp.
+static const char* sw_slicer_primitive_shape(const std::string& primitive)
+{
+    static const std::pair<const char*, const char*> shapes[] = {
+        {"cube", "Cube"}, {"cylinder", "Cylinder"}, {"sphere", "Sphere"}, {"slab", "Slab"},
+        {"cone", "Cone"}, {"disc", "Disc"},         {"torus", "Torus"},
+    };
+    for (const auto& s : shapes)
+        if (primitive == s.first)
+            return s.second;
+    throw std::runtime_error("unknown primitive '" + primitive + "' (expected cube|cylinder|sphere|slab|cone|disc|torus)");
+}
+
+// Required string parameter that names an object or part: trimmed, not empty, no characters that
+// the app refuses in names (same check as ObjectList::rename_item), no line breaks.
+static std::string sw_slicer_get_name(const json& params, const char* key)
+{
+    const std::string k = key;
+    if (!sw_slicer_has_param(params, key) || !params.at(key).is_string())
+        throw std::runtime_error("'" + k + "' must be a non-empty string");
+    std::string  name = params.at(key).get<std::string>();
+    const char*  ws   = " \t\r\n\f\v";
+    const size_t b    = name.find_first_not_of(ws);
+    name              = (b == std::string::npos) ? std::string() : name.substr(b, name.find_last_not_of(ws) - b + 1);
+    if (name.empty())
+        throw std::runtime_error("'" + k + "' must be a non-empty string");
+    if (Plater::has_illegal_filename_characters(name))
+        throw std::runtime_error("the name contains characters that are not allowed: <>:/\\|?*\"");
+    for (const unsigned char c : name)
+        if (c < 0x20 || c == 0x7f)
+            throw std::runtime_error("the name must not contain line breaks or control characters");
+    if (wxString::FromUTF8(name).empty())
+        throw std::runtime_error("'" + k + "' is not valid UTF-8");
+    return name;
+}
+
+// Show the model name of an object (vol < 0) or part in the object list. Returns false if the list
+// has no item for it (a single-part object has no part item).
+static bool sw_slicer_refresh_list_name(int obj, int vol)
+{
+    ObjectDataViewModel* list_model = wxGetApp().obj_list()->GetModel();
+    const ModelObject*   mo         = wxGetApp().plater()->model().objects[obj];
+    if (list_model == nullptr)
+        return false;
+    wxDataViewItem item = list_model->GetObjectItem(mo);
+    if (vol >= 0 && item.IsOk())
+        item = list_model->GetVolumeItem(item, vol);
+    if (!item.IsOk())
+        return false;
+    list_model->SetName(from_u8(vol >= 0 ? mo->volumes[vol]->name : mo->name), item);
+    return true;
+}
+
+// Required 'object' parameter (no fallback to the selection).
+static int sw_slicer_required_object(const json& params)
+{
+    if (!sw_slicer_has_param(params, "object"))
+        throw std::runtime_error("specify 'object' (0-based)");
+    sw_slicer_get_index(params, "object"); // type check
+    return sw_slicer_resolve_object(params);
+}
+
+// Optional index parameter of object obj ('instance' or 'volume'); def if missing.
+static int sw_slicer_optional_sub_index(const json& params, const char* key, int obj, int def)
+{
+    if (!sw_slicer_has_param(params, key))
+        return def;
+    const int idx = sw_slicer_get_index(params, key);
+    if (std::string(key) == "instance")
+        sw_slicer_check_indices(obj, idx, -1);
+    else
+        sw_slicer_check_indices(obj, -1, idx);
+    return idx;
+}
+
+// The plate an instance belongs to (-1 if it is on no plate).
+static int sw_slicer_instance_plate(int obj, int inst)
+{
+    PartPlateList& plates = wxGetApp().plater()->get_partplate_list();
+    const int      plate  = plates.find_instance_belongs(obj, inst);
+    return (plate >= 0) ? plate : plates.find_instance(obj, inst);
+}
+
+// Add a primitive: as a part, negative part, modifier or support blocker/enforcer of an object
+// (ObjectList::load_generic_subobject, like "Add part/modifier/... > Cube"), or without 'object' as
+// a new object (ObjectList::load_shape_object, like "Add primitive"). The primitive gets the app's
+// default size. One undo step "API: Add part" / "API: Add primitive".
+void SSWCP_SliceProject_Instance::sw_SlicerAddVolume()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_3d_view();
+        if (!sw_slicer_has_param(m_param_data, "primitive") || !m_param_data.at("primitive").is_string())
+            throw std::runtime_error("specify 'primitive' (cube|cylinder|sphere|slab|cone|disc|torus)");
+        const std::string primitive = m_param_data.at("primitive").get<std::string>();
+        const std::string shape     = sw_slicer_primitive_shape(primitive);
+        const bool        has_type  = sw_slicer_has_param(m_param_data, "type");
+        if (has_type && !m_param_data.at("type").is_string())
+            throw std::runtime_error("'type' must be a string (part|negative|modifier|support_blocker|support_enforcer)");
+        const std::string     type_name = has_type ? m_param_data.at("type").get<std::string>() : std::string("part");
+        const ModelVolumeType type      = sw_slicer_parse_volume_type(type_name);
+        const bool            has_name  = sw_slicer_has_param(m_param_data, "name");
+        const std::string     name      = has_name ? sw_slicer_get_name(m_param_data, "name") : std::string();
+        Model&                   model  = plater->model();
+        GLCanvas3D*              canvas = sw_slicer_canvas();
+        ObjectList*              list   = wxGetApp().obj_list();
+        std::vector<std::string> notes;
+
+        if (!sw_slicer_has_param(m_param_data, "object")) {
+            // A primitive as a new object.
+            if (type != ModelVolumeType::MODEL_PART)
+                throw std::runtime_error("specify 'object' to add a " + type_name);
+            if (primitive == "slab")
+                throw std::runtime_error("a slab can only be added to an object");
+            const size_t n_before = model.objects.size();
+            {
+                sswcp_api::Scope     api_scope;
+                Plater::TakeSnapshot snapshot(plater, "API: Add primitive");
+                // load_shape_object() adds nothing while something is selected. Cleared after the
+                // snapshot, so undo restores the user's selection.
+                canvas->get_selection().clear();
+                list->update_selections();
+                canvas->update_gizmos_on_off_state();
+                canvas->set_as_dirty();
+                // The app's own snapshot "Add Primitive" is suppressed.
+                list->load_shape_object(shape);
+                if (has_name && model.objects.size() == n_before + 1) {
+                    // Like ObjectList::update_name_in_model(): a single-part object names its part too.
+                    ModelObject* mo = model.objects.back();
+                    mo->name        = name;
+                    if (mo->volumes.size() == 1)
+                        mo->volumes.front()->name = name;
+                    sw_slicer_refresh_list_name(static_cast<int>(n_before), -1);
+                }
+                notes = sswcp_api::notes();
+            }
+            if (model.objects.size() != n_before + 1)
+                throw std::runtime_error(sw_slicer_join_notes("the primitive could not be added", notes));
+            const int obj = static_cast<int>(n_before);
+            m_res_data["object"] = obj;
+            m_res_data["name"]   = model.objects[obj]->name;
+            m_res_data["type"]   = "part";
+            m_res_data["notes"]  = notes;
+            send_to_js();
+            finish_job();
+            return;
+        }
+
+        // A primitive as a part of an object.
+        if (!has_type)
+            throw std::runtime_error("specify 'type' (part|negative|modifier|support_blocker|support_enforcer)");
+        const int    obj = sw_slicer_required_object(m_param_data);
+        ModelObject* mo  = model.objects[obj];
+        // Stricter than the context menu of this fork, which offers these on cut objects too: a new
+        // solid or negative part changes the geometry of one half of the cut without the other.
+        if (mo->is_cut() && (type == ModelVolumeType::MODEL_PART || type == ModelVolumeType::NEGATIVE_VOLUME))
+            throw std::runtime_error("parts cannot be added to a cut object");
+        // load_generic_subobject() reads the object from the object list and the instance from the
+        // canvas selection.
+        sw_slicer_select(obj, 0, -1);
+        if (list->get_selected_obj_idx() != obj || canvas->get_selection().get_object_idx() != obj)
+            throw std::runtime_error("could not select object " + std::to_string(obj));
+        std::set<size_t>             ids_before;
+        std::set<const ModelVolume*> ptrs_before;
+        for (const ModelVolume* mv : mo->volumes) {
+            ids_before.insert(mv->id().id);
+            ptrs_before.insert(mv);
+        }
+        ModelVolume* added = nullptr;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Add part");
+            // The app's own snapshot "Add primitive" is suppressed, and in API mode the
+            // "Add Modifier" tip is not shown.
+            list->load_generic_subobject(shape, type);
+            for (ModelVolume* mv : mo->volumes)
+                if (ids_before.count(mv->id().id) == 0 && ptrs_before.count(mv) == 0) {
+                    added = mv;
+                    break;
+                }
+            if (added != nullptr && has_name)
+                added->name = name;
+            notes = sswcp_api::notes();
+        }
+        if (added == nullptr)
+            throw std::runtime_error(sw_slicer_join_notes("the part could not be added", notes));
+        // The index after the app has reordered the volumes (reorder_volumes_and_get_selection).
+        int vol = -1;
+        for (size_t v = 0; v < mo->volumes.size(); ++v)
+            if (mo->volumes[v] == added)
+                vol = static_cast<int>(v);
+        if (has_name)
+            sw_slicer_refresh_list_name(obj, vol);
+        m_res_data["object"] = obj;
+        m_res_data["volume"] = vol;
+        m_res_data["name"]   = added->name;
+        m_res_data["type"]   = sw_slicer_volume_type(added->type());
+        m_res_data["notes"]  = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Change the type of a part, the work of ObjectList::change_part_type() after its choice dialog. The
+// app reorders the volumes afterwards: the reply holds the new index. One undo step
+// "API: Change part type"; the same type takes no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerChangeVolumeType()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        const SwSlicerModelTarget t = sw_slicer_model_target(m_param_data);
+        if (t.vol < 0)
+            throw std::runtime_error("specify 'volume' (0-based)");
+        if (!sw_slicer_has_param(m_param_data, "type") || !m_param_data.at("type").is_string())
+            throw std::runtime_error("specify 'type' (part|negative|modifier|support_blocker|support_enforcer)");
+        const ModelVolumeType new_type = sw_slicer_parse_volume_type(m_param_data.at("type").get<std::string>());
+        ModelVolume*          mv       = t.mv;
+        const ModelVolumeType old_type = mv->type();
+
+        std::vector<std::string> notes;
+        auto reply = [&](int vol) {
+            m_res_data["object"] = t.obj;
+            m_res_data["volume"] = vol;
+            m_res_data["type"]   = sw_slicer_volume_type(mv->type());
+            m_res_data["notes"]  = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (new_type == old_type) {
+            notes.push_back("type unchanged; nothing changed");
+            reply(t.vol);
+            return;
+        }
+        // The checks of change_part_type() (it shows an error dialog for the first one, and does not
+        // offer the support types for text and SVG parts).
+        if (old_type == ModelVolumeType::MODEL_PART && sw_slicer_count_model_parts(t.mo) == 1)
+            throw std::runtime_error("the type of the last solid part cannot be changed");
+        if ((mv->is_text() || mv->is_svg()) &&
+            (new_type == ModelVolumeType::SUPPORT_BLOCKER || new_type == ModelVolumeType::SUPPORT_ENFORCER))
+            throw std::runtime_error("a text or SVG part can only be a part, negative volume or modifier");
+        // The object list does not show cut connectors as parts, so the GUI cannot change their type.
+        if (mv->is_cut_connector())
+            throw std::runtime_error("the type of a cut connector cannot be changed");
+        // Same rule as sw_SlicerAddVolume: no new solid or negative geometry on one half of a cut.
+        auto is_geometry = [](ModelVolumeType ty) {
+            return ty == ModelVolumeType::MODEL_PART || ty == ModelVolumeType::NEGATIVE_VOLUME;
+        };
+        if (t.mo->is_cut() && is_geometry(new_type) && !is_geometry(old_type))
+            throw std::runtime_error("a cut object cannot get a new part or negative part");
+
+        sw_slicer_select(t.obj, -1, t.vol);
+        ObjectList* list = wxGetApp().obj_list();
+        list->select_item(ObjectVolumeID{t.mo, mv});
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Change part type");
+            mv->set_type(new_type);
+            // Reorders the volumes, rebuilds the object's items in the list and schedules the
+            // reslice (ObjectList::changed_object), like change_part_type().
+            wxDataViewItemArray sel = list->reorder_volumes_and_get_selection(t.obj, [mv](const ModelVolume* v) { return v == mv; });
+            if (!sel.IsEmpty())
+                list->select_item(sel.front());
+            else
+                plater->changed_object(t.obj);
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        int vol = -1;
+        for (size_t v = 0; v < t.mo->volumes.size(); ++v)
+            if (t.mo->volumes[v] == mv)
+                vol = static_cast<int>(v);
+        if (vol != t.vol)
+            notes.push_back("the part is now volume " + std::to_string(vol) + " (the app reorders parts by type)");
+        sw_slicer_canvas()->set_as_dirty();
+        reply(vol);
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Rename an object or part, the work of ObjectList::rename_item() after its input dialog (the model
+// part as in ObjectList::update_name_in_model()). One undo step "API: Rename"; the same name takes no
+// snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerRename()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        const SwSlicerModelTarget t        = sw_slicer_model_target(m_param_data);
+        const bool                is_part  = t.vol >= 0;
+        const std::string         name     = sw_slicer_get_name(m_param_data, "name");
+        const std::string         old_name = is_part ? t.mv->name : t.mo->name;
+
+        std::vector<std::string> notes;
+        auto reply = [&]() {
+            m_res_data["object"] = t.obj;
+            if (is_part)
+                m_res_data["volume"] = t.vol;
+            m_res_data["name"]     = is_part ? t.mv->name : t.mo->name;
+            m_res_data["old_name"] = old_name;
+            m_res_data["notes"]    = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (name == old_name) {
+            notes.push_back("name unchanged; nothing changed");
+            reply();
+            return;
+        }
+        sw_slicer_select(t.obj, -1, t.vol);
+        wxGetApp().obj_list()->select_item(ObjectVolumeID{t.mo, is_part ? t.mv : nullptr});
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Rename");
+            if (is_part) {
+                t.mv->name = name;
+            } else {
+                t.mo->name = name;
+                // Like update_name_in_model(): a single-part object names its part too.
+                if (t.mo->volumes.size() == 1)
+                    t.mo->volumes.front()->name = name;
+                Slic3r::save_object_mesh(*t.mo);
+            }
+            if (!sw_slicer_refresh_list_name(t.obj, t.vol))
+                notes.push_back("the part is not shown separately in the object list");
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        sw_slicer_canvas()->set_as_dirty();
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Clone one instance of an object (default 0) 'count' times, like the clone dialog (Selection::clone(): copy to the app's internal
+// clipboard, then paste 'count' times), without its progress bar and without arranging (that is a
+// separate step, sw_SlicerArrange). One undo step "API: Clone".
+void SSWCP_SliceProject_Instance::sw_SlicerClone()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_3d_view();
+        const int   obj = sw_slicer_required_object(m_param_data);
+        const json* jc  = sw_slicer_has_param(m_param_data, "count") ? &m_param_data.at("count") : nullptr;
+        // Same limit as the spin control of the clone dialog (CloneDialog.cpp).
+        if (jc == nullptr || !jc->is_number_integer() || jc->get<long long>() < 1 || jc->get<long long>() > 1000)
+            throw std::runtime_error("count must be between 1 and 1000");
+        const int count = jc->get<int>();
+        // One instance (default 0) is cloned: paste_objects_from_clipboard() puts every instance of a
+        // copy at the same position, so cloning all instances would stack them.
+        const int inst = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+
+        sw_slicer_select(obj, inst, -1);
+        GLCanvas3D* canvas = sw_slicer_canvas();
+        Selection&  sel    = canvas->get_selection();
+        if (sel.is_empty() || sel.get_mode() != Selection::Instance || sel.get_object_idx() != obj ||
+            sel.get_instance_idx() != inst)
+            throw std::runtime_error("could not select instance " + std::to_string(inst) + " of object " + std::to_string(obj));
+        Model&                   model    = plater->model();
+        const size_t             n_before = model.objects.size();
+        const size_t             n_inst   = model.objects[obj]->instances.size();
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Clone");
+            // The app's own snapshot "Selection-clone" is suppressed.
+            sel.clone(count);
+            notes = sswcp_api::notes();
+        }
+        const size_t n_after = model.objects.size();
+        if (n_after <= n_before)
+            throw std::runtime_error(sw_slicer_join_notes("cloning produced nothing", notes));
+        json added = json::array();
+        for (size_t i = n_before; i < n_after; ++i)
+            added.push_back(static_cast<int>(i));
+        // Selection::copy_to_clipboard() fills the selection's own clipboard (a Model), not the
+        // clipboard of the operating system.
+        notes.push_back("the app's internal copy/paste clipboard now holds this object");
+        if (n_inst > 1)
+            notes.push_back("the object has " + std::to_string(n_inst) + " instances; only instance " + std::to_string(inst) +
+                            " was cloned (each clone has one instance)");
+        m_res_data["instance"]      = inst;
+        m_res_data["objects_added"] = added;
+        m_res_data["objects"]       = sw_slicer_objects_json();
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Mirror an instance (default 0) or, with 'volume', a part along x, y or z, like the "Mirror" menu
+// (GLCanvas3D::mirror_selection). Mirroring always changes something. One undo step "API: Mirror".
+void SSWCP_SliceProject_Instance::sw_SlicerMirror()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_3d_view();
+        const std::string a = (sw_slicer_has_param(m_param_data, "axis") && m_param_data.at("axis").is_string()) ?
+                                  m_param_data.at("axis").get<std::string>() : std::string();
+        if (a != "x" && a != "y" && a != "z")
+            throw std::runtime_error("axis must be 'x', 'y' or 'z'");
+        const Axis axis = (a == "x") ? X : (a == "y") ? Y : Z;
+        const int  obj  = sw_slicer_required_object(m_param_data);
+        const int  inst = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+        const int  vol  = sw_slicer_optional_sub_index(m_param_data, "volume", obj, -1);
+        sw_slicer_select(obj, inst, vol);
+        std::vector<std::string> notes;
+        // Same condition as the menu item (no cut objects, a single instance).
+        if (!plater->can_mirror())
+            throw std::runtime_error("this cannot be mirrored (cut objects cannot be mirrored)");
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Mirror");
+            // The app's own snapshot "Mirror Object" is suppressed.
+            sw_slicer_canvas()->mirror_selection(axis);
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        const ModelObject* mo = plater->model().objects[obj];
+        m_res_data["object"]   = obj;
+        m_res_data["instance"] = inst;
+        if (vol >= 0)
+            m_res_data["volume"] = vol;
+        m_res_data["mirror"] = sw_slicer_vec3(vol >= 0 ? mo->volumes[vol]->get_mirror() : mo->instances[inst]->get_mirror());
+        m_res_data["notes"]  = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Drop an instance (default 0) onto the bed, like the "Drop" menu (Plater::drop_selection). The menu
+// item is disabled when the selection already touches the bed; then no snapshot is taken.
+// One undo step "API: Drop".
+void SSWCP_SliceProject_Instance::sw_SlicerDrop()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_3d_view();
+        const int obj  = sw_slicer_required_object(m_param_data);
+        const int inst = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+        sw_slicer_select(obj, inst, -1);
+        // Selection::drop() moves by the min z of the selection's bounding box (all volumes of the
+        // instance): the no-op check uses the same value.
+        const double             min_z = sw_slicer_canvas()->get_selection().get_bounding_box().min.z();
+        std::vector<std::string> notes;
+        if (std::abs(min_z) <= 1e-4) {
+            notes.push_back("already on the bed; nothing changed");
+        } else {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Drop");
+            // The app's own snapshot "Move Object" is suppressed.
+            plater->drop_selection();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        m_res_data["object"]   = obj;
+        m_res_data["instance"] = inst;
+        m_res_data["position"] = sw_slicer_vec3(plater->model().objects[obj]->instances[inst]->get_offset());
+        m_res_data["notes"]    = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Center an instance (default 0) on its plate in x/y, like the "Center" menu. The menu centers on the
+// current plate (Plater::center_selection); the API centers on the plate the instance is on
+// (GLCanvas3D::do_center_plate, the same move), so an object never jumps to another plate. An
+// instance on no plate is centered on the current plate. One undo step "API: Center".
+void SSWCP_SliceProject_Instance::sw_SlicerCenter()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_3d_view();
+        const int obj  = sw_slicer_required_object(m_param_data);
+        const int inst = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+        sw_slicer_select(obj, inst, -1);
+        PartPlateList& plates = plater->get_partplate_list();
+        int            plate  = sw_slicer_instance_plate(obj, inst);
+        if (plate < 0)
+            plate = plates.get_curr_plate_index();
+        // Same values as Selection::center_plate().
+        GLCanvas3D*              canvas = sw_slicer_canvas();
+        const Vec3d              src    = canvas->get_selection().get_bounding_box().center();
+        const Vec3d              tar    = plates.get_plate(plate)->get_center_origin();
+        std::vector<std::string> notes;
+        if (std::abs(tar.x() - src.x()) <= 1e-3 && std::abs(tar.y() - src.y()) <= 1e-3) {
+            notes.push_back("already centered on the plate; nothing changed");
+        } else {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Center");
+            // The app's own snapshot "Move Object" is suppressed.
+            canvas->do_center_plate(plate);
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        m_res_data["object"]   = obj;
+        m_res_data["instance"] = inst;
+        m_res_data["plate"]    = plate;
+        m_res_data["position"] = sw_slicer_vec3(plater->model().objects[obj]->instances[inst]->get_offset());
+        m_res_data["notes"]    = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Make all instances of an object, or one instance, printable or not, the work of
+// ObjectList::toggle_printable_state() (with an explicit state instead of a toggle). Unprintable
+// instances are not sliced. One undo step "API: Set printable"; no change takes no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerSetPrintable()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        const int  obj      = sw_slicer_required_object(m_param_data);
+        const bool has_inst = sw_slicer_has_param(m_param_data, "instance");
+        const int  inst     = sw_slicer_optional_sub_index(m_param_data, "instance", obj, -1);
+        if (!m_param_data.count("printable") || !m_param_data.at("printable").is_boolean())
+            throw std::runtime_error("'printable' must be true or false");
+        const bool   printable = m_param_data.at("printable").get<bool>();
+        ModelObject* mo        = plater->model().objects[obj];
+        std::vector<int> targets;
+        if (has_inst)
+            targets.push_back(inst);
+        else
+            for (size_t i = 0; i < mo->instances.size(); ++i)
+                targets.push_back(static_cast<int>(i));
+        bool changes = false;
+        for (int i : targets)
+            changes = changes || mo->instances[i]->printable != printable;
+
+        sw_slicer_select(obj, has_inst ? inst : -1, -1);
+        std::vector<std::string> notes;
+        if (!changes) {
+            notes.push_back("printable state unchanged; nothing changed");
+        } else {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Set printable");
+            ObjectList* list = wxGetApp().obj_list();
+            for (int i : targets) {
+                mo->instances[i]->printable = printable;
+                list->update_printable_state(obj, i);
+            }
+            sw_slicer_canvas()->update_instance_printable_state_for_objects({static_cast<size_t>(obj)});
+            plater->update();
+            plater->reload_paint_after_background_process_apply();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        m_res_data["object"] = obj;
+        if (has_inst)
+            m_res_data["instance"] = inst;
+        m_res_data["printable"] = printable;
+        m_res_data["notes"]     = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Scale an instance (default 0) uniformly to fill the build volume and center it, like "Scale to build
+// volume" (Plater::scale_selection_to_fit_print_volume). One undo step "API: Scale to fit".
+// No-op: for a rectangular bed the handler repeats the app's computation (Selection.cpp,
+// fit_rectangle) beforehand; if the app would change nothing, or only by rounding noise, no snapshot is
+// taken. For a circular bed that check is not done: if nothing changed, an empty undo step remains and
+// the reply says so.
+void SSWCP_SliceProject_Instance::sw_SlicerScaleToFit()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_3d_view();
+        const int obj  = sw_slicer_required_object(m_param_data);
+        const int inst = sw_slicer_optional_sub_index(m_param_data, "instance", obj, 0);
+        sw_slicer_select(obj, inst, -1);
+        // Same condition as the menu item (no cut objects, a rectangular or circular bed).
+#if ENABLE_ENHANCED_PRINT_VOLUME_FIT
+        if (!plater->can_scale_to_print_volume())
+            throw std::runtime_error("this object cannot be scaled to the build volume (not for cut objects or this bed shape)");
+#else
+        // The no-op check below follows the ENABLE_ENHANCED_PRINT_VOLUME_FIT version of the app.
+        throw std::runtime_error("scale to fit is not available in this build");
+#endif
+
+        const Selection&   sel = sw_slicer_canvas()->get_selection();
+        const BuildVolume& bv  = plater->build_volume();
+        bool               noop = false;
+        if (bv.type() == BuildVolume_Type::Rectangle) {
+            const BoundingBoxf3 pv       = bv.bounding_volume();
+            const Vec3d         pv_size  = pv.size();
+            const BoundingBoxf3 bb       = sel.get_bounding_box();
+            const Vec3d         box_size = bb.size() + 0.02 * Vec3d::Ones();
+            const double        sx       = (box_size.x() != 0.0) ? pv_size.x() / box_size.x() : 0.0;
+            const double        sy       = (box_size.y() != 0.0) ? pv_size.y() / box_size.y() : 0.0;
+            const double        sz       = (box_size.z() != 0.0) ? pv_size.z() / box_size.z() : 0.0;
+            if (sx == 0.0 || sy == 0.0 || sz == 0.0) {
+                noop = true; // the app does nothing either
+            } else {
+                const double s      = std::min(sx, std::min(sy, sz));
+                const Vec3d  offset = pv.center() - bb.center();
+                noop = s <= 0.0 || s == 1.0 ||
+                       (std::abs(s - 1.0) <= 1e-6 && std::abs(offset.x()) <= 1e-3 && std::abs(offset.y()) <= 1e-3 &&
+                        std::abs(bb.min.z()) <= 1e-4);
+            }
+        }
+        const ModelInstance*     mi           = plater->model().objects[obj]->instances[inst];
+        const Vec3d              scale_before = mi->get_scaling_factor();
+        const Vec3d              pos_before   = mi->get_offset();
+        const int                plate_before = sw_slicer_instance_plate(obj, inst);
+        std::vector<std::string> notes;
+        if (noop) {
+            notes.push_back("already fits; nothing changed");
+        } else {
+            {
+                sswcp_api::Scope     api_scope;
+                Plater::TakeSnapshot snapshot(plater, "API: Scale to fit");
+                // The app's own snapshot "Scale To Fit" is suppressed.
+                plater->scale_selection_to_fit_print_volume();
+                const std::vector<std::string>& api_notes = sswcp_api::notes();
+                notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+            }
+            if (mi->get_scaling_factor() == scale_before && mi->get_offset() == pos_before)
+                notes.push_back("already fits; nothing changed (an empty undo step was recorded)");
+            const int plate_after = sw_slicer_instance_plate(obj, inst);
+            if (plate_after != plate_before)
+                notes.push_back("the object is now on plate " + std::to_string(plate_after) +
+                                " (the app fits it into the build volume of the first plate)");
+        }
+        const ModelObject* mo = plater->model().objects[obj];
+        m_res_data["object"]   = obj;
+        m_res_data["instance"] = inst;
+        // Same keys and units as sw_SlicerScale.
+        m_res_data["scale_percent"] = sw_slicer_vec3(mo->instances[inst]->get_scaling_factor() * 100.0);
+        m_res_data["size_mm"]       = sw_slicer_vec3(mo->instance_bounding_box(static_cast<size_t>(inst)).size());
+        m_res_data["notes"]    = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// All plates: name, lock, the objects with at least one instance on the plate, and the slice state.
+// Read-only. (PartPlate::get_objects() is not used: it returns all model objects.)
+void SSWCP_SliceProject_Instance::sw_SlicerListPlates()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        PartPlateList& plates = plater->get_partplate_list();
+        const Model&   model  = plater->model();
+        json           list   = json::array();
+        for (int i = 0; i < plates.get_plate_count(); ++i) {
+            PartPlate* p       = plates.get_plate(i);
+            json       objects = json::array();
+            for (size_t o = 0; o < model.objects.size(); ++o)
+                for (size_t j = 0; j < model.objects[o]->instances.size(); ++j)
+                    if (p->contain_instance(static_cast<int>(o), static_cast<int>(j))) {
+                        objects.push_back(static_cast<int>(o));
+                        break;
+                    }
+            json e;
+            e["plate"]   = i;
+            e["name"]    = p->get_plate_name();
+            e["locked"]  = p->is_locked();
+            e["empty"]   = p->empty();
+            e["objects"] = objects;
+            e["sliced"]  = p->is_slice_result_valid();
+            e["ready"]   = p->is_slice_result_ready_for_print();
+            list.push_back(e);
+        }
+        m_res_data["plates"]        = list;
+        m_res_data["current_plate"] = plates.get_curr_plate_index();
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Make a plate the current plate (Slice and the exports work on it), like clicking it. The model does
+// not change: no "API: " step (the app's own snapshot "select partplate!" is skipped by undo).
+void SSWCP_SliceProject_Instance::sw_SlicerSelectPlate()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_get_index(m_param_data, "plate"); // required here
+        const int                n = sw_slicer_resolve_plate(m_param_data);
+        std::vector<std::string> notes;
+        if (plater->get_partplate_list().get_curr_plate_index() == n)
+            notes.push_back("already the current plate");
+        else
+            sw_slicer_select_plate(n);
+        m_res_data["current_plate"] = plater->get_partplate_list().get_curr_plate_index();
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Duplicate a plate (default: the current plate) with copies of its objects, like "Duplicate Current
+// Plate" (Plater::duplicate_plate). The copies are new objects at the end of the model. An empty plate
+// gives an empty copy. One undo step "API: Duplicate plate".
+void SSWCP_SliceProject_Instance::sw_SlicerDuplicatePlate()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        const int n = sw_slicer_resolve_plate(m_param_data);
+        // Checked first: PartPlateList::duplicate_plate() does not handle a failed create_plate().
+        if (!plater->can_add_plate())
+            throw std::runtime_error("cannot add a plate (maximum reached)");
+        PartPlateList& plates = plater->get_partplate_list();
+        PartPlate*     src    = plates.get_plate(n);
+        Model&         model  = plater->model();
+        // PartPlateList::duplicate_plate() copies an object once per instance on the plate, each copy
+        // with all instances: an object with several instances would end up on the new plate several
+        // times (and instances on other plates would be copied too). Refused instead.
+        std::string multi;
+        for (size_t o = 0; o < model.objects.size(); ++o) {
+            const ModelObject* mo = model.objects[o];
+            if (mo->instances.size() < 2)
+                continue;
+            for (size_t j = 0; j < mo->instances.size(); ++j)
+                if (src->contain_instance(static_cast<int>(o), static_cast<int>(j))) {
+                    multi += (multi.empty() ? "" : ", ") + std::to_string(o) + " '" + mo->name + "'";
+                    break;
+                }
+        }
+        if (!multi.empty())
+            throw std::runtime_error("plate " + std::to_string(n) + " holds objects with more than one instance (" + multi +
+                                     "); the app cannot duplicate such a plate correctly");
+        const bool               was_empty = src->empty();
+        const size_t             n_before  = model.objects.size();
+        int                      idx       = -1;
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Duplicate plate");
+            idx   = plater->duplicate_plate(n);
+            notes = sswcp_api::notes();
+        }
+        if (idx < 0)
+            throw std::runtime_error(sw_slicer_join_notes("the plate could not be duplicated", notes));
+        json added = json::array();
+        for (size_t i = n_before; i < model.objects.size(); ++i)
+            added.push_back(static_cast<int>(i));
+        if (was_empty)
+            notes.push_back("plate " + std::to_string(n) + " was empty; the new plate is empty too");
+        sw_slicer_canvas()->set_as_dirty();
+        m_res_data["plate"]         = idx;
+        m_res_data["plate_count"]   = plates.get_plate_count();
+        m_res_data["objects_added"] = added;
+        m_res_data["objects"]       = sw_slicer_objects_json();
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Name and/or lock a plate (default: the current plate), like the plate name dialog and the lock icon
+// on the bed, without selecting the plate. An empty name removes the name. One undo step
+// "API: Plate settings" (the undo stack stores the plate's name and lock state, PartPlate::save/load);
+// no change takes no snapshot.
+void SSWCP_SliceProject_Instance::sw_SlicerSetPlate()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_loading();
+        const int      n          = sw_slicer_resolve_plate(m_param_data);
+        PartPlateList& plates     = plater->get_partplate_list();
+        PartPlate*     pp         = plates.get_plate(n);
+        const bool     has_name   = sw_slicer_has_param(m_param_data, "name");
+        const bool     has_locked = sw_slicer_has_param(m_param_data, "locked");
+        if (!has_name && !has_locked)
+            throw std::runtime_error("specify 'name' and/or 'locked'");
+        std::string name;
+        if (has_name) {
+            if (!m_param_data.at("name").is_string())
+                throw std::runtime_error("'name' must be a string");
+            name = m_param_data.at("name").get<std::string>();
+            for (const unsigned char c : name)
+                if (c < 0x20 || c == 0x7f)
+                    throw std::runtime_error("the plate name must not contain line breaks or control characters");
+            const wxString wname = wxString::FromUTF8(name);
+            if (!name.empty() && wname.empty())
+                throw std::runtime_error("'name' is not valid UTF-8");
+            // Same limit as the plate name dialog (PlateNameEditDialog, SetMaxLength(250)).
+            if (wname.length() > 250)
+                throw std::runtime_error("the plate name may be at most 250 characters");
+        }
+        if (has_locked && !m_param_data.at("locked").is_boolean())
+            throw std::runtime_error("'locked' must be true or false");
+        const bool locked      = has_locked && m_param_data.at("locked").get<bool>();
+        const bool change_name = has_name && pp->get_plate_name() != name;
+        const bool change_lock = has_locked && pp->is_locked() != locked;
+
+        std::vector<std::string> notes;
+        auto reply = [&]() {
+            m_res_data["plate"]  = n;
+            m_res_data["name"]   = pp->get_plate_name();
+            m_res_data["locked"] = pp->is_locked();
+            m_res_data["notes"]  = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (!change_name && !change_lock) {
+            notes.push_back("plate settings unchanged; nothing changed");
+            reply();
+            return;
+        }
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Plate settings");
+            if (change_name) {
+                // Also regenerates the name texture on the bed and passes the name to the plate's print.
+                pp->set_plate_name(name);
+                // The plate item of the object list ("Plate n (name)"), like update_name_in_model().
+                if (ObjectDataViewModel* list_model = wxGetApp().obj_list()->GetModel()) {
+                    list_model->SetCurSelectedPlateFullName(n, name);
+                    const wxDataViewItem item = list_model->GetItemByPlateId(n);
+                    if (item.IsOk())
+                        list_model->ItemChanged(item);
+                }
+            }
+            if (change_lock && plates.lock_plate(n, locked) != 0)
+                throw std::runtime_error("plate " + std::to_string(n) + " could not be locked or unlocked");
+            plater->set_plater_dirty(true);
+            plater->update();
+            const std::vector<std::string>& api_notes = sswcp_api::notes();
+            notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+        }
+        sw_slicer_canvas()->set_as_dirty();
+        reply();
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
     }

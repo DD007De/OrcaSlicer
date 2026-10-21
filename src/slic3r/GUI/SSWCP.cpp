@@ -4689,6 +4689,32 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerGetPlateSettings();
     } else if (m_cmd == "sw_SlicerSetPlateSettings") {
         sw_SlicerSetPlateSettings();
+    } else if (m_cmd == "sw_SlicerAddVolume") {
+        sw_SlicerAddVolume();
+    } else if (m_cmd == "sw_SlicerChangeVolumeType") {
+        sw_SlicerChangeVolumeType();
+    } else if (m_cmd == "sw_SlicerRename") {
+        sw_SlicerRename();
+    } else if (m_cmd == "sw_SlicerClone") {
+        sw_SlicerClone();
+    } else if (m_cmd == "sw_SlicerMirror") {
+        sw_SlicerMirror();
+    } else if (m_cmd == "sw_SlicerDrop") {
+        sw_SlicerDrop();
+    } else if (m_cmd == "sw_SlicerCenter") {
+        sw_SlicerCenter();
+    } else if (m_cmd == "sw_SlicerSetPrintable") {
+        sw_SlicerSetPrintable();
+    } else if (m_cmd == "sw_SlicerScaleToFit") {
+        sw_SlicerScaleToFit();
+    } else if (m_cmd == "sw_SlicerListPlates") {
+        sw_SlicerListPlates();
+    } else if (m_cmd == "sw_SlicerSelectPlate") {
+        sw_SlicerSelectPlate();
+    } else if (m_cmd == "sw_SlicerDuplicatePlate") {
+        sw_SlicerDuplicatePlate();
+    } else if (m_cmd == "sw_SlicerSetPlate") {
+        sw_SlicerSetPlate();
     } else if (m_cmd == "sw_SlicerListPrinters") {
         sw_SlicerListPrinters();
     } else if (m_cmd == "sw_SlicerConnectPrinter") {
@@ -8008,6 +8034,11 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_SlicerGetObjectConfig", "sw_SlicerSetObjectConfig", "sw_SlicerSetFilament",
     "sw_SlicerListPresets", "sw_SlicerSelectPreset", "sw_SlicerSetFilamentCount",
     "sw_SlicerGetPlateSettings", "sw_SlicerSetPlateSettings",
+    // Parts, object actions and plates
+    "sw_SlicerAddVolume", "sw_SlicerChangeVolumeType", "sw_SlicerRename",
+    "sw_SlicerClone", "sw_SlicerMirror", "sw_SlicerDrop", "sw_SlicerCenter",
+    "sw_SlicerSetPrintable", "sw_SlicerScaleToFit",
+    "sw_SlicerListPlates", "sw_SlicerSelectPlate", "sw_SlicerDuplicatePlate", "sw_SlicerSetPlate",
     "sw_SlicerListPrinters", "sw_SlicerConnectPrinter", "sw_SlicerDisconnectPrinter",
 };
 

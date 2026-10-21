@@ -2486,8 +2486,8 @@ void ObjectList::load_generic_subobject(const std::string& type_name, const Mode
     //BBS Switch to Objects List after add a modifier
     wxGetApp().params_panel()->switch_to_object(true);
 
-    //Show Dialog
-    if (wxGetApp().app_config->get("do_not_show_modifer_tips").empty()) {
+    // Show Dialog (not in API mode: the tip is purely informational).
+    if (!sswcp_api::active() && wxGetApp().app_config->get("do_not_show_modifer_tips").empty()) {
         TipsDialog dlg(wxGetApp().mainframe, _L("Add Modifier"), _L("Switch to per-object setting mode to edit modifier settings."), "do_not_show_modifer_tips");
         dlg.ShowModal();
     }
