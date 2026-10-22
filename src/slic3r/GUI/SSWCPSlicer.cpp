@@ -20,9 +20,11 @@
 #include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoEmboss.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoMeasure.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoSVG.hpp"
 #include "slic3r/GUI/SurfaceDrag.hpp"
 #include "slic3r/GUI/Jobs/Job.hpp"
 #include "slic3r/GUI/Jobs/Worker.hpp"
+#include "slic3r/GUI/Jobs/EmbossJob.hpp"
 #include "slic3r/GUI/SSWCPApiMode.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/I18N.hpp"
@@ -32,10 +34,12 @@
 #include "slic3r/Utils/WxFontUtils.hpp"
 #include "slic3r/Utils/PrintHost.hpp"
 #include "slic3r/Utils/ASCIIFolding.hpp"
+#include "slic3r/Utils/FixModelByWin10.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/CutUtils.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
@@ -51,11 +55,13 @@
 #include "libslic3r/QuadricEdgeCollapse.hpp"
 #include "libslic3r/TextConfiguration.hpp"
 #include "libslic3r/EmbossShape.hpp"
+#include "libslic3r/NSVGUtils.hpp"
 #include "libslic3r/ParameterUtils.hpp"
 #include "slic3r/GUI/ParamsPanel.hpp"
 #include "slic3r/GUI/ObjectDataViewModel.hpp"
 #include "slic3r/GUI/HttpServer.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -79,6 +85,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/nowide/convert.hpp>
 #include <boost/log/trivial.hpp>
 #include <wx/font.h>
 #include <wx/fontenum.h>
@@ -115,7 +122,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 14;
+        m_res_data["phase"]    = 15;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -5789,6 +5796,23 @@ void SSWCP_SliceProject_Instance::sw_SlicerGetObjectConfig()
     }
 }
 
+// Schedule the reslice of an object after a config change (never reslice() here). The object is
+// looked up again by its ID: its index may change if the user deletes an object in between.
+static void sw_slicer_schedule_changed_object(const ModelObject* mo)
+{
+    const ObjectID object_id = mo->id();
+    wxGetApp().CallAfter([object_id]() {
+        Plater* p = wxGetApp().plater();
+        if (p == nullptr)
+            return;
+        for (ModelObject* o : p->model().objects)
+            if (o->id() == object_id) {
+                p->changed_object(*o);
+                return;
+            }
+    });
+}
+
 // Set or remove overrides of an object or part, with the key names of sw_SlicerSetConfig. All or
 // nothing: every key and value is validated before anything is written. One undo step
 // "API: Object settings"; a no-op takes no snapshot. The object is resliced afterwards.
@@ -5933,19 +5957,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerSetObjectConfig()
             const std::vector<std::string>& api_notes = sswcp_api::notes();
             notes.insert(notes.end(), api_notes.begin(), api_notes.end());
         }
-        // Schedule the reslice afterwards (never reslice() here). The object is looked up again by
-        // its ID: its index may change if the user deletes an object in between.
-        const ObjectID object_id = t.mo->id();
-        wxGetApp().CallAfter([object_id]() {
-            Plater* p = wxGetApp().plater();
-            if (p == nullptr)
-                return;
-            for (ModelObject* o : p->model().objects)
-                if (o->id() == object_id) {
-                    p->changed_object(*o);
-                    return;
-                }
-        });
+        sw_slicer_schedule_changed_object(t.mo);
         reply();
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
@@ -12578,8 +12590,10 @@ struct SwSlicerMeshJobState
 // finalize clears eptr. On a time-out the job is cancelled and the error is rethrown; the job
 // then keeps running on its own shared_ptr and its result is dropped.
 // The job only owns a copy of the data; the result is applied by the caller on the GUI thread.
-static void sw_slicer_run_mesh_job(Plater* plater, std::shared_ptr<SwSlicerMeshJobState> st,
-                                   std::function<void(SwSlicerMeshJobState&, Job::Ctl&)> work, unsigned budget_ms, const char* what)
+// State: a struct with 'bool done, ok' and 'std::string error' (simplify, repair); Work: a
+// callable void(State&, Job::Ctl&) that captures no model pointers.
+template<class State, class Work>
+static void sw_slicer_run_mesh_job(Plater* plater, std::shared_ptr<State> st, Work work, unsigned budget_ms, const char* what)
 {
     const bool queued = queue_job(
         plater->get_ui_job_worker(),
@@ -12779,6 +12793,1275 @@ void SSWCP_SliceProject_Instance::sw_SlicerSimplify()
         m_res_data["notes"]            = notes;
         send_to_js();
         finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Toolbar extras: height range modifiers ---------------------------------------------------
+// Like "Height range Modifier" in the object list (ObjectList::layers_editing and the layer
+// items). Every range that the API writes has 'layer_height' and 'extruder', like
+// ObjectList::get_default_layer_config: the slicer reads the layer_height of every range without
+// a null check (layer_height_profile_from_ranges) and the object list only shows a range with
+// 'extruder' (ObjectList::add_layer_item). Heights are in mm from the bottom of the object.
+
+// Effective limits of the layer height of a range, like Slicing::min/max_layer_height_from_nozzle
+// (the values of MIN_LAYER_HEIGHT and MIN_LAYER_HEIGHT_DEFAULT are static in Slicing.cpp): a
+// printer minimum of 0 means 0.07 mm, never below 0.01 mm. The raw printer value (as
+// get_min_layer_height in GUI_ObjectList.cpp uses it) would allow 0, and the slicer takes the
+// layer_height of a range literally (generate_object_layers would never finish).
+static double sw_slicer_min_layer_height(int extruder)
+{
+    const DynamicPrintConfig& config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    const double              min_h  = config.opt_float("min_layer_height", std::max(0, extruder - 1));
+    return (min_h == 0.) ? 0.07 : std::max(0.01, min_h);
+}
+
+static double sw_slicer_max_layer_height(int extruder)
+{
+    const DynamicPrintConfig& config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    const int idx = std::max(0, extruder - 1);
+    double max_layer_height = config.opt_float("max_layer_height", idx);
+    // In case max_layer_height is set to zero, it should default to 75 % of nozzle diameter.
+    if (max_layer_height < EPSILON)
+        max_layer_height = 0.75 * config.opt_float("nozzle_diameter", idx);
+    return std::max(sw_slicer_min_layer_height(extruder), max_layer_height);
+}
+
+// A number for messages: up to 4 decimals, without trailing zeros (0.08, 20, 0.075).
+static std::string sw_slicer_fmt_short(double v)
+{
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(4) << v;
+    std::string s = ss.str();
+    while (s.size() > 1 && s.back() == '0')
+        s.pop_back();
+    if (!s.empty() && s.back() == '.')
+        s.pop_back();
+    return s;
+}
+
+// One height range as JSON. 'settings' without layer_height and extruder (own fields);
+// 'complete' is false for a range without layer_height or extruder (not made by the object list
+// or by the API, for example from an older project).
+static json sw_slicer_layer_range_json(int index, const t_layer_height_range& r, const ModelConfig& cfg)
+{
+    json j;
+    j["index"]        = index;
+    j["z_from"]       = r.first;
+    j["z_to"]         = r.second;
+    j["layer_height"] = cfg.has("layer_height") ? json(cfg.option("layer_height")->getFloat()) : json(nullptr);
+    j["filament"]     = cfg.has("extruder") ? cfg.option("extruder")->getInt() : 0;
+    json settings     = json::object();
+    for (const std::string& k : cfg.keys())
+        if (k != "layer_height" && k != "extruder")
+            settings[k] = cfg.opt_serialize(k);
+    j["settings"] = settings;
+    j["complete"] = cfg.has("layer_height") && cfg.has("extruder");
+    return j;
+}
+
+static json sw_slicer_layer_ranges_json(const ModelObject* mo)
+{
+    json out = json::array();
+    int  i   = 0;
+    for (const auto& r : mo->layer_config_ranges)
+        out.push_back(sw_slicer_layer_range_json(i++, r.first, r.second));
+    return out;
+}
+
+// Index of a range in the (sorted) map, -1 if it is not there.
+static int sw_slicer_layer_range_index(const ModelObject* mo, const t_layer_height_range& range)
+{
+    int i = 0;
+    for (const auto& r : mo->layer_config_ranges) {
+        if (r.first == range)
+            return i;
+        ++i;
+    }
+    return -1;
+}
+
+// Height of the object (instance 0): the ranges start at the bottom of the object.
+static double sw_slicer_object_height(const ModelObject* mo)
+{
+    return mo->instances.empty() ? 0.0 : mo->instance_bounding_box(0).size().z();
+}
+
+// Notes about the ranges of an object: a variable layer height profile wins over the
+// layer_height of the ranges (PrintObject::update_layer_height_profile only falls back to
+// layer_height_profile_from_ranges without a valid profile), and incomplete ranges.
+static void sw_slicer_layer_range_notes(const ModelObject* mo, std::vector<std::string>& notes)
+{
+    if (!mo->layer_height_profile.empty())
+        notes.push_back("a variable layer height profile is set on this object; it takes precedence over the layer_height of height ranges");
+    int i = 0;
+    for (const auto& r : mo->layer_config_ranges) {
+        if (!r.second.has("layer_height") || !r.second.has("extruder"))
+            notes.push_back("range " + std::to_string(i) +
+                            " has no layer_height or filament (not made by the object list); edit it to complete it");
+        ++i;
+    }
+}
+
+// Select the object in the canvas and put the object list selection explicitly on the object
+// item, before height ranges change. update_selections() keeps a selected "Height ranges" item
+// of the same object; the height range panel (ObjectLayers) would then keep editing the old
+// ranges (edit_layer_range on a range that no longer exists creates an empty one). select_items
+// also resets ObjectList::m_last_selected_item, which could point to a deleted layer item.
+static void sw_slicer_select_object_item(int obj)
+{
+    sw_slicer_select(obj, -1, -1);
+    ObjectList*          list = wxGetApp().obj_list();
+    ObjectDataViewModel* m    = (list != nullptr) ? list->GetModel() : nullptr;
+    if (m == nullptr)
+        return;
+    const wxDataViewItem obj_item = m->GetItemById(obj);
+    if (!obj_item.IsOk())
+        return;
+    wxDataViewItemArray sels;
+    sels.Add(obj_item);
+    list->select_items(sels);
+}
+
+// Rebuild the height range items of an object in the object list from the model, like
+// ObjectList::edit_layer_range: the layer items are deleted and added again. Without ranges the
+// root item is deleted (ObjectDataViewModel::Delete removes the root together with its last
+// layer item, like deleting the root in the list); a missing root is created with
+// add_layer_root_item. Returns false if the list could not follow the model.
+static bool sw_slicer_refresh_layer_items(int obj)
+{
+    ObjectList*          list = wxGetApp().obj_list();
+    ObjectDataViewModel* m    = (list != nullptr) ? list->GetModel() : nullptr;
+    if (m == nullptr)
+        return false;
+    wxDataViewItem obj_item = m->GetItemById(obj);
+    if (!obj_item.IsOk())
+        return false;
+    const t_layer_config_ranges& ranges = wxGetApp().plater()->model().objects[obj]->layer_config_ranges;
+    wxDataViewItem               root   = m->GetLayerRootItem(obj_item);
+    if (ranges.empty()) {
+        if (root.IsOk())
+            m->Delete(root);
+        return !m->GetLayerRootItem(obj_item).IsOk();
+    }
+    if (!root.IsOk())
+        return list->add_layer_root_item(obj_item).IsOk();
+    m->DeleteChildren(root);
+    for (const auto& r : ranges)
+        list->add_layer_item(r.first, root);
+    list->Expand(root);
+    return true;
+}
+
+// The start config of a range: the values of ObjectList::get_default_layer_config (layer_height of
+// the object, else of the print preset; extruder 0). Not that function itself: it also reads the
+// print preset's 'extruder' (an int option) with opt_float, which is undefined for an object
+// without its own 'extruder' (the value is not used there).
+static DynamicPrintConfig sw_slicer_default_layer_config(const ModelObject* mo)
+{
+    DynamicPrintConfig  config;
+    const ConfigOption* own = mo->config.option("layer_height");
+    const double        lh  = (own != nullptr) ? own->getFloat() :
+                                                 wxGetApp().preset_bundle->prints.get_edited_preset().config.opt_float("layer_height");
+    config.set_key_value("layer_height", new ConfigOptionFloat(lh));
+    config.set_key_value("extruder", new ConfigOptionInt(0));
+    return config;
+}
+
+// Optional number (mm). std::nullopt if missing; throws for an invalid value.
+static std::optional<double> sw_slicer_opt_mm(const json& params, const char* key)
+{
+    if (!sw_slicer_has_param(params, key))
+        return std::nullopt;
+    double v = 0.0;
+    if (!sw_slicer_get_number(params, key, 0.0, v))
+        throw std::runtime_error(std::string("'") + key + "' must be a finite number (mm)");
+    return v;
+}
+
+// Optional filament of a range: integer >= 0 (0 = the object's filament); the upper limit is
+// checked with the range.
+static std::optional<int> sw_slicer_opt_range_filament(const json& params)
+{
+    if (!sw_slicer_has_param(params, "filament"))
+        return std::nullopt;
+    const json& j = params.at("filament");
+    if (!j.is_number_integer() || j.get<long long>() < 0 || j.get<long long>() > 1000)
+        throw std::runtime_error("filament must be an integer between 0 and 1000 (0 = the object's filament)");
+    return j.get<int>();
+}
+
+// Check a range before it is written: 0 <= z_from < z_to, at least the minimal layer height
+// high, starting below the top of the object, no overlap with another range ('ignore' = the
+// range that is being edited), layer_height within the printer limits (like
+// ObjectList::edit_layer_range) and the filament within 0...n (like sw_SlicerSetFilament).
+// 'cfg' has layer_height and extruder. 'check_bounds' false: the bounds do not change (an existing
+// range above the top of a scaled object can still be edited).
+static void sw_slicer_validate_layer_range(const ModelObject* mo, const t_layer_height_range& r, const DynamicPrintConfig& cfg,
+                                           const t_layer_height_range* ignore, bool check_bounds = true)
+{
+    if (!std::isfinite(r.first) || !std::isfinite(r.second) || r.first < 0.0 || r.first >= r.second)
+        throw std::runtime_error("z_from and z_to must satisfy 0 <= z_from < z_to (mm from the bottom of the object)");
+    const int    filament = cfg.option("extruder")->getInt();
+    const int    n        = static_cast<int>(wxGetApp().plater()->get_extruder_colors_from_plater_config().size());
+    if (filament < 0 || filament > n)
+        throw std::runtime_error("filament must be between 0 and " + std::to_string(n) + " (0 = the object's filament)");
+    const double min_h = sw_slicer_min_layer_height(filament);
+    const double max_h = sw_slicer_max_layer_height(filament);
+    if (check_bounds && r.second - r.first < min_h - EPSILON)
+        throw std::runtime_error("a height range must be at least " + sw_slicer_fmt_short(min_h) + " mm high (the minimal layer height)");
+    const double height = sw_slicer_object_height(mo);
+    if (check_bounds && r.first >= height - EPSILON)
+        throw std::runtime_error("z_from must be below the top of the object (" + sw_slicer_fmt_short(height) + " mm)");
+    for (const auto& o : mo->layer_config_ranges) {
+        if (ignore != nullptr && o.first == *ignore)
+            continue;
+        if (r.first < o.first.second - EPSILON && o.first.first < r.second - EPSILON)
+            throw std::runtime_error("the range " + sw_slicer_fmt_short(r.first) + "-" + sw_slicer_fmt_short(r.second) +
+                                     " mm overlaps the range " + sw_slicer_fmt_short(o.first.first) + "-" +
+                                     sw_slicer_fmt_short(o.first.second) + " mm");
+    }
+    const double lh = cfg.option("layer_height")->getFloat();
+    if (!std::isfinite(lh) || lh <= 0.0 || lh < min_h - EPSILON || lh > max_h + EPSILON)
+        throw std::runtime_error("layer_height must be between " + sw_slicer_fmt_short(min_h) + " and " + sw_slicer_fmt_short(max_h) +
+                                 " mm for this printer");
+}
+
+// 'settings' {key: value as text} and 'reset' [keys] of a height range. The keys of a part
+// (sw_slicer_model_keys(true), the settings of a range in the object list besides layer_height),
+// checked like sw_SlicerSetObjectConfig: all or nothing. layer_height and extruder have their
+// own fields and can never be removed (a range always has both).
+struct SwSlicerRangeSettings
+{
+    DynamicPrintConfig       values;
+    std::vector<std::string> keys; // keys of 'settings'
+    std::vector<std::string> reset;
+};
+
+static SwSlicerRangeSettings sw_slicer_parse_range_settings(const json& params, const ModelConfig* current)
+{
+    SwSlicerRangeSettings        out;
+    const std::set<std::string>& allowed   = sw_slicer_model_keys(true);
+    auto                         check_key = [&](const std::string& key, bool existing_ok) {
+        if (key == "extruder")
+            throw std::runtime_error("use 'filament' for the filament of a height range");
+        if (key == "layer_height")
+            throw std::runtime_error("use the field 'layer_height' for the layer height of a height range");
+        // A key that is already set on the range (for example from an older project) may be reset.
+        if (allowed.count(key) == 0 && !(existing_ok && current != nullptr && current->has(key)))
+            throw std::runtime_error("'" + key + "' cannot be set per height range");
+    };
+    if (sw_slicer_has_param(params, "settings")) {
+        const json& j = params.at("settings");
+        if (!j.is_object())
+            throw std::runtime_error("'settings' must be an object {key: value}");
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            if (it.key().empty())
+                throw std::runtime_error("'settings' contains an empty key");
+            if (!it.value().is_string())
+                throw std::runtime_error("the value of '" + it.key() + "' must be a string (like sw_SlicerSetConfig)");
+            check_key(it.key(), false);
+            try {
+                out.values.set_deserialize_strict(it.key(), it.value().get<std::string>());
+            } catch (std::exception& e) {
+                throw std::runtime_error("invalid value for '" + it.key() + "': " + e.what());
+            }
+            // set_deserialize may resolve a legacy name or a shortcut to other keys.
+            if (out.values.option(it.key()) == nullptr)
+                throw std::runtime_error("invalid value for '" + it.key() + "': the key was not set");
+            out.keys.push_back(it.key());
+        }
+    }
+    if (sw_slicer_has_param(params, "reset")) {
+        const json& j = params.at("reset");
+        if (!j.is_array())
+            throw std::runtime_error("'reset' must be a list of keys");
+        for (const json& k : j) {
+            if (!k.is_string() || k.get<std::string>().empty())
+                throw std::runtime_error("'reset' must be a list of keys");
+            const std::string key = k.get<std::string>();
+            if (key == "extruder" || key == "layer_height")
+                throw std::runtime_error("'" + key + "' cannot be reset (a height range always has layer_height and filament)");
+            if (std::find(out.reset.begin(), out.reset.end(), key) != out.reset.end())
+                throw std::runtime_error("'" + key + "' appears twice in reset");
+            if (std::find(out.keys.begin(), out.keys.end(), key) != out.keys.end())
+                throw std::runtime_error("'" + key + "' appears in both settings and reset");
+            check_key(key, true);
+            out.reset.push_back(key);
+        }
+    }
+    return out;
+}
+
+// The range of an edit or delete: 'range' (index from sw_SlicerGetLayerRanges) or the pair
+// z_from + z_to (exact within 1e-4 mm).
+static t_layer_height_range sw_slicer_find_layer_range(const ModelObject* mo, const json& params)
+{
+    const bool by_index = sw_slicer_has_param(params, "range");
+    const bool by_z     = sw_slicer_has_param(params, "z_from") || sw_slicer_has_param(params, "z_to");
+    if (by_index && by_z)
+        throw std::runtime_error("specify either 'range' or 'z_from' and 'z_to', not both");
+    if (!by_index && !by_z)
+        throw std::runtime_error("specify 'range' (index from sw_SlicerGetLayerRanges) or 'z_from' and 'z_to'");
+    const t_layer_config_ranges& ranges = mo->layer_config_ranges;
+    const int                    n      = static_cast<int>(ranges.size());
+    if (by_index) {
+        const json& j = params.at("range");
+        if (!j.is_number_integer() || j.get<long long>() < 0 || j.get<long long>() >= n)
+            throw std::runtime_error("range " + j.dump() + " does not exist (the object has " + std::to_string(n) +
+                                     " height ranges, 0-based)");
+        auto it = ranges.begin();
+        std::advance(it, j.get<int>());
+        return it->first;
+    }
+    if (!sw_slicer_has_param(params, "z_from") || !sw_slicer_has_param(params, "z_to"))
+        throw std::runtime_error("specify both 'z_from' and 'z_to' of the range");
+    const double z_from = *sw_slicer_opt_mm(params, "z_from");
+    const double z_to   = *sw_slicer_opt_mm(params, "z_to");
+    for (const auto& r : ranges)
+        if (std::abs(r.first.first - z_from) < 1e-4 && std::abs(r.first.second - z_to) < 1e-4)
+            return r.first;
+    throw std::runtime_error("the object has no height range " + sw_slicer_fmt_short(z_from) + "-" + sw_slicer_fmt_short(z_to) +
+                             " mm (see sw_SlicerGetLayerRanges)");
+}
+
+// The guards and the object of the commands that change height ranges.
+static ModelObject* sw_slicer_layer_range_object(const json& params, int& obj)
+{
+    sw_slicer_require_free_gizmo();
+    sw_slicer_require_idle();
+    sw_slicer_require_not_slicing();
+    sw_slicer_require_not_loading();
+    sw_slicer_require_fff();
+    sw_slicer_get_index(params, "object");
+    obj = sw_slicer_resolve_object(params);
+    return wxGetApp().plater()->model().objects[obj];
+}
+
+// Height ranges of an object, like the "Height ranges" items of the object list.
+// Params: {object}. Read only.
+void SSWCP_SliceProject_Instance::sw_SlicerGetLayerRanges()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_fff();
+        sw_slicer_get_index(m_param_data, "object");
+        const int          obj = sw_slicer_resolve_object(m_param_data);
+        const ModelObject* mo  = plater->model().objects[obj];
+        std::vector<std::string> notes;
+        sw_slicer_layer_range_notes(mo, notes);
+        m_res_data["object"]                = obj;
+        m_res_data["name"]                  = mo->name;
+        m_res_data["object_height"]         = sw_slicer_object_height(mo);
+        m_res_data["ranges"]                = sw_slicer_layer_ranges_json(mo);
+        m_res_data["variable_layer_height"] = !mo->layer_height_profile.empty();
+        m_res_data["limits"]                = {{"min_layer_height", sw_slicer_min_layer_height(0)},
+                                               {"max_layer_height", sw_slicer_max_layer_height(0)}};
+        m_res_data["notes"]                 = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Add a height range modifier. The range starts with the values of
+// ObjectList::get_default_layer_config (layer_height of the object or the print preset,
+// extruder 0) with the given fields on top.
+// Params: {object, z_from, z_to, layer_height?, filament?, settings?}.
+void SSWCP_SliceProject_Instance::sw_SlicerAddLayerRange()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        int          obj = -1;
+        ModelObject* mo  = sw_slicer_layer_range_object(m_param_data, obj);
+        if (!sw_slicer_has_param(m_param_data, "z_from") || !sw_slicer_has_param(m_param_data, "z_to"))
+            throw std::runtime_error("specify 'z_from' and 'z_to' (mm from the bottom of the object)");
+        if (sw_slicer_has_param(m_param_data, "reset"))
+            throw std::runtime_error("'reset' is only for sw_SlicerEditLayerRange");
+        const double                z_from   = *sw_slicer_opt_mm(m_param_data, "z_from");
+        const double                z_to     = *sw_slicer_opt_mm(m_param_data, "z_to");
+        const std::optional<double> lh       = sw_slicer_opt_mm(m_param_data, "layer_height");
+        const std::optional<int>    filament = sw_slicer_opt_range_filament(m_param_data);
+        const SwSlicerRangeSettings s        = sw_slicer_parse_range_settings(m_param_data, nullptr);
+
+        DynamicPrintConfig cfg = sw_slicer_default_layer_config(mo);
+        if (lh.has_value())
+            cfg.set_key_value("layer_height", new ConfigOptionFloat(*lh));
+        if (filament.has_value())
+            cfg.set_key_value("extruder", new ConfigOptionInt(*filament));
+        for (const std::string& k : s.keys)
+            cfg.set_key_value(k, s.values.option(k)->clone());
+        const t_layer_height_range range{z_from, z_to};
+        sw_slicer_validate_layer_range(mo, range, cfg, nullptr);
+
+        // Object item selected (no layer item): the layer items are rebuilt below.
+        sw_slicer_select_object_item(obj);
+        std::vector<std::string> notes;
+        bool                     list_ok = false;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Add height range");
+            mo->layer_config_ranges[range].assign_config(std::move(cfg));
+            list_ok = sw_slicer_refresh_layer_items(obj);
+            sw_slicer_add_notes(notes, sswcp_api::notes());
+        }
+        sw_slicer_schedule_changed_object(mo);
+        if (!list_ok)
+            notes.push_back("the object list could not show the height ranges; they are in the model");
+        if (!mo->layer_height_profile.empty())
+            notes.push_back("a variable layer height profile is set on this object; it takes precedence over the layer_height of height ranges");
+
+        m_res_data["object"] = obj;
+        m_res_data["range"]  = sw_slicer_layer_range_json(sw_slicer_layer_range_index(mo, range), range, mo->layer_config_ranges.at(range));
+        m_res_data["ranges"] = sw_slicer_layer_ranges_json(mo);
+        m_res_data["notes"]  = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Change a height range: move it (new_z_from/new_z_to, like ObjectList::edit_layer_range with a
+// new range: the config moves along), its layer height, filament or settings. A range without
+// layer_height or extruder (from elsewhere) is completed. No-op: no undo step.
+// Params: {object, range | z_from+z_to, new_z_from?, new_z_to?, layer_height?, filament?, settings?, reset?}.
+void SSWCP_SliceProject_Instance::sw_SlicerEditLayerRange()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        int                        obj       = -1;
+        ModelObject*               mo        = sw_slicer_layer_range_object(m_param_data, obj);
+        const t_layer_height_range old_range = sw_slicer_find_layer_range(mo, m_param_data);
+        const std::optional<double> new_from = sw_slicer_opt_mm(m_param_data, "new_z_from");
+        const std::optional<double> new_to   = sw_slicer_opt_mm(m_param_data, "new_z_to");
+        const std::optional<double> lh       = sw_slicer_opt_mm(m_param_data, "layer_height");
+        const std::optional<int>    filament = sw_slicer_opt_range_filament(m_param_data);
+        const ModelConfig&          current  = mo->layer_config_ranges.at(old_range);
+        const SwSlicerRangeSettings s        = sw_slicer_parse_range_settings(m_param_data, &current);
+        if (!new_from.has_value() && !new_to.has_value() && !lh.has_value() && !filament.has_value() && s.keys.empty() &&
+            s.reset.empty())
+            throw std::runtime_error("specify at least one field to change (new_z_from, new_z_to, layer_height, filament, settings or reset)");
+
+        std::vector<std::string> notes;
+        DynamicPrintConfig       cfg = current.get();
+        // The API never writes an incomplete range.
+        if (!cfg.has("layer_height") && !lh.has_value()) {
+            const DynamicPrintConfig def = sw_slicer_default_layer_config(mo);
+            cfg.set_key_value("layer_height", def.option("layer_height")->clone());
+            notes.push_back("the range had no layer_height; it was set to " + sw_slicer_fmt_short(def.option("layer_height")->getFloat()) + " mm");
+        }
+        if (!cfg.has("extruder") && !filament.has_value()) {
+            cfg.set_key_value("extruder", new ConfigOptionInt(0));
+            notes.push_back("the range had no filament; it was set to 0 (the object's filament)");
+        }
+        if (lh.has_value())
+            cfg.set_key_value("layer_height", new ConfigOptionFloat(*lh));
+        if (filament.has_value())
+            cfg.set_key_value("extruder", new ConfigOptionInt(*filament));
+        for (const std::string& k : s.keys)
+            cfg.set_key_value(k, s.values.option(k)->clone());
+        for (const std::string& k : s.reset) {
+            if (cfg.has(k))
+                cfg.erase(k);
+            else
+                notes.push_back("'" + k + "' had no override");
+        }
+        const t_layer_height_range new_range{new_from.value_or(old_range.first), new_to.value_or(old_range.second)};
+        sw_slicer_validate_layer_range(mo, new_range, cfg, &old_range, new_range != old_range);
+
+        // What changes (before anything is written).
+        json                  changed = json::object();
+        std::set<std::string> keys;
+        for (const std::string& k : current.keys())
+            keys.insert(k);
+        for (const std::string& k : cfg.keys())
+            keys.insert(k);
+        for (const std::string& k : keys) {
+            const json old_v = current.has(k) ? json(current.opt_serialize(k)) : json(nullptr);
+            const json new_v = cfg.has(k) ? json(cfg.opt_serialize(k)) : json(nullptr);
+            if (old_v != new_v)
+                changed[k] = {{"old", old_v}, {"new", new_v}};
+        }
+        if (new_range != old_range)
+            changed["range"] = {{"old", json::array({old_range.first, old_range.second})},
+                                {"new", json::array({new_range.first, new_range.second})}};
+        auto reply = [&](const t_layer_height_range& r) {
+            m_res_data["object"]  = obj;
+            m_res_data["range"]   = sw_slicer_layer_range_json(sw_slicer_layer_range_index(mo, r), r, mo->layer_config_ranges.at(r));
+            m_res_data["changed"] = changed;
+            m_res_data["ranges"]  = sw_slicer_layer_ranges_json(mo);
+            m_res_data["notes"]   = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (changed.empty()) {
+            notes.push_back("height range unchanged; nothing changed");
+            reply(old_range);
+            return;
+        }
+
+        sw_slicer_select_object_item(obj);
+        bool list_ok = false;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Edit height range");
+            if (new_range != old_range)
+                mo->layer_config_ranges.erase(old_range);
+            mo->layer_config_ranges[new_range].assign_config(std::move(cfg));
+            list_ok = sw_slicer_refresh_layer_items(obj);
+            sw_slicer_add_notes(notes, sswcp_api::notes());
+        }
+        sw_slicer_schedule_changed_object(mo);
+        if (!list_ok)
+            notes.push_back("the object list could not show the height ranges; they are in the model");
+        if (lh.has_value() && !mo->layer_height_profile.empty())
+            notes.push_back("a variable layer height profile is set on this object; it takes precedence over the layer_height of height ranges");
+        reply(new_range);
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Delete one height range or all of them (like deleting a layer item or the "Height ranges" item
+// in the object list). Params: {object, range | z_from+z_to | all:true}.
+void SSWCP_SliceProject_Instance::sw_SlicerDeleteLayerRange()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        int          obj = -1;
+        ModelObject* mo  = sw_slicer_layer_range_object(m_param_data, obj);
+        if (sw_slicer_has_param(m_param_data, "all") && !m_param_data.at("all").is_boolean())
+            throw std::runtime_error("'all' must be true or false");
+        const bool all     = sw_slicer_get_bool(m_param_data, "all", false);
+        const int  targets = int(all) + int(sw_slicer_has_param(m_param_data, "range")) +
+                            int(sw_slicer_has_param(m_param_data, "z_from") || sw_slicer_has_param(m_param_data, "z_to"));
+        if (targets != 1)
+            throw std::runtime_error("specify exactly one of 'range', 'z_from' and 'z_to', or all:true");
+
+        std::vector<std::string> notes;
+        json                     deleted = json::array();
+        auto                     reply   = [&]() {
+            m_res_data["object"]  = obj;
+            m_res_data["deleted"] = deleted;
+            m_res_data["ranges"]  = sw_slicer_layer_ranges_json(mo);
+            m_res_data["notes"]   = notes;
+            send_to_js();
+            finish_job();
+        };
+        t_layer_height_range range{0.0, 0.0};
+        if (all) {
+            if (mo->layer_config_ranges.empty()) {
+                notes.push_back("the object has no height ranges; nothing changed");
+                reply();
+                return;
+            }
+            deleted = sw_slicer_layer_ranges_json(mo);
+        } else {
+            range = sw_slicer_find_layer_range(mo, m_param_data);
+            deleted.push_back(sw_slicer_layer_range_json(sw_slicer_layer_range_index(mo, range), range, mo->layer_config_ranges.at(range)));
+        }
+
+        sw_slicer_select_object_item(obj);
+        bool list_ok = false;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, all ? "API: Delete height ranges" : "API: Delete height range");
+            if (all)
+                mo->layer_config_ranges.clear();
+            else
+                mo->layer_config_ranges.erase(range);
+            list_ok = sw_slicer_refresh_layer_items(obj);
+            sw_slicer_add_notes(notes, sswcp_api::notes());
+        }
+        sw_slicer_schedule_changed_object(mo);
+        if (!list_ok)
+            notes.push_back("the object list could not follow; the height ranges are deleted in the model");
+        reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Toolbar extras: SVG ----------------------------------------------------------------------
+
+// API limit for the size of an SVG file.
+static constexpr uintmax_t SW_SLICER_SVG_MAX_BYTES = 20u * 1024u * 1024u;
+
+// Tesselation tolerance of the SVG tool for a scale (get_tesselation_tolerance in GLGizmoSVG.cpp,
+// not reachable from outside): 0.1 mm, in the scaled units of the shape.
+static double sw_slicer_svg_tolerance(double scale)
+{
+    const double mm = 0.1;
+    return (mm * mm) / SCALING_FACTOR / SCALING_FACTOR / scale / scale;
+}
+
+// The checks of select_shape (GLGizmoSVG.cpp) beforehand: that function shows an error dialog
+// (show_error, not API-aware) for each of them. Same order and the same NanoSVG calls.
+static void sw_slicer_check_svg_file(const std::string& path)
+{
+    const boost::filesystem::path p = sw_slicer_path_from_utf8(path);
+    if (path.empty() || !p.is_absolute())
+        throw std::runtime_error("'path' must be the absolute path of an .svg file");
+    boost::system::error_code ec;
+    if (!boost::filesystem::is_regular_file(p, ec))
+        throw std::runtime_error("svg file not found");
+    if (!boost::algorithm::iends_with(path, ".svg"))
+        throw std::runtime_error("not an .svg file");
+    // select_shape tests the plain string path itself (boost::filesystem::exists, throwing).
+    boost::system::error_code ec_plain;
+    if (!boost::filesystem::exists(boost::filesystem::path(path), ec_plain) || ec_plain)
+        throw std::runtime_error("the SVG import of the app cannot open this path; use a path without special characters");
+    const uintmax_t bytes = boost::filesystem::file_size(p, ec);
+    if (ec)
+        throw std::runtime_error("the svg file cannot be read");
+    if (bytes > SW_SLICER_SVG_MAX_BYTES)
+        throw std::runtime_error("the svg file is too large for the API (at most 20 MB)");
+    EmbossShape::SvgFile svg;
+    svg.path               = path;
+    const NSVGimage* image = init_image(svg);
+    if (image == nullptr)
+        throw std::runtime_error("the svg file cannot be parsed");
+    if (create_shape_with_ids(*image, NSVGLineParams{sw_slicer_svg_tolerance(1.0)}).empty())
+        throw std::runtime_error("the svg file contains no closed path to emboss");
+}
+
+// Width and height of an SVG volume in mm in the world. The shape lies in the XY plane of the
+// volume; the scale per axis comes from the world matrix, like GLGizmoSVG::calculate_scale.
+static Vec2d sw_slicer_svg_size(const ModelVolume& mv, Vec2d* scale = nullptr)
+{
+    const ModelObject* mo = mv.get_object();
+    Transform3d        w  = mv.get_matrix();
+    if (mo != nullptr && !mo->instances.empty())
+        w = mo->instances.front()->get_matrix() * w;
+    if (mv.emboss_shape.has_value() && mv.emboss_shape->fix_3mf_tr.has_value())
+        w = w * mv.emboss_shape->fix_3mf_tr->inverse();
+    const double        sx = (w.linear() * Vec3d::UnitX()).norm();
+    const double        sy = (w.linear() * Vec3d::UnitY()).norm();
+    const BoundingBoxf3 bb = mv.mesh().bounding_box();
+    if (scale != nullptr)
+        *scale = Vec2d(sx, sy);
+    return Vec2d(bb.size().x() * sx, bb.size().y() * sy);
+}
+
+// After a time-out of an emboss job (create or update of an SVG): cancel it and let its finalize
+// run here, within the caller's API scope. ::finalize (EmbossJob.cpp) applies nothing for a
+// canceled job; an error message there becomes a note, not a dialog. Returns false if the worker
+// is still busy afterwards.
+static bool sw_slicer_cancel_emboss_job(Plater* plater)
+{
+    Worker& w = plater->get_ui_job_worker();
+    if (w.is_idle())
+        return true;
+    w.cancel();
+    w.wait_for_current_job(5000);
+    try {
+        SwSlicerJobBudget(5000, "the canceled SVG job").wait_for_idle(plater);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+// Size and depth of a new SVG volume with the steps of the SVG tool: the size is a scale of the
+// volume in its plane (GLGizmoSVG::draw_size: selection.scale + do_scale, then the shape is
+// tesselated again for the new scale), the depth is projection.depth of the shape
+// (GLGizmoSVG::draw_depth); then one update job (GLGizmoSVG::process). The selection must be the
+// SVG volume. On failure 'error' says why and a rescale is undone, so size and tesselation fit.
+static bool sw_slicer_svg_apply_size(Plater* plater, ModelVolume* mv, std::optional<double> width, std::optional<double> height,
+                                     std::optional<double> depth, const SwSlicerJobBudget& budget, std::string& error)
+{
+    GLCanvas3D*                           canvas = sw_slicer_canvas();
+    Model&                                model  = plater->model();
+    const Geometry::Transformation        vol_tr = mv->get_transformation();
+    std::vector<Geometry::Transformation> inst_tr;
+    for (const ModelInstance* inst : mv->get_object()->instances)
+        inst_tr.push_back(inst->get_transformation());
+    bool rescaled   = false;
+    auto undo_scale = [&]() {
+        int o = -1, v = -1;
+        if (!rescaled || !sw_slicer_find_volume(model, mv, o, v))
+            return;
+        ModelObject* mo = model.objects[o];
+        mv->set_transformation(vol_tr);
+        for (size_t i = 0; i < mo->instances.size() && i < inst_tr.size(); ++i)
+            mo->instances[i]->set_transformation(inst_tr[i]);
+        mo->invalidate_bounding_box();
+        plater->changed_object(o);
+    };
+    try {
+        if (width.has_value() || height.has_value()) {
+            const Vec2d  size    = sw_slicer_svg_size(*mv);
+            const double current = width.has_value() ? size.x() : size.y();
+            if (current <= EPSILON)
+                throw std::runtime_error("the SVG has no width or height to scale");
+            const double ratio = (width.has_value() ? *width : *height) / current;
+            // Same limits as the SVG tool (relative_scale_ratio).
+            if (std::abs(ratio - 1.0) >= 1e-5) {
+                if (ratio > 1e4 || ratio < 1e-4)
+                    throw std::runtime_error("this size cannot be reached from the size of the SVG (" + sw_slicer_fmt_short(size.x()) +
+                                             " x " + sw_slicer_fmt_short(size.y()) + " mm)");
+                Selection& sel = canvas->get_selection();
+                sel.setup_cache();
+                selection_transform(sel, [&sel, ratio]() { sel.scale(Vec3d(ratio, ratio, 1.), get_drag_transformation_type(sel)); });
+                rescaled = true;
+                canvas->do_scale(""); // no own undo step (the API snapshot covers it)
+                if (GizmoObjectManipulation* manip = wxGetApp().obj_manipul())
+                    manip->set_dirty();
+            }
+        }
+        const bool deeper = depth.has_value() && !is_approx(*depth, mv->emboss_shape->projection.depth, 1e-4);
+        if (!rescaled && !deeper)
+            return true;
+
+        EmbossShape shape = *mv->emboss_shape; // copy
+        if (deeper)
+            shape.projection.depth = *depth;
+        if (rescaled && shape.svg_file.has_value()) {
+            Vec2d sc;
+            sw_slicer_svg_size(*mv, &sc);
+            if (const NSVGimage* image = init_image(*shape.svg_file)) {
+                shape.shapes_with_ids = create_shape_with_ids(*image, NSVGLineParams{sw_slicer_svg_tolerance(std::max(sc.x(), sc.y()))});
+                shape.final_shape     = {}; // cache of the shape
+            }
+        }
+        auto cancel      = std::make_shared<std::atomic<bool>>(false);
+        auto base        = std::make_unique<Emboss::DataBase>(mv->name, cancel, std::move(shape));
+        base->is_outside = mv->type() == ModelVolumeType::MODEL_PART;
+        const ObjectID     old_id = mv->id();
+        Emboss::DataUpdate data{std::move(base), old_id, false};
+        RaycastManager     raycaster;
+        if (!Emboss::start_update_volume(std::move(data), *mv, canvas->get_selection(), raycaster))
+            throw std::runtime_error("the update of the SVG could not be started");
+        try {
+            budget.wait_for_idle(plater);
+        } catch (...) {
+            // Our own cancel flag makes its finalize a no-op, whatever the worker reports.
+            cancel->store(true);
+            sw_slicer_cancel_emboss_job(plater);
+            throw;
+        }
+        // The update job keeps the volume and gives it a new ObjectID (UpdateJob::update_volume).
+        int obj = -1, vol = -1;
+        if (sw_slicer_find_volume(model, mv, obj, vol) && mv->id() != old_id)
+            return true;
+        error = "the update job of the SVG failed";
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    undo_scale();
+    return false;
+}
+
+// Add an SVG as a part, negative volume or modifier, like "Add SVG" in the context menu without a
+// mouse position (GLGizmoSVG::create_volume(path, type)): with 'object' on or next to that
+// object, without 'object' as a new object. The file is checked beforehand (no error dialog).
+// The job runs synchronously in API mode; the SVG tool that the job opens is closed again.
+// Params: {path, object?, part_type?, width_mm? | height_mm?, depth_mm?}.
+void SSWCP_SliceProject_Instance::sw_SlicerAddSvg()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_3d_view();
+
+        if (!sw_slicer_has_param(m_param_data, "path") || !m_param_data.at("path").is_string())
+            throw std::runtime_error("'path' must be the absolute path of an .svg file");
+        const std::string path = m_param_data.at("path").get<std::string>();
+        ModelVolumeType   type = ModelVolumeType::MODEL_PART;
+        if (sw_slicer_has_param(m_param_data, "part_type")) {
+            const json&       j  = m_param_data.at("part_type");
+            const std::string pt = j.is_string() ? j.get<std::string>() : std::string();
+            if (pt == "part")
+                type = ModelVolumeType::MODEL_PART;
+            else if (pt == "negative")
+                type = ModelVolumeType::NEGATIVE_VOLUME;
+            else if (pt == "modifier")
+                type = ModelVolumeType::PARAMETER_MODIFIER;
+            else
+                throw std::runtime_error("unknown part_type (expected part|negative|modifier)");
+        }
+        const bool has_object = sw_slicer_has_param(m_param_data, "object");
+        // Without an object the job creates a new object and ignores the type (always a part).
+        if (!has_object && type != ModelVolumeType::MODEL_PART)
+            throw std::runtime_error("part_type 'negative' or 'modifier' requires an existing object: specify 'object'");
+        const std::optional<double> width  = sw_slicer_get_positive_mm(m_param_data, "width_mm", 0.1, 1000.0);
+        const std::optional<double> height = sw_slicer_get_positive_mm(m_param_data, "height_mm", 0.1, 1000.0);
+        if (width.has_value() && height.has_value())
+            throw std::runtime_error("specify width_mm or height_mm, not both (the aspect ratio is kept)");
+        const std::optional<double> depth =
+            sw_slicer_get_positive_mm(m_param_data, "depth_mm", SW_SLICER_TEXT_DEPTH_MIN, SW_SLICER_TEXT_DEPTH_MAX);
+        sw_slicer_check_svg_file(path);
+
+        GLCanvas3D*      canvas = sw_slicer_canvas();
+        GLGizmosManager& gm     = canvas->get_gizmos_manager();
+        GLGizmoSVG*      svg    = dynamic_cast<GLGizmoSVG*>(gm.get_gizmo(GLGizmosManager::Svg));
+        if (svg == nullptr)
+            throw std::runtime_error("the SVG tool is not available");
+
+        Model&   model     = plater->model();
+        ObjectID target_id = ObjectID();
+        int      target    = -1;
+        if (has_object) {
+            target = sw_slicer_resolve_object(m_param_data);
+            if (model.objects[target]->is_cut())
+                throw std::runtime_error("an SVG cannot be placed on a cut object");
+            target_id = model.objects[target]->id();
+            sw_slicer_select(target, -1, -1);
+        } else {
+            // Empty selection: start_create_volume_without_position then creates a new object.
+            canvas->get_selection().clear();
+            wxGetApp().obj_list()->update_selections();
+            canvas->update_gizmos_on_off_state();
+            canvas->set_as_dirty();
+        }
+
+        // ObjectIDs of all existing volumes: the new SVG volume is the only one missing.
+        std::set<size_t> old_ids, old_objects;
+        for (const ModelObject* mo : model.objects) {
+            old_objects.insert(mo->id().id);
+            for (const ModelVolume* mv : mo->volumes)
+                old_ids.insert(mv->id().id);
+        }
+
+        ModelVolume*             new_mv = nullptr;
+        bool                     sized  = true;
+        std::string              size_error;
+        std::string              misplaced; // the job put the SVG elsewhere (see below)
+        std::vector<std::string> notes;
+        const SwSlicerJobBudget  budget(30000, "the SVG job"); // total for create + size/depth
+        // The job's finalize opens the SVG tool: our own tool (the free-gizmo check allowed no
+        // other one), so it may be closed; also on the error path.
+        auto close_svg = [&gm, canvas]() {
+            if (gm.get_current_type() == GLGizmosManager::Svg)
+                canvas->reset_all_gizmos();
+        };
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Add SVG");
+            try {
+                if (svg->create_volume(std::string_view(path), type)) {
+                    try {
+                        budget.wait_for_idle(plater);
+                    } catch (...) {
+                        // Cancel the create job: otherwise it adds the SVG later, outside this
+                        // undo step (CreateObjectJob even takes its own snapshot).
+                        if (!sw_slicer_cancel_emboss_job(plater))
+                            throw std::runtime_error("the SVG job did not finish within 30 s and could not be canceled (the app is still busy)");
+                    }
+                    for (ModelObject* mo : model.objects) {
+                        for (ModelVolume* mv : mo->volumes)
+                            if (GLGizmoSVG::is_svg(*mv) && old_ids.count(mv->id().id) == 0) {
+                                new_mv = mv;
+                                break;
+                            }
+                        if (new_mv != nullptr)
+                            break;
+                    }
+                }
+                // start_create_volume_without_position falls back to a new object (and ignores
+                // the type) when it finds no part of the selected object to place on. Refused:
+                // the new SVG is deleted again within this undo step.
+                if (new_mv != nullptr && has_object &&
+                    (new_mv->get_object()->id() != target_id || new_mv->type() != type)) {
+                    misplaced = new_mv->get_object()->id() != target_id ?
+                                    "the app created the SVG as a new object instead of on object " + std::to_string(target) :
+                                    std::string("the app created the SVG with another part type");
+                    int        m_obj = -1, m_vol = -1;
+                    const bool found = sw_slicer_find_volume(model, new_mv, m_obj, m_vol);
+                    new_mv           = nullptr;
+                    close_svg();
+                    if (found) {
+                        if (old_objects.count(model.objects[m_obj]->id().id) == 0)
+                            sw_slicer_select(m_obj, -1, -1);
+                        else
+                            sw_slicer_select(m_obj, -1, m_vol);
+                        if (plater->can_delete())
+                            plater->remove_selected();
+                        else
+                            misplaced += " (it could not be deleted; use sw_SlicerUndo)";
+                    }
+                }
+                if (new_mv != nullptr && (width.has_value() || height.has_value() || depth.has_value())) {
+                    int t_obj = -1, t_vol = -1;
+                    if (sw_slicer_find_volume(model, new_mv, t_obj, t_vol))
+                        sw_slicer_select(t_obj, -1, t_vol);
+                    // The SVG exists now: a failure here becomes a note (like a failed restyle in
+                    // sw_SlicerAddText), the SVG keeps its own size and depth.
+                    sized = sw_slicer_svg_apply_size(plater, new_mv, width, height, depth, budget, size_error);
+                }
+            } catch (...) {
+                // Close within the snapshot scope: no separate "leave gizmo" step.
+                close_svg();
+                canvas->set_as_dirty();
+                throw;
+            }
+            close_svg();
+            notes = sswcp_api::notes();
+        }
+        canvas->set_as_dirty();
+        canvas->request_extra_frame();
+
+        // Resolve object/volume again: the create job sorts the volumes and the update job assigns
+        // a new ObjectID.
+        int obj = -1, vol = -1;
+        if (!misplaced.empty())
+            throw std::runtime_error(
+                sw_slicer_join_notes(misplaced + "; it was removed again (an undo step 'API: Add SVG' without change remains)", notes));
+        if (new_mv == nullptr || !sw_slicer_find_volume(model, new_mv, obj, vol))
+            throw std::runtime_error(
+                sw_slicer_join_notes("the SVG could not be created (an undo step 'API: Add SVG' without change remains)", notes));
+        if (!sized)
+            notes.push_back("the size or depth could not be applied" + (size_error.empty() ? std::string() : " (" + size_error + ")") +
+                            "; the SVG keeps size " + sw_slicer_fmt_short(sw_slicer_svg_size(*new_mv).x()) + " x " +
+                            sw_slicer_fmt_short(sw_slicer_svg_size(*new_mv).y()) + " mm and depth " +
+                            sw_slicer_fmt_short(new_mv->emboss_shape->projection.depth) + " mm");
+        notes.push_back("move the SVG with sw_SlicerMove (object, volume)");
+        const Vec2d size = sw_slicer_svg_size(*new_mv);
+        m_res_data["object"]   = obj;
+        m_res_data["volume"]   = vol;
+        m_res_data["name"]     = new_mv->name;
+        m_res_data["type"]     = sw_slicer_volume_type(new_mv->type());
+        m_res_data["size_mm"]  = json::array({size.x(), size.y()});
+        m_res_data["depth_mm"] = new_mv->emboss_shape->projection.depth;
+        m_res_data["notes"]    = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Toolbar extras: repair (Windows) -----------------------------------------------------------
+
+#ifdef HAS_WIN10SDK
+// Deletes temporary files, also on errors and after a time-out (it lives in the job state).
+struct SwSlicerTempFiles
+{
+    std::vector<boost::filesystem::path> paths;
+    SwSlicerTempFiles() = default;
+    SwSlicerTempFiles(const SwSlicerTempFiles&)            = delete;
+    SwSlicerTempFiles& operator=(const SwSlicerTempFiles&) = delete;
+    ~SwSlicerTempFiles()
+    {
+        for (const boost::filesystem::path& p : paths) {
+            boost::system::error_code ec;
+            boost::filesystem::remove(p, ec);
+        }
+    }
+};
+
+// State of the repair job: only file paths (UTF-8) and flags. The 3MF files are written and read
+// on the GUI thread: Model and ObjectID are not thread-safe (ObjectBase::s_last_id).
+struct SwSlicerRepairJobState
+{
+    std::vector<std::string> src, dst;
+    SwSlicerTempFiles        tmp;
+    std::atomic<bool>        cancel{false};
+    bool                     done = false, ok = false;
+    std::string              error;
+};
+
+// A new temporary 3MF path, registered for deletion. Returned as UTF-8 (the app's file functions
+// expect UTF-8; path.string() would be the ANSI code page).
+static std::string sw_slicer_repair_temp_path(SwSlicerTempFiles& tmp)
+{
+    const boost::filesystem::path p = boost::filesystem::temp_directory_path() /
+                                      boost::filesystem::unique_path("api-repair-%%%%-%%%%-%%%%-%%%%.3mf");
+    tmp.paths.push_back(p);
+    return boost::nowide::narrow(p.wstring());
+}
+
+// Store a mesh as a 3MF with one volume and the identity transformation, like
+// fix_model_by_win10_sdk_gui does per volume. GUI thread.
+static void sw_slicer_store_repair_input(const TriangleMesh& mesh, const std::string& path)
+{
+    Model        model;
+    ModelObject* mo = model.add_object();
+    mo->add_volume(TriangleMesh(mesh), ModelVolumeType::MODEL_PART, false);
+    mo->add_instance();
+    if (!Slic3r::store_3mf(path.c_str(), &model, nullptr, false, nullptr, false))
+        throw std::runtime_error("exporting the 3mf file for the repair failed");
+}
+
+// Load the repaired 3MF with the checks of fix_model_by_win10_sdk_gui. GUI thread.
+static TriangleMesh sw_slicer_load_repair_result(const std::string& path)
+{
+    DynamicPrintConfig        config;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::EnableSilent};
+    Model                     repaired;
+    if (!Slic3r::load_3mf(path.c_str(), config, substitutions, &repaired, false))
+        throw std::runtime_error("importing the repaired 3mf file failed");
+    if (repaired.objects.size() != 1 || repaired.objects.front()->volumes.size() != 1)
+        throw std::runtime_error("the repaired 3mf file does not contain exactly one part");
+    TriangleMesh out = repaired.objects.front()->volumes.front()->mesh();
+    if (out.empty())
+        throw std::runtime_error("the repaired mesh is empty");
+    return out;
+}
+
+// Repair one 3MF file with the Windows service. The Windows call runs in its own thread, like in
+// the GUI: it initializes its own (multithreaded) COM context per call and does not uninitialize
+// it when it throws. The thread is always joined (also when the polling loop throws). Runs on the
+// job thread and touches no model data.
+static void sw_slicer_repair_file(const std::string& src, const std::string& dst, std::atomic<bool>& cancel, Job::Ctl& ctl,
+                                  size_t index, size_t count, const std::string& status)
+{
+    std::exception_ptr    err;
+    std::atomic<bool>     finished{false};
+    std::atomic<unsigned> progress{0};
+    std::thread           repair_thread([&]() {
+        try {
+            fix_model_by_win10_sdk(
+                src, dst, [&progress](const char*, unsigned p) { progress = p; },
+                [&cancel]() {
+                    if (cancel.load())
+                        throw std::runtime_error("canceled");
+                });
+        } catch (...) {
+            err = std::current_exception();
+        }
+        finished = true;
+    });
+    try {
+        while (!finished.load()) {
+            if (ctl.was_canceled())
+                cancel = true;
+            ctl.update_status(static_cast<int>((progress.load() + 100 * index) / count), status);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    } catch (...) {
+        cancel = true;
+        repair_thread.join();
+        throw;
+    }
+    repair_thread.join();
+    if (err)
+        std::rethrow_exception(err);
+}
+#endif // HAS_WIN10SDK
+
+// Repair the solid parts of an object with the Windows repair service, like "Fix model" in the
+// object menu (ObjectList::fix_through_netfabb), but without the progress dialog and without
+// changing the model from a worker thread: the GUI thread writes the 3MF copies, the job only
+// runs the Windows repair on those files, and the result is loaded and applied here on the GUI
+// thread. Without 'force' only parts with errors (FIX_THROUGH_NETFABB_ALWAYS == 0). Text and SVG
+// parts are left out (regenerated from their shape, like for simplify). Painting of the object
+// is removed (Plater::clear_before_change_mesh) only with discard_paint.
+// Params: {object, volume?, discard_paint?, force?}.
+void SSWCP_SliceProject_Instance::sw_SlicerRepair()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+#ifndef HAS_WIN10SDK
+        throw std::runtime_error("model repair is only available on Windows 10 or later");
+#else
+        if (!is_windows10())
+            throw std::runtime_error("model repair is only available on Windows 10 or later");
+        sw_slicer_get_index(m_param_data, "object");
+        const int    obj   = sw_slicer_resolve_object(m_param_data);
+        Model&       model = plater->model();
+        ModelObject* mo    = model.objects[obj];
+        for (const char* key : {"discard_paint", "force"})
+            if (sw_slicer_has_param(m_param_data, key) && !m_param_data.at(key).is_boolean())
+                throw std::runtime_error(std::string("'") + key + "' must be true or false");
+        const bool discard_paint = sw_slicer_get_bool(m_param_data, "discard_paint", false);
+        const bool force         = sw_slicer_get_bool(m_param_data, "force", false);
+
+        json             skipped = json::array();
+        std::vector<int> candidates;
+        if (sw_slicer_has_param(m_param_data, "volume")) {
+            const int vol = sw_slicer_get_index(m_param_data, "volume");
+            sw_slicer_check_indices(obj, -1, vol);
+            const ModelVolume* mv = mo->volumes[vol];
+            if (!mv->is_model_part())
+                throw std::runtime_error("only solid parts can be repaired (volume " + std::to_string(vol) + " is a " +
+                                         sw_slicer_volume_type(mv->type()) + ")");
+            if (mv->emboss_shape.has_value())
+                throw std::runtime_error("text and SVG parts are regenerated from their shape; repair is not useful here");
+            candidates.push_back(vol);
+        } else {
+            for (size_t i = 0; i < mo->volumes.size(); ++i) {
+                const ModelVolume* mv = mo->volumes[i];
+                if (!mv->is_model_part())
+                    continue;
+                if (mv->emboss_shape.has_value())
+                    skipped.push_back({{"volume", static_cast<int>(i)},
+                                       {"name", mv->name},
+                                       {"reason", "text or SVG part (regenerated from its shape)"}});
+                else
+                    candidates.push_back(static_cast<int>(i));
+            }
+        }
+        if (candidates.empty() && skipped.empty())
+            throw std::runtime_error("the object has no solid part to repair");
+
+        // Which parts: without 'force' only parts with errors, like the menu.
+        struct Target
+        {
+            int                                 vol;
+            ObjectID                            id;
+            std::shared_ptr<const TriangleMesh> mesh;
+            size_t                              open_before;
+            int                                 errors_before;
+        };
+        std::vector<Target> targets;
+        for (int v : candidates) {
+            const ModelVolume* mv     = mo->volumes[v];
+            const size_t       n_tris = mv->mesh().its.indices.size();
+            if (n_tris == 0)
+                throw std::runtime_error("part " + std::to_string(v) + " has no mesh");
+            if (n_tris > 5000000)
+                throw std::runtime_error("the mesh of part " + std::to_string(v) + " is too large for the API (" +
+                                         std::to_string(n_tris) + " triangles; at most 5000000)");
+            const size_t open   = its_num_open_edges(mv->mesh().its);
+            const int    errors = mv->get_repaired_errors_count();
+            if (!force && open == 0 && errors == 0) {
+                skipped.push_back({{"volume", v}, {"name", mv->name}, {"reason", "no errors"}});
+                continue;
+            }
+            targets.push_back({v, mv->id(), mv->mesh_ptr(), open, errors});
+        }
+        std::vector<std::string> notes;
+        json                     repaired = json::array();
+        auto                     reply    = [&](int o) {
+            m_res_data["object"]   = o;
+            m_res_data["repaired"] = repaired;
+            m_res_data["skipped"]  = skipped;
+            m_res_data["notes"]    = notes;
+            send_to_js();
+            finish_job();
+        };
+        if (targets.empty()) {
+            notes.push_back(candidates.empty() ? "no part to repair (see skipped); nothing changed" :
+                                                 "no errors found; nothing changed (force:true repairs anyway)");
+            reply(obj);
+            return;
+        }
+        if (sw_slicer_object_has_paint(mo) && !discard_paint)
+            throw std::runtime_error("repairing removes all painting of this object (support, seam, color, fuzzy skin); pass discard_paint");
+
+        // The input files are written here; the job only gets their paths.
+        const ObjectID obj_id = mo->id();
+        auto           st     = std::make_shared<SwSlicerRepairJobState>();
+        for (const Target& t : targets) {
+            st->src.push_back(sw_slicer_repair_temp_path(st->tmp));
+            st->dst.push_back(sw_slicer_repair_temp_path(st->tmp));
+            sw_slicer_store_repair_input(*t.mesh, st->src.back());
+        }
+        mo = nullptr;
+        const std::string status_text = _u8L("Repairing model object");
+        sw_slicer_run_mesh_job(
+            plater, st,
+            [status_text](SwSlicerRepairJobState& s, Job::Ctl& ctl) {
+                for (size_t i = 0; i < s.src.size(); ++i)
+                    sw_slicer_repair_file(s.src[i], s.dst[i], s.cancel, ctl, i, s.src.size(), status_text);
+            },
+            180000, "the repair job");
+        if (!st->done || !st->ok)
+            throw std::runtime_error("repair failed: " + (st->error.empty() ? std::string("no result") : st->error));
+        std::vector<TriangleMesh> meshes;
+        for (const std::string& dst : st->dst)
+            meshes.push_back(sw_slicer_load_repair_result(dst));
+
+        // Look the object and the parts up again (the model may have changed while waiting).
+        int r_obj = -1;
+        for (size_t o = 0; o < model.objects.size(); ++o)
+            if (model.objects[o]->id() == obj_id)
+                r_obj = static_cast<int>(o);
+        if (r_obj < 0)
+            throw std::runtime_error("the object was removed while repairing; nothing changed");
+        mo = model.objects[r_obj];
+        std::vector<int> r_vols;
+        for (const Target& t : targets) {
+            int found = -1;
+            for (size_t v = 0; v < mo->volumes.size(); ++v)
+                if (mo->volumes[v]->id() == t.id && mo->volumes[v]->mesh_ptr() == t.mesh)
+                    found = static_cast<int>(v);
+            if (found < 0)
+                throw std::runtime_error("a part was changed or removed while repairing; nothing changed");
+            r_vols.push_back(found);
+        }
+        // GUI events ran while waiting: decide on the state now (like sw_SlicerSimplify).
+        sw_slicer_require_free_gizmo();
+        const bool paint_now = sw_slicer_object_has_paint(mo);
+        if (paint_now && !discard_paint)
+            throw std::runtime_error("the object was painted while repairing; nothing changed");
+
+        bool paint_removed = false;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Repair");
+            // Same steps as ObjectList::fix_through_netfabb + fix_model_by_win10_sdk_gui.
+            if (paint_now) {
+                plater->clear_before_change_mesh(r_obj);
+                paint_removed = true;
+            }
+            for (size_t i = 0; i < r_vols.size(); ++i) {
+                ModelVolume* v = mo->volumes[r_vols[i]];
+                v->set_mesh(std::move(meshes[i]));
+                v->calculate_convex_hull();
+                v->invalidate_convex_hull_2d();
+                v->set_new_unique_id();
+            }
+            mo->invalidate_bounding_box();
+            mo->ensure_on_bed();
+            plater->changed_mesh(r_obj);
+            plater->get_partplate_list().notify_instance_update(r_obj, 0);
+            ObjectList* obj_list = wxGetApp().obj_list();
+            obj_list->update_plate_values_for_items();
+            for (int v : r_vols)
+                obj_list->update_item_error_icon(r_obj, v);
+            obj_list->update_info_items(static_cast<size_t>(r_obj));
+            sw_slicer_add_notes(notes, sswcp_api::notes());
+        }
+        sw_slicer_canvas()->set_as_dirty();
+        sw_slicer_canvas()->request_extra_frame();
+        for (size_t i = 0; i < r_vols.size(); ++i) {
+            const ModelVolume* v = mo->volumes[r_vols[i]];
+            repaired.push_back({{"volume", r_vols[i]},
+                                {"name", v->name},
+                                {"open_edges_before", static_cast<long long>(targets[i].open_before)},
+                                {"open_edges_after", static_cast<long long>(its_num_open_edges(v->mesh().its))},
+                                {"errors_before", targets[i].errors_before}});
+        }
+        if (paint_removed)
+            notes.push_back("painting removed (support, seam, color, fuzzy skin)");
+        reply(r_obj);
+#endif // HAS_WIN10SDK
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
     }

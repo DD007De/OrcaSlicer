@@ -4777,6 +4777,18 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerMergeParts();
     } else if (m_cmd == "sw_SlicerSimplify") {
         sw_SlicerSimplify();
+    } else if (m_cmd == "sw_SlicerGetLayerRanges") {
+        sw_SlicerGetLayerRanges();
+    } else if (m_cmd == "sw_SlicerAddLayerRange") {
+        sw_SlicerAddLayerRange();
+    } else if (m_cmd == "sw_SlicerEditLayerRange") {
+        sw_SlicerEditLayerRange();
+    } else if (m_cmd == "sw_SlicerDeleteLayerRange") {
+        sw_SlicerDeleteLayerRange();
+    } else if (m_cmd == "sw_SlicerAddSvg") {
+        sw_SlicerAddSvg();
+    } else if (m_cmd == "sw_SlicerRepair") {
+        sw_SlicerRepair();
     } else {
         handle_general_fail();
     }
@@ -8109,6 +8121,8 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_SlicerListCalibrations", "sw_SlicerCalibrate", "sw_SlicerGetCalibration", "sw_SlicerApplyCalibration",
     // Toolbar extras
     "sw_SlicerGetText", "sw_SlicerCutSection", "sw_SlicerMergeObjects", "sw_SlicerMergeParts", "sw_SlicerSimplify",
+    "sw_SlicerGetLayerRanges", "sw_SlicerAddLayerRange", "sw_SlicerEditLayerRange", "sw_SlicerDeleteLayerRange",
+    "sw_SlicerAddSvg", "sw_SlicerRepair",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.

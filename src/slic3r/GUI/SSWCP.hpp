@@ -809,6 +809,12 @@ private:
     void sw_SlicerMergeObjects();
     void sw_SlicerMergeParts();
     void sw_SlicerSimplify();
+    void sw_SlicerGetLayerRanges();
+    void sw_SlicerAddLayerRange();
+    void sw_SlicerEditLayerRange();
+    void sw_SlicerDeleteLayerRange();
+    void sw_SlicerAddSvg();
+    void sw_SlicerRepair();
 };
 
 // Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the

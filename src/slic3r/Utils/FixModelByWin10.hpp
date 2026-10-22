@@ -1,6 +1,7 @@
 #ifndef slic3r_GUI_Utils_FixModelByWin10_hpp_
 #define slic3r_GUI_Utils_FixModelByWin10_hpp_
 
+#include <functional>
 #include <string>
 #include "../GUI/Widgets/ProgressDialog.hpp"
 
@@ -15,6 +16,10 @@ class Print;
 #ifdef HAS_WIN10SDK
 
 extern bool is_windows10();
+// Repair a 3MF file without any UI (used by the GUI repair and by the API).
+typedef std::function<void (const char * /* message */, unsigned /* progress */)> ProgressFn;
+typedef std::function<void ()> ThrowOnCancelFn;
+extern void fix_model_by_win10_sdk(const std::string &path_src, const std::string &path_dst, ProgressFn on_progress, ThrowOnCancelFn throw_on_cancel);
 // returt false, if fixing was canceled
 extern bool fix_model_by_win10_sdk_gui(ModelObject &model_object, int volume_idx,GUI::ProgressDialog &progress_dlg, const wxString &msg_header, std::string &fix_result);
 
