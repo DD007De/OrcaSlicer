@@ -802,6 +802,13 @@ private:
     void sw_SlicerCalibrate();
     void sw_SlicerGetCalibration();
     void sw_SlicerApplyCalibration();
+
+    // Toolbar extras: text info, cut section, merge, simplify, layer ranges, SVG, repair.
+    void sw_SlicerGetText();
+    void sw_SlicerCutSection();
+    void sw_SlicerMergeObjects();
+    void sw_SlicerMergeParts();
+    void sw_SlicerSimplify();
 };
 
 // Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the

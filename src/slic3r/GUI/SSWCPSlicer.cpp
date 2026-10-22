@@ -20,6 +20,7 @@
 #include "slic3r/GUI/Gizmos/GizmoObjectManipulation.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoEmboss.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoMeasure.hpp"
+#include "slic3r/GUI/SurfaceDrag.hpp"
 #include "slic3r/GUI/Jobs/Job.hpp"
 #include "slic3r/GUI/Jobs/Worker.hpp"
 #include "slic3r/GUI/SSWCPApiMode.hpp"
@@ -47,6 +48,7 @@
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/MeshBoolean.hpp"
+#include "libslic3r/QuadricEdgeCollapse.hpp"
 #include "libslic3r/TextConfiguration.hpp"
 #include "libslic3r/EmbossShape.hpp"
 #include "libslic3r/ParameterUtils.hpp"
@@ -113,7 +115,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 13;
+        m_res_data["phase"]    = 14;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -1677,9 +1679,14 @@ void SSWCP_SliceProject_Instance::sw_SlicerLayOnFace()
 
 // --- 3D toolbar: cut (plane + groove) -----------------------------------------------
 
+// Defined further down in this file.
+static bool sw_slicer_has_param(const json& params, const char* key);
+static bool sw_slicer_get_number(const json& params, const char* key, double def, double& out);
+static void sw_slicer_require_not_slicing();
+
 // Local copy of update_object_cut_id() from GLGizmoCut.cpp (not exposed in a header).
-// Without connectors/dowels (dowels_count = 0): connectors are not supported by the API.
-static void sw_slicer_update_object_cut_id(CutObjectBase& cut_id, ModelObjectCutAttributes attributes)
+// dowels_count counts only with CreateDowels (cut with dowel connectors).
+static void sw_slicer_update_object_cut_id(CutObjectBase& cut_id, ModelObjectCutAttributes attributes, int dowels_count)
 {
     // do not keep cut information if the result does not contain all parts of the object
     if (!attributes.has(ModelObjectCutAttribute::KeepUpper) || !attributes.has(ModelObjectCutAttribute::KeepLower) ||
@@ -1692,6 +1699,8 @@ static void sw_slicer_update_object_cut_id(CutObjectBase& cut_id, ModelObjectCut
         cut_obj_cnt++;
     if (attributes.has(ModelObjectCutAttribute::KeepLower))
         cut_obj_cnt++;
+    if (attributes.has(ModelObjectCutAttribute::CreateDowels))
+        cut_obj_cnt += dowels_count;
     if (cut_obj_cnt > 0)
         cut_id.increase_check_sum(size_t(cut_obj_cnt));
 }
@@ -1720,6 +1729,363 @@ struct SwSlicerCutIdRestore
     SwSlicerCutIdRestore& operator=(const SwSlicerCutIdRestore&) = delete;
 };
 
+// The cut plane of an instance at height z with a rotation in degrees.
+struct SwSlicerCutFrame
+{
+    Transform3d   cut_matrix; // object frame (world orientation, instance offset removed)
+    Transform3d   R;          // plane rotation
+    Vec3d         center;     // plane center (world)
+    Vec3d         normal;     // plane normal (world)
+    BoundingBoxf3 bb;         // instance bounding box (world)
+    double        mean_size;  // the cut tool's size limit for connectors
+};
+
+static SwSlicerCutFrame sw_slicer_cut_frame(const ModelObject* mo, int inst, double z, const Vec3d& rot_deg)
+{
+    SwSlicerCutFrame f;
+    f.bb = mo->instance_bounding_box(static_cast<size_t>(inst));
+    // Cut matrix exactly like GLGizmoCut3D::get_cut_matrix(): plane center (world) minus the
+    // instance offset, times the rotation. sla_shift_z is 0 for FFF.
+    f.R          = Slic3r::Geometry::rotation_transform(rot_deg * (PI / 180.0));
+    f.center     = Vec3d(f.bb.center().x(), f.bb.center().y(), z);
+    f.cut_matrix = Slic3r::Geometry::translation_transform(f.center - mo->instances[inst]->get_offset()) * f.R;
+    f.normal     = f.R * Vec3d::UnitZ();
+    // Same limit as the size/depth inputs of the cut tool (render_slider_double_input).
+    const Vec3d sz = f.bb.size();
+    f.mean_size    = (sz.x() + sz.y() + sz.z()) / 9.0;
+    return f;
+}
+
+// The cross-section of the object's solid parts with the cut plane, in plane coordinates
+// [u, v] (scaled): every part mesh taken to the plane frame like process_volume_cut
+// (CutUtils.cpp) and sliced at z = 0.
+static ExPolygons sw_slicer_cut_section(const ModelObject* mo, int inst, const SwSlicerCutFrame& f)
+{
+    const Transform3d inverse_cut = f.cut_matrix.inverse();
+    const Transform3d instance_matrix =
+        mo->instances[static_cast<size_t>(inst)]->get_transformation().get_matrix_no_offset();
+    ExPolygons all;
+    for (const ModelVolume* v : mo->volumes) {
+        if (!v->is_model_part() || v->mesh().empty())
+            continue;
+        TriangleMesh mesh(v->mesh());
+        mesh.transform(inverse_cut * instance_matrix * v->get_matrix(), true);
+        std::vector<ExPolygons> slices = slice_mesh_ex(mesh.its, {0.f});
+        if (!slices.empty())
+            append(all, std::move(slices.front()));
+    }
+    return union_ex(all);
+}
+
+// The connector settings of sw_SlicerCut, validated against the cut tool's limits.
+struct SwSlicerConnectorSpec
+{
+    CutConnectorAttributes attribs;
+    float                  size       = 2.5f; // diameter (mm)
+    float                  depth      = 3.f;  // mm
+    float                  size_tol   = 0.f;  // mm (diameter)
+    float                  depth_tol  = 0.1f; // mm
+    float                  angle_rad  = 0.f;  // rotation around the connector axis
+    float                  snap_bulge = 0.15f;
+    float                  snap_space = 0.3f;
+    std::vector<Vec2d>     uv;                // positions on the cut plane (mm)
+    bool                   automatic  = false;
+};
+
+// Local copy of GLGizmoCut3D::get_connector_mesh (a gizmo member).
+static indexed_triangle_set sw_slicer_connector_mesh(const CutConnectorAttributes& a, float snap_space, float snap_bulge)
+{
+    int sectorCount{1};
+    switch (CutConnectorShape(a.shape)) {
+    case CutConnectorShape::Triangle: sectorCount = 3; break;
+    case CutConnectorShape::Square:   sectorCount = 4; break;
+    case CutConnectorShape::Circle:   sectorCount = 360; break;
+    case CutConnectorShape::Hexagon:  sectorCount = 6; break;
+    default: break;
+    }
+    if (a.type == CutConnectorType::Snap)
+        return its_make_snap(1.0, 1.0, snap_space, snap_bulge);
+    if (a.style == CutConnectorStyle::Prism)
+        return its_make_cylinder(1.0, 1.0, (2 * PI / sectorCount));
+    if (a.type == CutConnectorType::Plug)
+        return its_make_frustum(1.0, 1.0, (2 * PI / sectorCount));
+    return its_make_frustum_dowel(1.0, 1.0, sectorCount);
+}
+
+static std::string sw_slicer_fmt_uv(const Vec2d& p)
+{
+    return "[" + sw_slicer_fmt_mm(p.x()) + ", " + sw_slicer_fmt_mm(p.y()) + "]";
+}
+
+static bool sw_slicer_section_contains(const ExPolygons& section, const Vec2d& p)
+{
+    const Point pt(scale_(p.x()), scale_(p.y()));
+    for (const ExPolygon& ex : section)
+        if (ex.contains(pt))
+            return true;
+    return false;
+}
+
+// Like GLGizmoCut3D::is_conflict_for_connector / is_outside_of_cut_contour, but against the
+// computed section instead of the gizmo's object clipper: the center and the bottom outline
+// (3/4/6 points, 60 for a circle) inside the section, the connector's bounding box inside the
+// object's bounding box, and no two connectors closer than the sum of their radii.
+static void sw_slicer_check_connectors(const SwSlicerConnectorSpec& s, const SwSlicerCutFrame& f, const ExPolygons& section)
+{
+    const CutConnectorShape shape       = CutConnectorShape(s.attribs.shape);
+    const int               sectorCount = shape == CutConnectorShape::Triangle ? 3 :
+                                          shape == CutConnectorShape::Square   ? 4 :
+                                          shape == CutConnectorShape::Circle   ? 60 :
+                                          shape == CutConnectorShape::Hexagon  ? 6 : 1;
+    const float              radius = 0.5f * s.size;
+    const BoundingBoxf3      mesh_bb =
+        TriangleMesh(sw_slicer_connector_mesh(s.attribs, s.snap_space, s.snap_bulge)).bounding_box();
+    for (size_t i = 0; i < s.uv.size(); ++i) {
+        const Vec2d& p       = s.uv[i];
+        bool         outside = !sw_slicer_section_contains(section, p);
+        const float  fa      = 2 * PI / sectorCount;
+        const Vec2f  vec(0.f, radius);
+        for (float angle = 0; !outside && angle < 2.f * PI; angle += fa) {
+            const Vec2f q = Eigen::Rotation2Df(angle) * vec;
+            outside       = !sw_slicer_section_contains(section, p + q.cast<double>());
+        }
+        if (outside)
+            throw std::runtime_error("connector " + std::to_string(i) + " at " + sw_slicer_fmt_uv(p) + " lies outside the cut section");
+        const Vec3d       world = f.center + f.R * Vec3d(p.x(), p.y(), 0.0);
+        const Transform3d m     = Slic3r::Geometry::translation_transform(world) * f.R *
+                              Slic3r::Geometry::scale_transform(Vec3d(radius, radius, s.depth));
+        if (!f.bb.contains(mesh_bb.transformed(m)))
+            throw std::runtime_error("connector " + std::to_string(i) + " sticks out of the object");
+    }
+    for (size_t i = 0; i < s.uv.size(); ++i)
+        for (size_t j = i + 1; j < s.uv.size(); ++j)
+            if ((s.uv[i] - s.uv[j]).norm() < double(s.size))
+                throw std::runtime_error("connectors " + std::to_string(i) + " and " + std::to_string(j) + " overlap");
+}
+
+// Automatic placement (API extension): n points evenly along the long axis of the largest
+// section part, through its centroid, at max(size, 15 % of the length) from the edges.
+// Returns an empty list if there is no room.
+static std::vector<Vec2d> sw_slicer_connector_layout(const ExPolygons& section, int n, double size)
+{
+    std::vector<Vec2d> out;
+    const ExPolygon*   best = nullptr;
+    for (const ExPolygon& ex : section)
+        if (best == nullptr || std::abs(ex.area()) > std::abs(best->area()))
+            best = &ex;
+    if (best == nullptr || n < 1)
+        return out;
+    const BoundingBox bb = get_extents(*best);
+    const Vec2d       mn(unscale<double>(bb.min.x()), unscale<double>(bb.min.y()));
+    const Vec2d       mx(unscale<double>(bb.max.x()), unscale<double>(bb.max.y()));
+    const Point       c   = best->contour.centroid();
+    const Vec2d       cen(unscale<double>(c.x()), unscale<double>(c.y()));
+    const int         ax  = (mx.x() - mn.x() >= mx.y() - mn.y()) ? 0 : 1;
+    if (n == 1) {
+        out.push_back(cen);
+        return out;
+    }
+    const double length = mx[ax] - mn[ax];
+    const double margin = std::max(size, 0.15 * length);
+    const double from = mn[ax] + margin, to = mx[ax] - margin;
+    if (!(to > from))
+        return out;
+    for (int i = 0; i < n; ++i) {
+        Vec2d p = cen;
+        p[ax]   = from + (to - from) * double(i) / double(n - 1);
+        out.push_back(p);
+    }
+    return out;
+}
+
+// Parse and validate the 'connectors' object of sw_SlicerCut (limits of the cut tool's
+// connector panel, render_connectors_input_window). Positions are checked as well.
+static SwSlicerConnectorSpec sw_slicer_parse_connectors(const json& c, const SwSlicerCutFrame& f, const ExPolygons& section)
+{
+    if (!c.is_object())
+        throw std::runtime_error("'connectors' must be an object");
+    static const std::set<std::string> known = {"type", "style", "shape", "size", "depth", "size_tolerance", "depth_tolerance",
+                                                "rotation", "snap_bulge", "snap_space", "positions", "auto_count"};
+    for (auto it = c.begin(); it != c.end(); ++it)
+        if (known.count(it.key()) == 0)
+            throw std::runtime_error("unknown field 'connectors." + it.key() + "'");
+    auto get_str = [&c](const char* key) -> std::optional<std::string> {
+        if (!sw_slicer_has_param(c, key))
+            return std::nullopt;
+        if (!c.at(key).is_string())
+            throw std::runtime_error(std::string("connectors.") + key + " must be a string");
+        return c.at(key).get<std::string>();
+    };
+    // Number within [lo, hi]; 'what' describes the limit in the error.
+    auto get_num = [&c](const char* key, double def, double lo, double hi, const std::string& what) {
+        double v = def;
+        if (!sw_slicer_get_number(c, key, def, v) || v < lo || v > hi)
+            throw std::runtime_error(std::string("connectors.") + key + " must be between " + what);
+        return v;
+    };
+
+    SwSlicerConnectorSpec s;
+    const std::string type = get_str("type").value_or("plug");
+    if (type == "plug")       s.attribs.type = CutConnectorType::Plug;
+    else if (type == "dowel") s.attribs.type = CutConnectorType::Dowel;
+    else if (type == "snap")  s.attribs.type = CutConnectorType::Snap;
+    else throw std::runtime_error("connectors.type must be plug, dowel or snap");
+
+    // Style: only plugs choose (dowel = prism; snap ignores it), like the panel.
+    s.attribs.style = CutConnectorStyle::Prism;
+    if (const std::optional<std::string> style = get_str("style")) {
+        if (s.attribs.type != CutConnectorType::Plug)
+            throw std::runtime_error("connectors.style can only be chosen for plugs");
+        if (*style == "prism")        s.attribs.style = CutConnectorStyle::Prism;
+        else if (*style == "frustum") s.attribs.style = CutConnectorStyle::Frustum;
+        else throw std::runtime_error("connectors.style must be prism or frustum");
+    }
+    s.attribs.shape = CutConnectorShape::Circle;
+    if (const std::optional<std::string> shape = get_str("shape")) {
+        if (*shape == "triangle")     s.attribs.shape = CutConnectorShape::Triangle;
+        else if (*shape == "square")  s.attribs.shape = CutConnectorShape::Square;
+        else if (*shape == "hexagon") s.attribs.shape = CutConnectorShape::Hexagon;
+        else if (*shape == "circle")  s.attribs.shape = CutConnectorShape::Circle;
+        else throw std::runtime_error("connectors.shape must be triangle, square, hexagon or circle");
+        if (s.attribs.type == CutConnectorType::Snap && s.attribs.shape != CutConnectorShape::Circle)
+            throw std::runtime_error("connectors.shape must be circle for snaps");
+    }
+
+    const double mean = f.mean_size;
+    if (mean < 1.0)
+        throw std::runtime_error("the object is too small for connectors (the cut tool's limit is " + sw_slicer_fmt_mm(mean) + " mm)");
+    const std::string size_range = "1 and " + sw_slicer_fmt_mm(mean) + " mm (the cut tool's limit for this object)";
+    const std::string tol_range  = "0 and " + sw_slicer_fmt_mm(0.5 * mean) + " mm (the cut tool's limit for this object)";
+    s.size      = static_cast<float>(get_num("size", 2.5, 1.0, mean, size_range));
+    s.depth     = static_cast<float>(get_num("depth", 3.0, 1.0, mean, size_range));
+    s.size_tol  = static_cast<float>(get_num("size_tolerance", 0.0, 0.0, 0.5 * mean, tol_range));
+    s.depth_tol = static_cast<float>(get_num("depth_tolerance", 0.1, 0.0, 0.5 * mean, tol_range));
+    s.angle_rad = static_cast<float>(get_num("rotation", 0.0, 0.0, 180.0, "0 and 180 degrees") * PI / 180.0);
+    if (s.attribs.type == CutConnectorType::Snap) {
+        if (s.depth < s.size)
+            throw std::runtime_error(sw_slicer_has_param(c, "depth") ?
+                                         std::string("connectors.depth must be at least the size for snaps") :
+                                         "connectors.depth must be at least the size for snaps (the default depth is 3 mm; specify depth)");
+        s.snap_space = static_cast<float>(get_num("snap_space", 0.3, 0.10, 0.50, "0.10 and 0.50"));
+        // The default bulge never exceeds a smaller given space.
+        s.snap_bulge = static_cast<float>(get_num("snap_bulge", std::min(0.15, double(s.snap_space)), 0.05, s.snap_space,
+                                                  "0.05 and snap_space (" + sw_slicer_fmt_mm(s.snap_space) + ")"));
+    } else {
+        for (const char* key : {"snap_bulge", "snap_space"})
+            if (sw_slicer_has_param(c, key))
+                throw std::runtime_error(std::string("connectors.") + key + " is only for snaps");
+    }
+
+    const bool has_pos  = sw_slicer_has_param(c, "positions");
+    const bool has_auto = sw_slicer_has_param(c, "auto_count");
+    if (has_pos == has_auto)
+        throw std::runtime_error("specify connectors.positions or connectors.auto_count");
+    if (has_pos) {
+        const json& arr = c.at("positions");
+        if (!arr.is_array() || arr.empty())
+            throw std::runtime_error("connectors.positions must be a non-empty list of [u, v] (mm)");
+        if (arr.size() > 32)
+            throw std::runtime_error("at most 32 connectors");
+        for (const json& p : arr) {
+            if (!p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number() ||
+                !std::isfinite(p[0].get<double>()) || !std::isfinite(p[1].get<double>()))
+                throw std::runtime_error("connectors.positions must be a non-empty list of [u, v] (mm)");
+            s.uv.emplace_back(p[0].get<double>(), p[1].get<double>());
+        }
+        sw_slicer_check_connectors(s, f, section);
+    } else {
+        const json& j = c.at("auto_count");
+        if (!j.is_number_integer() || j.get<long long>() < 1 || j.get<long long>() > 8)
+            throw std::runtime_error("connectors.auto_count must be an integer between 1 and 8");
+        const int n = j.get<int>();
+        s.automatic = true;
+        s.uv        = sw_slicer_connector_layout(section, n, s.size);
+        const std::string err = "automatic placement failed for " + std::to_string(n) +
+                                " connectors; give positions (see sw_SlicerCutSection)";
+        if (static_cast<int>(s.uv.size()) != n)
+            throw std::runtime_error(err);
+        try {
+            sw_slicer_check_connectors(s, f, section);
+        } catch (const std::exception&) {
+            throw std::runtime_error(err);
+        }
+    }
+    return s;
+}
+
+// RAII: remove the connector volumes added to 'mo' (from index n_volumes) unless disarmed.
+// The volumes are removed directly instead of with ModelObject::delete_volume, which would
+// fold the transformation of a single remaining volume into the instances.
+struct SwSlicerConnectorRollback
+{
+    ModelObject* mo;
+    size_t       n_volumes;
+    bool         armed = true;
+    SwSlicerConnectorRollback(ModelObject* o) : mo(o), n_volumes(o->volumes.size()) {}
+    ~SwSlicerConnectorRollback()
+    {
+        if (!armed || mo->volumes.size() <= n_volumes)
+            return;
+        for (size_t i = mo->volumes.size(); i > n_volumes; --i) {
+            delete mo->volumes[i - 1];
+            mo->volumes.erase(mo->volumes.begin() + (i - 1));
+        }
+        mo->cut_connectors.clear(); // defensive: the API never fills cut_connectors
+        mo->invalidate_bounding_box();
+        Slic3r::save_object_mesh(*mo);
+    }
+    SwSlicerConnectorRollback(const SwSlicerConnectorRollback&)            = delete;
+    SwSlicerConnectorRollback& operator=(const SwSlicerConnectorRollback&) = delete;
+};
+
+// Same steps as GLGizmoCut3D::apply_connectors_in_model + apply_cut_connectors (gizmo members):
+// every connector gets the plane rotation; a prism dowel gets twice the depth (it is cut into
+// two halves); a plug/snap is shifted by half its depth along the cut normal; then each
+// connector becomes a negative volume with cut info, named "Connector-<n>". Returns the
+// number of dowels.
+static int sw_slicer_apply_connectors(ModelObject* mo, const SwSlicerConnectorSpec& s, const SwSlicerCutFrame& f, int inst)
+{
+    using namespace Slic3r::Geometry;
+    const Vec3d   offset = mo->instances[static_cast<size_t>(inst)]->get_offset();
+    CutConnectors connectors;
+    int           dowels_count = 0;
+    for (const Vec2d& p : s.uv) {
+        // Point on the cut plane in world orientation minus the instance offset, like
+        // GLGizmoCut3D::unproject_on_cut_plane.
+        CutConnector c(f.center + f.R * Vec3d(p.x(), p.y(), 0.0) - offset, f.R, 0.5f * s.size, s.depth, 0.5f * s.size_tol,
+                       s.depth_tol, s.angle_rad, s.attribs);
+        if (c.attribs.type == CutConnectorType::Dowel) {
+            if (c.attribs.style == CutConnectorStyle::Prism)
+                c.height *= 2;
+            dowels_count++;
+        } else {
+            // shift of the connector center regarding to the position on the cut plane
+            c.pos += f.normal * 0.5 * double(c.height);
+        }
+        connectors.push_back(c);
+    }
+
+    const std::string connector_name = _u8L("Connector");
+    size_t            connector_id   = mo->cut_id.connectors_cnt();
+    for (const CutConnector& connector : connectors) {
+        TriangleMesh mesh = TriangleMesh(sw_slicer_connector_mesh(connector.attribs, s.snap_space, s.snap_bulge));
+        // Mesh will be centered when loading.
+        ModelVolume* new_volume = mo->add_volume(std::move(mesh), ModelVolumeType::NEGATIVE_VOLUME);
+        new_volume->set_transformation(translation_transform(connector.pos) * connector.rotation_m *
+                                       rotation_transform(-connector.z_angle * Vec3d::UnitZ()) *
+                                       scale_transform(Vec3f(connector.radius, connector.radius, connector.height).cast<double>()));
+        new_volume->cut_info = {connector.attribs.type, connector.radius_tolerance, connector.height_tolerance};
+        new_volume->name     = connector_name + "-" + std::to_string(++connector_id);
+    }
+    mo->cut_id.increase_connectors_cnt(connectors.size());
+    return dowels_count;
+}
+
+static const char* sw_slicer_connector_type_name(CutConnectorType t)
+{
+    return t == CutConnectorType::Dowel ? "dowel" : t == CutConnectorType::Snap ? "snap" : "plug";
+}
+
 // Cut an object with an (optionally tilted) plane at height z, or with a groove
 // (tongue-and-groove). Directly through libslic3r/CutUtils (Cut) + apply_cut_object_to_model,
 // without the gizmo and without dialogs (the gizmo's Windows repair prompt becomes a note).
@@ -1745,6 +2111,18 @@ void SSWCP_SliceProject_Instance::sw_SlicerCut()
         bool       place_on_cut_upper = sw_slicer_get_bool(m_param_data, "place_on_cut_upper", true);
         bool       place_on_cut_lower = sw_slicer_get_bool(m_param_data, "place_on_cut_lower", false);
         const bool as_parts           = sw_slicer_get_bool(m_param_data, "as_parts", false);
+
+        // Connectors (plug/dowel/snap): only with a planar cut, and like the cut tool they keep
+        // both halves as linked cut objects (never as parts).
+        const bool has_connectors = sw_slicer_has_param(m_param_data, "connectors");
+        if (has_connectors) {
+            if (!planar)
+                throw std::runtime_error("connectors are only possible with a planar cut");
+            if (as_parts)
+                throw std::runtime_error("connectors cannot be combined with as_parts");
+            if (!keep_upper || !keep_lower)
+                throw std::runtime_error("connectors keep both halves (keep_upper and keep_lower must be true)");
+        }
 
         // Normalize the options like the gizmo UI does (GLGizmoCut3D::render_cut_plane_input_window).
         std::vector<std::string> notes;
@@ -1830,6 +2208,9 @@ void SSWCP_SliceProject_Instance::sw_SlicerCut()
 
         sw_slicer_require_free_gizmo();
         sw_slicer_require_idle();
+        // Connectors add volumes to the object before cutting.
+        if (has_connectors)
+            sw_slicer_require_not_slicing();
         const int obj  = sw_slicer_resolve_object(m_param_data);
         const int inst = sw_slicer_resolve_instance(m_param_data);
         if (inst < 0)
@@ -1870,11 +2251,21 @@ void SSWCP_SliceProject_Instance::sw_SlicerCut()
             }
         }
 
-        // Cut matrix exactly like GLGizmoCut3D::get_cut_matrix(): plane center (world) minus the
-        // instance offset, times the rotation. sla_shift_z is 0 for FFF.
-        const Transform3d R = Slic3r::Geometry::rotation_transform(rot_deg * (PI / 180.0));
-        const Vec3d       center(bb.center().x(), bb.center().y(), z);
-        const Transform3d cut_matrix = Slic3r::Geometry::translation_transform(center - mo->instances[inst]->get_offset()) * R;
+        const SwSlicerCutFrame frame      = sw_slicer_cut_frame(mo, inst, z, rot_deg);
+        const Transform3d&     R          = frame.R;
+        const Transform3d&     cut_matrix = frame.cut_matrix;
+
+        // Connectors: everything is validated before the snapshot (nothing changed on an error).
+        SwSlicerConnectorSpec spec;
+        int                   dowels = 0;
+        if (has_connectors) {
+            const ExPolygons section = sw_slicer_cut_section(mo, inst, frame);
+            if (section.empty())
+                throw std::runtime_error("the cut plane does not cross the object");
+            spec = sw_slicer_parse_connectors(m_param_data.at("connectors"), frame, section);
+            if (spec.attribs.type == CutConnectorType::Dowel)
+                dowels = static_cast<int>(spec.uv.size());
+        }
 
         ModelObjectCutAttributes attrs = only_if(keep_upper, ModelObjectCutAttribute::KeepUpper) |
                                          only_if(keep_lower, ModelObjectCutAttribute::KeepLower) |
@@ -1882,19 +2273,21 @@ void SSWCP_SliceProject_Instance::sw_SlicerCut()
                                          only_if(place_on_cut_upper, ModelObjectCutAttribute::PlaceOnCutUpper) |
                                          only_if(place_on_cut_lower, ModelObjectCutAttribute::PlaceOnCutLower) |
                                          only_if(flip_upper, ModelObjectCutAttribute::FlipUpper) |
-                                         only_if(flip_lower, ModelObjectCutAttribute::FlipLower);
+                                         only_if(flip_lower, ModelObjectCutAttribute::FlipLower) |
+                                         only_if(dowels > 0, ModelObjectCutAttribute::CreateDowels);
         // Planar cut: InvalidateCutInfo, so the halves do not become linked cut objects
         // (that would block splitting/deleting later). Like the gizmo, only if the object is
-        // not a cut object yet; an existing cut object keeps its link consistent.
-        if (planar && mo->cut_id.id().invalid())
+        // not a cut object yet; an existing cut object keeps its link consistent. With
+        // connectors the halves stay linked (GLGizmoCut3D::perform_cut).
+        if (planar && !has_connectors && mo->cut_id.id().invalid())
             attrs = attrs | ModelObjectCutAttribute::InvalidateCutInfo;
 
         if (!planar && as_parts)
             notes.push_back("as_parts is not supported for a groove cut: two separate objects were created");
 
         // Expected number of resulting objects; fewer means the cut (partly) misses the
-        // object: Cut::post_process silently drops empty halves.
-        const size_t expected = (keep_upper && keep_lower && !(planar && as_parts)) ? 2 : 1;
+        // object: Cut::post_process silently drops empty halves. Dowels become own objects.
+        const size_t expected = ((keep_upper && keep_lower && !(planar && as_parts)) ? 2 : 1) + static_cast<size_t>(dowels);
 
         const size_t n_before = model.objects.size();
         {
@@ -1906,7 +2299,15 @@ void SSWCP_SliceProject_Instance::sw_SlicerCut()
             // Restore the cut_id of 'mo' if something goes wrong before apply (also on an
             // exception in perform_*). Disarmed right before apply: apply deletes 'mo'.
             SwSlicerCutIdRestore cut_id_restore(mo->cut_id);
-            sw_slicer_update_object_cut_id(mo->cut_id, attrs);
+            // Connectors are added as volumes of 'mo' before Cut copies it (like the gizmo);
+            // removed again on an error before apply.
+            SwSlicerConnectorRollback connector_rollback(mo);
+            if (has_connectors) {
+                const int applied = sw_slicer_apply_connectors(mo, spec, frame, inst);
+                if (applied != dowels)
+                    throw std::runtime_error("internal error: unexpected number of dowels");
+            }
+            sw_slicer_update_object_cut_id(mo->cut_id, attrs, dowels);
 
             // 'cut' must stay alive as long as 'objs' is used: the objects are owned by the
             // Model inside Cut (its destructor cleans them up). apply_cut_object_to_model()
@@ -1928,9 +2329,23 @@ void SSWCP_SliceProject_Instance::sw_SlicerCut()
                     }
                 }
             }
+            // Replaces the gizmo's WarningDialog of check_objects_after_cut: same check, as a note.
+            if (has_connectors) {
+                for (const ModelObject* o : objs) {
+                    std::vector<std::string> names;
+                    for (const ModelVolume* v : o->volumes)
+                        if (v->cut_info.is_connector)
+                            names.push_back(v->name);
+                    const size_t count = names.size();
+                    sort_remove_duplicates(names);
+                    if (count != names.size())
+                        notes.push_back(o->name + ": duplicated connectors; some may be missing in the slicing result");
+                }
+            }
 
             // Save cut_id before apply: apply deletes 'mo' (the pointer is invalid afterwards).
             const CutObjectBase cut_id = mo->cut_id;
+            connector_rollback.armed   = false;
             cut_id_restore.armed       = false; // 'mo' is about to be deleted; do not touch it anymore
             plater->apply_cut_object_to_model(static_cast<size_t>(obj), objs);
             mo = nullptr;
@@ -1944,9 +2359,25 @@ void SSWCP_SliceProject_Instance::sw_SlicerCut()
         // The original was removed; the new objects are appended at the end.
         const size_t n_after = model.objects.size();
         json objects = json::array();
-        for (size_t i = n_before - 1; i < n_after; ++i)
+        json dowel_objects = json::array();
+        for (size_t i = n_before - 1; i < n_after; ++i) {
             objects.push_back(static_cast<int>(i));
+            // A dowel object holds exactly one volume: the connector (Cut::perform_with_plane).
+            const ModelObject* o = model.objects[i];
+            if (has_connectors && o->volumes.size() == 1 && o->volumes[0]->cut_info.is_connector)
+                dowel_objects.push_back(static_cast<int>(i));
+        }
         m_res_data["objects"] = objects;
+        if (has_connectors) {
+            json positions = json::array();
+            for (const Vec2d& p : spec.uv)
+                positions.push_back(json::array({p.x(), p.y()}));
+            m_res_data["connectors"] = {{"count", static_cast<int>(spec.uv.size())},
+                                        {"type", sw_slicer_connector_type_name(spec.attribs.type)},
+                                        {"positions", positions},
+                                        {"dowel_objects", dowel_objects}};
+            notes.insert(notes.begin(), "connectors keep both halves as linked cut parts (like the cut tool)");
+        }
         m_res_data["notes"]   = notes;
         send_to_js();
         finish_job();
@@ -1985,9 +2416,49 @@ void SSWCP_SliceProject_Instance::sw_SlicerLayerHeight()
         }
         const std::string action = (m_param_data.count("action") && m_param_data.at("action").is_string()) ?
                                        m_param_data.at("action").get<std::string>() : std::string();
-        if (action != "adaptive" && action != "smooth" && action != "reset") {
-            handle_general_fail(-1, wxString::FromUTF8("action must be 'adaptive', 'smooth' or 'reset'"));
+        if (action != "adaptive" && action != "smooth" && action != "reset" && action != "adjust") {
+            handle_general_fail(-1, wxString::FromUTF8("action must be 'adaptive', 'smooth', 'reset' or 'adjust'"));
             return;
+        }
+        // action "adjust": like a click on the layer height bar of the editor (GLCanvas3D, mouse
+        // actions: left = decrease, right = increase, shift+left = back to the default height,
+        // shift+right = smooth). The strength 'delta' is used by all four modes.
+        LayerHeightEditActionType adjust_mode  = LAYER_HEIGHT_EDIT_ACTION_INCREASE;
+        std::string               adjust_name;
+        double                    adjust_z     = 0.0;
+        double                    adjust_delta = 0.05;
+        double                    adjust_band  = 2.0;
+        if (action == "adjust") {
+            adjust_name = (m_param_data.count("mode") && m_param_data.at("mode").is_string()) ?
+                              m_param_data.at("mode").get<std::string>() : std::string();
+            if (adjust_name == "increase")      adjust_mode = LAYER_HEIGHT_EDIT_ACTION_INCREASE;
+            else if (adjust_name == "decrease") adjust_mode = LAYER_HEIGHT_EDIT_ACTION_DECREASE;
+            else if (adjust_name == "reset")    adjust_mode = LAYER_HEIGHT_EDIT_ACTION_REDUCE;
+            else if (adjust_name == "smooth")   adjust_mode = LAYER_HEIGHT_EDIT_ACTION_SMOOTH;
+            else {
+                handle_general_fail(-1, wxString::FromUTF8("mode must be 'increase', 'decrease', 'reset' or 'smooth'"));
+                return;
+            }
+            if (!m_param_data.count("z") || m_param_data.at("z").is_null() ||
+                !sw_slicer_get_number(m_param_data, "z", 0.0, adjust_z)) {
+                handle_general_fail(-1, wxString::FromUTF8("specify 'z' (mm, a finite number)"));
+                return;
+            }
+            // Same range as the mouse wheel on the bar (GLCanvas3D::on_mouse_wheel).
+            if (!sw_slicer_get_number(m_param_data, "band", 2.0, adjust_band) || adjust_band < 1.5 || adjust_band > 10.0) {
+                handle_general_fail(-1, wxString::FromUTF8("band must be a number between 1.5 and 10 (mm)"));
+                return;
+            }
+            if (!sw_slicer_get_number(m_param_data, "delta", 0.05, adjust_delta) || adjust_delta < 0.001) {
+                handle_general_fail(-1, wxString::FromUTF8("delta must be a number of at least 0.001 (mm)"));
+                return;
+            }
+        } else {
+            for (const char* key : {"z", "mode", "delta", "band"})
+                if (sw_slicer_has_param(m_param_data, key)) {
+                    handle_general_fail(-1, wxString::FromUTF8((std::string("'") + key + "' is only for action 'adjust'").c_str()));
+                    return;
+                }
         }
         double quality = 0.5;
         if (!sw_slicer_get_number(m_param_data, "quality", 0.5, quality) || quality < 0.0 || quality > 1.0) {
@@ -2030,6 +2501,23 @@ void SSWCP_SliceProject_Instance::sw_SlicerLayerHeight()
         std::vector<std::string> notes;
         std::vector<coordf_t>    result; // the profile the slicer actually uses
         bool                     changed = false;
+        // Layer height at z in a profile [z0, h0, z1, h1, ...], linear like
+        // adjust_layer_height_profile (Slicing.cpp).
+        auto height_at = [](const std::vector<coordf_t>& p, double zz, double def) {
+            double h = def;
+            for (size_t i = 0; i + 1 < p.size(); i += 2) {
+                if (i + 2 >= p.size()) {
+                    h = p[i + 1];
+                    break;
+                }
+                if (p[i + 2] > zz) {
+                    h = (p[i + 2] > p[i]) ? lerp(double(p[i + 1]), double(p[i + 3]), (zz - p[i]) / (p[i + 2] - p[i])) : double(p[i + 1]);
+                    break;
+                }
+            }
+            return h;
+        };
+        double height_before = 0.0, height_after = 0.0;
         if (action == "reset") {
             changed = !mo->layer_height_profile.empty();
             if (!changed)
@@ -2040,8 +2528,53 @@ void SSWCP_SliceProject_Instance::sw_SlicerLayerHeight()
                                                                          float(mo->max_z()),
                                                                          plater->fff_print().shrinkage_compensation());
             std::vector<coordf_t> prof;
+            std::vector<coordf_t> prof_before; // adjust: the current (completed) profile
             if (action == "adaptive") {
                 prof = layer_height_profile_adaptive(sp, *mo, float(quality));
+            } else if (action == "adjust") {
+                // Same z range in which adjust_layer_height_profile works (above a fixed first layer).
+                const double z_lo = sp.first_object_layer_height_fixed() ? sp.first_object_layer_height : 0.0;
+                const double z_hi = sp.object_print_z_uncompensated_height();
+                if (adjust_z < z_lo || adjust_z > z_hi) {
+                    const std::string err = "z must be between " + sw_slicer_fmt_mm(z_lo) + " and " + sw_slicer_fmt_mm(z_hi) +
+                                            " mm (within the object, above the fixed first layer)";
+                    handle_general_fail(-1, wxString::FromUTF8(err.c_str()));
+                    return;
+                }
+                // Without a fixed first layer (e.g. with a raft) the band must not reach z = 0:
+                // adjust_layer_height_profile then steps before the first profile point (index
+                // underflow, Slicing.cpp "idx -= 2"). The upper side is safe: the profile always
+                // ends at z_hi and the resampling stops there.
+                if (!sp.first_object_layer_height_fixed() && adjust_z - 0.5 * adjust_band <= EPSILON) {
+                    const std::string err = "without a fixed first layer (raft), z must be above band/2 (" +
+                                            sw_slicer_fmt_mm(0.5 * adjust_band) + " mm)";
+                    handle_general_fail(-1, wxString::FromUTF8(err.c_str()));
+                    return;
+                }
+                const double max_delta = sp.max_layer_height - sp.min_layer_height;
+                if (adjust_delta > max_delta) {
+                    const std::string err = "delta must be between 0.001 and " + sw_slicer_fmt_mm(max_delta) +
+                                            " mm (max_layer_height - min_layer_height)";
+                    handle_general_fail(-1, wxString::FromUTF8(err.c_str()));
+                    return;
+                }
+                prof = mo->layer_height_profile.get();
+                PrintObject::update_layer_height_profile(*mo, sp, prof);
+                // adjust_layer_height_profile expects a complete profile ending at z_hi (asserts only).
+                if (prof.size() < 4 || std::abs(prof[prof.size() - 2] - z_hi) > EPSILON) {
+                    handle_general_fail(-1, wxString::FromUTF8("the slicer rejects this layer height profile (Z shrinkage compensation != 100%?)"));
+                    return;
+                }
+                prof_before   = prof;
+                height_before = height_at(prof, adjust_z, sp.layer_height);
+                // adjust_layer_height_profile silently does nothing inside a height range.
+                for (const auto& [range, options] : mo->layer_config_ranges) {
+                    if (adjust_z >= range.first - height_before && adjust_z <= range.second + height_before) {
+                        handle_general_fail(-1, wxString::FromUTF8("z lies in a height range; the layer height there comes from the range"));
+                        return;
+                    }
+                }
+                adjust_layer_height_profile(*mo, sp, prof, adjust_z, adjust_delta, adjust_band, adjust_mode);
             } else {
                 // Smoothing works on the current profile. update_layer_height_profile() fills an
                 // empty profile with the default profile and rejects a profile that no longer
@@ -2060,10 +2593,19 @@ void SSWCP_SliceProject_Instance::sw_SlicerLayerHeight()
                 handle_general_fail(-1, wxString::FromUTF8("the slicer rejects this layer height profile (Z shrinkage compensation != 100%?)"));
                 return;
             }
-            result  = check;
-            changed = (mo->layer_height_profile.get() != result);
-            if (!changed)
-                notes.push_back("the profile was already identical; nothing changed");
+            result = check;
+            if (action == "adjust") {
+                height_after = height_at(result, adjust_z, sp.layer_height);
+                // Compared with the completed current profile: an empty profile would
+                // otherwise count as a change without any effect.
+                changed = (result != prof_before);
+                if (!changed)
+                    notes.push_back("the layer height at z cannot change further in this mode; nothing changed");
+            } else {
+                changed = (mo->layer_height_profile.get() != result);
+                if (!changed)
+                    notes.push_back("the profile was already identical; nothing changed");
+            }
         }
 
         if (changed) {
@@ -2098,6 +2640,12 @@ void SSWCP_SliceProject_Instance::sw_SlicerLayerHeight()
         m_res_data["points"]     = static_cast<int>(result.size() / 2);
         m_res_data["min_height"] = have_h ? json(min_h) : json(nullptr);
         m_res_data["max_height"] = have_h ? json(max_h) : json(nullptr);
+        if (action == "adjust") {
+            m_res_data["z"]                 = adjust_z;
+            m_res_data["mode"]              = adjust_name;
+            m_res_data["height_at_z_before"] = height_before;
+            m_res_data["height_at_z_after"]  = height_after;
+        }
         m_res_data["notes"]      = notes;
         send_to_js();
         finish_job();
@@ -2826,6 +3374,12 @@ static std::optional<wxFont> sw_slicer_get_font(const json& params)
     return font;
 }
 
+// Limits of the advanced text options (static 'limits' in GLGizmoEmboss.cpp): char/line gap in
+// font points; boldness and skew use the gizmo's slider range (stricter than its value range).
+static constexpr int    SW_SLICER_TEXT_GAP_LIMIT      = 20000;
+static constexpr double SW_SLICER_TEXT_BOLDNESS_LIMIT = 0.5;
+static constexpr double SW_SLICER_TEXT_SKEW_LIMIT     = 1.0;
+
 // The text fields that can be specified for AddText/EditText.
 struct SwSlicerTextStyle
 {
@@ -2833,40 +3387,203 @@ struct SwSlicerTextStyle
     std::optional<double>      height_mm;
     std::optional<double>      depth_mm;
     std::optional<wxFont>      font;
+    // Advanced options (FontProp / EmbossProjection). The two align parts are separate, so a
+    // caller can change one of them and keep the other.
+    std::optional<bool>                      per_glyph;
+    std::optional<bool>                      use_surface;
+    std::optional<FontProp::HorizontalAlign> align_h;
+    std::optional<FontProp::VerticalAlign>   align_v;
+    std::optional<int>                       char_gap;
+    std::optional<int>                       line_gap;
+    std::optional<float>                     boldness;
+    std::optional<float>                     skew;
 
-    bool has_style() const { return height_mm.has_value() || depth_mm.has_value() || font.has_value(); }
+    bool has_style() const
+    {
+        return height_mm.has_value() || depth_mm.has_value() || font.has_value() || per_glyph.has_value() ||
+               use_surface.has_value() || align_h.has_value() || align_v.has_value() || char_gap.has_value() ||
+               line_gap.has_value() || boldness.has_value() || skew.has_value();
+    }
 };
+
+// Optional bool; throws if it is present but not a bool.
+static std::optional<bool> sw_slicer_get_opt_bool(const json& params, const char* key)
+{
+    if (!sw_slicer_has_param(params, key))
+        return std::nullopt;
+    if (!params.at(key).is_boolean())
+        throw std::runtime_error(std::string("'") + key + "' must be true or false");
+    return params.at(key).get<bool>();
+}
+
+// Optional gap in font points (integer within the gizmo limits).
+static std::optional<int> sw_slicer_get_text_gap(const json& params, const char* key)
+{
+    if (!sw_slicer_has_param(params, key))
+        return std::nullopt;
+    const json& j = params.at(key);
+    if (!j.is_number_integer() || j.get<long long>() < -SW_SLICER_TEXT_GAP_LIMIT || j.get<long long>() > SW_SLICER_TEXT_GAP_LIMIT)
+        throw std::runtime_error(std::string("'") + key + "' must be an integer between -20000 and 20000");
+    return j.get<int>();
+}
+
+// Optional number within [-limit, limit].
+static std::optional<float> sw_slicer_get_text_ratio(const json& params, const char* key, double limit)
+{
+    if (!sw_slicer_has_param(params, key))
+        return std::nullopt;
+    double v = 0.0;
+    if (!sw_slicer_get_number(params, key, 0.0, v) || v < -limit || v > limit) {
+        std::ostringstream ss;
+        ss << "'" << key << "' must be a number between " << -limit << " and " << limit;
+        throw std::runtime_error(ss.str());
+    }
+    return static_cast<float>(v);
+}
 
 static SwSlicerTextStyle sw_slicer_parse_text_style(const json& params)
 {
     SwSlicerTextStyle st;
-    st.text      = sw_slicer_get_text(params);
-    st.height_mm = sw_slicer_get_positive_mm(params, "height_mm", SW_SLICER_TEXT_HEIGHT_MIN, SW_SLICER_TEXT_HEIGHT_MAX);
-    st.depth_mm  = sw_slicer_get_positive_mm(params, "depth_mm", SW_SLICER_TEXT_DEPTH_MIN, SW_SLICER_TEXT_DEPTH_MAX);
-    st.font      = sw_slicer_get_font(params);
+    st.text        = sw_slicer_get_text(params);
+    st.height_mm   = sw_slicer_get_positive_mm(params, "height_mm", SW_SLICER_TEXT_HEIGHT_MIN, SW_SLICER_TEXT_HEIGHT_MAX);
+    st.depth_mm    = sw_slicer_get_positive_mm(params, "depth_mm", SW_SLICER_TEXT_DEPTH_MIN, SW_SLICER_TEXT_DEPTH_MAX);
+    st.font        = sw_slicer_get_font(params);
+    st.per_glyph   = sw_slicer_get_opt_bool(params, "per_glyph");
+    st.use_surface = sw_slicer_get_opt_bool(params, "use_surface");
+    st.char_gap    = sw_slicer_get_text_gap(params, "char_gap");
+    st.line_gap    = sw_slicer_get_text_gap(params, "line_gap");
+    st.boldness    = sw_slicer_get_text_ratio(params, "boldness", SW_SLICER_TEXT_BOLDNESS_LIMIT);
+    st.skew        = sw_slicer_get_text_ratio(params, "skew", SW_SLICER_TEXT_SKEW_LIMIT);
+    if (sw_slicer_has_param(params, "align")) {
+        const json& a = params.at("align");
+        if (!a.is_object() || a.empty())
+            throw std::runtime_error("'align' must be an object with 'horizontal' and/or 'vertical'");
+        for (auto it = a.begin(); it != a.end(); ++it)
+            if (it.key() != "horizontal" && it.key() != "vertical")
+                throw std::runtime_error("'align' accepts only 'horizontal' and 'vertical' (got '" + it.key() + "')");
+        if (sw_slicer_has_param(a, "horizontal")) {
+            const std::string h = a.at("horizontal").is_string() ? a.at("horizontal").get<std::string>() : std::string();
+            if (h == "left")        st.align_h = FontProp::HorizontalAlign::left;
+            else if (h == "center") st.align_h = FontProp::HorizontalAlign::center;
+            else if (h == "right")  st.align_h = FontProp::HorizontalAlign::right;
+            else throw std::runtime_error("'align.horizontal' must be left, center or right");
+        }
+        if (sw_slicer_has_param(a, "vertical")) {
+            const std::string v = a.at("vertical").is_string() ? a.at("vertical").get<std::string>() : std::string();
+            if (v == "top")         st.align_v = FontProp::VerticalAlign::top;
+            else if (v == "center") st.align_v = FontProp::VerticalAlign::center;
+            else if (v == "bottom") st.align_v = FontProp::VerticalAlign::bottom;
+            else throw std::runtime_error("'align.vertical' must be top, center or bottom");
+        }
+        if (!st.align_h.has_value() && !st.align_v.has_value())
+            throw std::runtime_error("'align' must be an object with 'horizontal' and/or 'vertical'");
+    }
     return st;
 }
 
-// Set the specified fields in the text configuration of a volume. This only changes the
+// Set the specified fields in a text configuration and projection. This only changes the
 // configuration; the mesh follows with sw_slicer_re_emboss. Same fields as the gizmo:
-// height = style.prop.size_in_mm, depth = emboss_shape->projection.depth, font = style.path/
-// type + face_name etc. (like StyleManager::set_wx_font; the height is kept).
-static void sw_slicer_apply_text_style(ModelVolume& mv, const SwSlicerTextStyle& st)
+// height = style.prop.size_in_mm, depth = projection.depth, font = style.path/type + face_name
+// etc. (like StyleManager::set_wx_font; the height is kept). A gap, boldness or skew of 0 is
+// stored as "not set" (std::nullopt), like FontProp documents it.
+static void sw_slicer_apply_text_style(TextConfiguration& tc, EmbossProjection& proj, const SwSlicerTextStyle& st)
 {
-    TextConfiguration& tc = *mv.text_configuration;
     if (st.text.has_value())
         tc.text = *st.text;
+    FontProp& prop = tc.style.prop;
     if (st.font.has_value()) {
-        const float size = tc.style.prop.size_in_mm;
+        const float size = prop.size_in_mm;
         tc.style.path    = WxFontUtils::store_wxFont(*st.font);
         tc.style.type    = WxFontUtils::get_current_type();
-        WxFontUtils::update_property(tc.style.prop, *st.font);
-        tc.style.prop.size_in_mm = size;
+        WxFontUtils::update_property(prop, *st.font);
+        prop.size_in_mm = size;
     }
     if (st.height_mm.has_value())
-        tc.style.prop.size_in_mm = static_cast<float>(*st.height_mm);
+        prop.size_in_mm = static_cast<float>(*st.height_mm);
     if (st.depth_mm.has_value())
-        mv.emboss_shape->projection.depth = *st.depth_mm;
+        proj.depth = *st.depth_mm;
+    if (st.per_glyph.has_value())
+        prop.per_glyph = *st.per_glyph;
+    if (st.use_surface.has_value())
+        proj.use_surface = *st.use_surface;
+    if (st.align_h.has_value())
+        prop.align.first = *st.align_h;
+    if (st.align_v.has_value())
+        prop.align.second = *st.align_v;
+    if (st.char_gap.has_value())
+        prop.char_gap = (*st.char_gap == 0) ? std::nullopt : std::optional<int>(*st.char_gap);
+    if (st.line_gap.has_value())
+        prop.line_gap = (*st.line_gap == 0) ? std::nullopt : std::optional<int>(*st.line_gap);
+    if (st.boldness.has_value())
+        prop.boldness = (*st.boldness == 0.f) ? std::nullopt : std::optional<float>(*st.boldness);
+    if (st.skew.has_value())
+        prop.skew = (*st.skew == 0.f) ? std::nullopt : std::optional<float>(*st.skew);
+}
+
+static void sw_slicer_apply_text_style(ModelVolume& mv, const SwSlicerTextStyle& st)
+{
+    sw_slicer_apply_text_style(*mv.text_configuration, mv.emboss_shape->projection, st);
+}
+
+// per_glyph and use_surface need another part on the object: the gizmo disables both for the
+// only part (GLGizmoEmboss::draw_advanced) and start_update_volume silently drops use_surface.
+static void sw_slicer_check_surface_options(const ModelVolume& mv, const SwSlicerTextStyle& st)
+{
+    if (!mv.is_the_only_one_part())
+        return;
+    if (st.per_glyph.value_or(false))
+        throw std::runtime_error("per_glyph needs another part on the object (the text is the only part)");
+    if (st.use_surface.value_or(false))
+        throw std::runtime_error("use_surface needs another part on the object (the text is the only part)");
+}
+
+// Text and style of a text volume as JSON. Deliberately without style.path (a font descriptor
+// or a file path on this computer).
+static json sw_slicer_text_json(const ModelVolume& mv)
+{
+    const TextConfiguration& tc   = *mv.text_configuration;
+    const FontProp&          prop = tc.style.prop;
+    json s;
+    s["text"]      = tc.text;
+    s["font"]      = prop.face_name.has_value() ? *prop.face_name : tc.style.name;
+    s["height_mm"] = prop.size_in_mm;
+    s["depth_mm"]  = mv.emboss_shape.has_value() ? json(mv.emboss_shape->projection.depth) : json(nullptr);
+    s["per_glyph"] = prop.per_glyph;
+    const char* h  = prop.align.first == FontProp::HorizontalAlign::left  ? "left" :
+                     prop.align.first == FontProp::HorizontalAlign::right ? "right" : "center";
+    const char* v  = prop.align.second == FontProp::VerticalAlign::top    ? "top" :
+                     prop.align.second == FontProp::VerticalAlign::bottom ? "bottom" : "center";
+    s["align"]       = {{"horizontal", h}, {"vertical", v}};
+    s["char_gap"]    = prop.char_gap.value_or(0);
+    s["line_gap"]    = prop.line_gap.value_or(0);
+    // Rounded to 6 decimals: the values are floats (0.1f would become 0.100000001490116).
+    auto round6      = [](float v) { return std::round(double(v) * 1e6) / 1e6; };
+    s["boldness"]    = round6(prop.boldness.value_or(0.f));
+    s["skew"]        = round6(prop.skew.value_or(0.f));
+    s["use_surface"] = mv.emboss_shape.has_value() && mv.emboss_shape->projection.use_surface;
+    s["type"]        = sw_slicer_volume_type(mv.type());
+    return s;
+}
+
+// When use_surface is switched on, the gizmo moves the text origin onto the surface
+// (start_update_volume: only if the volume does not use the surface yet). re_emboss reads the
+// projection from the volume itself, so that step would be skipped once the API has set the
+// flag; therefore the same offset (calc_surface_offset, public) is applied to the volume
+// beforehand. The selection must be the text volume.
+static void sw_slicer_move_text_onto_surface(ModelVolume& mv)
+{
+    RaycastManager             raycaster;
+    const std::optional<Vec3d> offset = calc_surface_offset(sw_slicer_canvas()->get_selection(), raycaster);
+    if (!offset.has_value())
+        return;
+    // start_update_volume uses get_matrix() * fix_3mf^-1 * offset; keep that result.
+    Transform3d tr = mv.get_matrix();
+    const std::optional<Transform3d>& fix = mv.emboss_shape->fix_3mf_tr;
+    if (fix.has_value())
+        tr = tr * fix->inverse() * Eigen::Translation<double, 3>(*offset) * (*fix);
+    else
+        tr = tr * Eigen::Translation<double, 3>(*offset);
+    mv.set_transformation(tr);
 }
 
 // Total wait budget for the job worker within one handler. Worker::wait_for_idle itself
@@ -2876,8 +3593,9 @@ static void sw_slicer_apply_text_style(ModelVolume& mv, const SwSlicerTextStyle&
 class SwSlicerJobBudget
 {
 public:
-    explicit SwSlicerJobBudget(unsigned total_ms)
-        : m_total_ms(total_ms), m_end(std::chrono::steady_clock::now() + std::chrono::milliseconds(total_ms))
+    // 'what' names the job in the error message.
+    explicit SwSlicerJobBudget(unsigned total_ms, const char* what = "the text job")
+        : m_total_ms(total_ms), m_what(what), m_end(std::chrono::steady_clock::now() + std::chrono::milliseconds(total_ms))
     {}
 
     void wait_for_idle(Plater* plater) const
@@ -2887,7 +3605,7 @@ public:
             const long long left =
                 std::chrono::duration_cast<std::chrono::milliseconds>(m_end - std::chrono::steady_clock::now()).count();
             if (left <= 0)
-                throw std::runtime_error("the text job did not finish within " + std::to_string(m_total_ms / 1000) +
+                throw std::runtime_error(std::string(m_what) + " did not finish within " + std::to_string(m_total_ms / 1000) +
                                          " s (the app is still busy)");
             // Never pass 0: that means "wait forever".
             w.wait_for_idle(static_cast<unsigned>(std::clamp<long long>(left, 1, 200)));
@@ -2896,6 +3614,7 @@ public:
 
 private:
     unsigned                              m_total_ms;
+    const char*                           m_what;
     std::chrono::steady_clock::time_point m_end;
 };
 
@@ -2951,6 +3670,11 @@ void SSWCP_SliceProject_Instance::sw_SlicerAddText()
         // Without an object the job creates a new object and ignores the type (always a part).
         if (!has_object && type != ModelVolumeType::MODEL_PART)
             throw std::runtime_error("part_type 'negative' or 'modifier' requires an existing object: specify 'object'");
+        // A new object holds only the text, so per_glyph/use_surface are not possible there.
+        if (!has_object && st.per_glyph.value_or(false))
+            throw std::runtime_error("per_glyph needs another part on the object (the text is the only part)");
+        if (!has_object && st.use_surface.value_or(false))
+            throw std::runtime_error("use_surface needs another part on the object (the text is the only part)");
 
         GLCanvas3D*      canvas = sw_slicer_canvas();
         GLGizmosManager& gm     = canvas->get_gizmos_manager();
@@ -3006,16 +3730,28 @@ void SSWCP_SliceProject_Instance::sw_SlicerAddText()
                     }
                 }
                 if (new_mv != nullptr && st.has_style() && new_mv->emboss_shape.has_value()) {
-                    // The text itself is already correct; only height/depth/font.
+                    // The text itself is already correct; only the style fields.
                     SwSlicerTextStyle style = st;
                     style.text.reset();
+                    // re_emboss (per_glyph text lines, surface offset) reads the selection:
+                    // the new text volume.
+                    int t_obj = -1, t_vol = -1;
+                    if (sw_slicer_find_volume(model, new_mv, t_obj, t_vol))
+                        sw_slicer_select(t_obj, -1, t_vol);
                     const TextConfiguration old_tc   = *new_mv->text_configuration;
                     const EmbossProjection  old_proj = new_mv->emboss_shape->projection;
+                    const Transform3d       old_tr   = new_mv->get_matrix();
+                    // No sw_slicer_check_surface_options here: with 'object' the text is added
+                    // to an existing object, which keeps its own part (and without 'object'
+                    // both options were refused before creating anything).
+                    if (style.use_surface.value_or(false) && !old_proj.use_surface)
+                        sw_slicer_move_text_onto_surface(*new_mv);
                     sw_slicer_apply_text_style(*new_mv, style);
                     restyled = sw_slicer_re_emboss(plater, *new_mv, budget);
                     if (!restyled) {
-                        *new_mv->text_configuration          = old_tc;
+                        *new_mv->text_configuration      = old_tc;
                         new_mv->emboss_shape->projection = old_proj;
+                        new_mv->set_transformation(old_tr);
                     }
                 }
             } catch (...) {
@@ -3041,11 +3777,12 @@ void SSWCP_SliceProject_Instance::sw_SlicerAddText()
             return;
         }
         if (!restyled)
-            notes.push_back("height/depth/font could not be applied; the text was created in the default style");
+            notes.push_back("the style could not be applied; the text was created in the default style");
         m_res_data["object"] = obj;
         m_res_data["volume"] = vol;
         m_res_data["name"]   = new_mv->name;
         m_res_data["text"]   = new_mv->text_configuration->text;
+        m_res_data["style"]  = sw_slicer_text_json(*new_mv);
         m_res_data["notes"]  = notes;
         send_to_js();
         finish_job();
@@ -3078,22 +3815,46 @@ void SSWCP_SliceProject_Instance::sw_SlicerEditText()
 
         const SwSlicerTextStyle st = sw_slicer_parse_text_style(m_param_data);
         if (!st.text.has_value() && !st.has_style())
-            throw std::runtime_error("specify at least one field to change (text, height_mm, depth_mm or font)");
+            throw std::runtime_error("specify at least one field to change (text, height_mm, depth_mm, font, per_glyph, align, "
+                                     "char_gap, line_gap, boldness, skew or use_surface)");
+        sw_slicer_check_surface_options(*mv, st);
+
+        const TextConfiguration old_tc   = *mv->text_configuration;
+        const EmbossProjection  old_proj = mv->emboss_shape->projection;
+        const Transform3d       old_tr   = mv->get_matrix();
+        // No-op: every given field already has this value -> no re_emboss and no undo step.
+        {
+            TextConfiguration new_tc   = old_tc;
+            EmbossProjection  new_proj = old_proj;
+            sw_slicer_apply_text_style(new_tc, new_proj, st);
+            if (new_tc.text == old_tc.text && new_tc.style == old_tc.style && new_proj == old_proj) {
+                m_res_data["object"] = obj;
+                m_res_data["volume"] = vol;
+                m_res_data["name"]   = mv->name;
+                m_res_data["text"]   = mv->text_configuration->text;
+                m_res_data["style"]  = sw_slicer_text_json(*mv);
+                m_res_data["notes"]  = json::array({"text unchanged; nothing changed"});
+                send_to_js();
+                finish_job();
+                return;
+            }
+        }
 
         // Like in the app: the text is selected while editing (re_emboss reads the selection).
         sw_slicer_select(obj, -1, vol);
-        const TextConfiguration  old_tc   = *mv->text_configuration;
-        const EmbossProjection   old_proj = mv->emboss_shape->projection;
-        bool                     ok       = false;
+        bool                     ok = false;
         std::vector<std::string> notes;
         {
             sswcp_api::Scope     api_scope;
             Plater::TakeSnapshot snapshot(plater, "API: Edit text");
+            if (st.use_surface.value_or(false) && !old_proj.use_surface)
+                sw_slicer_move_text_onto_surface(*mv);
             sw_slicer_apply_text_style(*mv, st);
             ok = sw_slicer_re_emboss(plater, *mv, SwSlicerJobBudget(30000));
             if (!ok) {
                 *mv->text_configuration      = old_tc;
                 mv->emboss_shape->projection = old_proj;
+                mv->set_transformation(old_tr);
             }
             notes = sswcp_api::notes();
         }
@@ -3113,6 +3874,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerEditText()
         m_res_data["volume"] = r_vol;
         m_res_data["name"]   = mv->name;
         m_res_data["text"]   = mv->text_configuration->text;
+        m_res_data["style"]  = sw_slicer_text_json(*mv);
         m_res_data["notes"]  = notes;
         send_to_js();
         finish_job();
@@ -11324,6 +12086,697 @@ void SSWCP_SliceProject_Instance::sw_SlicerApplyCalibration()
         m_res_data["not_restored"]  = not_restored;
         m_res_data["presets_dirty"] = sw_slicer_presets_dirty();
         m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Toolbar extras: merge, simplify, layer ranges, SVG, repair ---------------------------------
+// The remaining tools of the 3D toolbar and the object menu, without gizmo UI and without dialogs.
+// Every model change is one "API: ..." undo step; a no-op makes no step; read commands never do.
+
+// Text and style of a text volume. Params: {object, volume}. Read only.
+void SSWCP_SliceProject_Instance::sw_SlicerGetText()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_get_index(m_param_data, "object");
+        const int obj = sw_slicer_resolve_object(m_param_data);
+        const int vol = sw_slicer_get_index(m_param_data, "volume");
+        sw_slicer_check_indices(obj, -1, vol);
+        const ModelVolume* mv = plater->model().objects[obj]->volumes[vol];
+        if (!mv->is_text() || !mv->emboss_shape.has_value())
+            throw std::runtime_error("this volume is not a text");
+        m_res_data["object"] = obj;
+        m_res_data["volume"] = vol;
+        m_res_data["name"]   = mv->name;
+        m_res_data["style"]  = sw_slicer_text_json(*mv);
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// The cross-section of an object with a cut plane (like sw_SlicerCut: z, rotation), the
+// connector limits of the cut tool for this object and optionally suggested connector positions
+// [u, v]. Params: {object?, instance?, z?, rotation?, count?, size?}. Read only.
+void SSWCP_SliceProject_Instance::sw_SlicerCutSection()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        Vec3d rot_deg = Vec3d::Zero();
+        if (sw_slicer_has_param(m_param_data, "rotation") && !sw_slicer_parse_vec3(m_param_data.at("rotation"), rot_deg))
+            throw std::runtime_error("rotation must be a list of three finite numbers [x,y,z] (degrees)");
+        int count = 0;
+        if (sw_slicer_has_param(m_param_data, "count")) {
+            const json& j = m_param_data.at("count");
+            if (!j.is_number_integer() || j.get<long long>() < 1 || j.get<long long>() > 8)
+                throw std::runtime_error("count must be an integer between 1 and 8");
+            count = j.get<int>();
+        }
+        double size = 2.5;
+        if (sw_slicer_has_param(m_param_data, "size") && count == 0)
+            throw std::runtime_error("size needs count");
+        if (!sw_slicer_get_number(m_param_data, "size", 2.5, size))
+            throw std::runtime_error("size must be a finite number (mm)");
+
+        const int obj  = sw_slicer_resolve_object(m_param_data);
+        const int inst = sw_slicer_resolve_instance(m_param_data);
+        if (inst < 0)
+            throw std::runtime_error("instance must be 0 or greater");
+        sw_slicer_check_indices(obj, inst, -1);
+        const ModelObject*  mo = plater->model().objects[obj];
+        const BoundingBoxf3 bb = mo->instance_bounding_box(static_cast<size_t>(inst));
+        double              z  = bb.center().z();
+        if (sw_slicer_has_param(m_param_data, "z") && !sw_slicer_get_number(m_param_data, "z", z, z))
+            throw std::runtime_error("z must be a finite number (mm)");
+        if (!std::isfinite(z) || z <= bb.min.z() || z >= bb.max.z())
+            throw std::runtime_error("cut height is outside the object (z between " + sw_slicer_fmt_mm(bb.min.z()) + " and " +
+                                     sw_slicer_fmt_mm(bb.max.z()) + ")");
+
+        const SwSlicerCutFrame frame   = sw_slicer_cut_frame(mo, inst, z, rot_deg);
+        // Same limit and text as the connector parser of sw_SlicerCut.
+        if (count > 0 && (size < 1.0 || size > frame.mean_size))
+            throw std::runtime_error("size must be between 1 and " + sw_slicer_fmt_mm(frame.mean_size) +
+                                     " mm (the cut tool's limit for this object)");
+        ExPolygons             section = sw_slicer_cut_section(mo, inst, frame);
+        std::sort(section.begin(), section.end(),
+                  [](const ExPolygon& a, const ExPolygon& b) { return std::abs(a.area()) > std::abs(b.area()); });
+        std::vector<std::string> notes;
+        json                     parts = json::array();
+        const double             s2    = SCALING_FACTOR * SCALING_FACTOR;
+        for (const ExPolygon& ex : section) {
+            // Area-weighted centroid of the contour minus the holes.
+            const double c_area = std::abs(ex.contour.area());
+            const Point  cc     = ex.contour.centroid();
+            Vec2d        sum    = c_area * Vec2d(double(cc.x()), double(cc.y()));
+            double       area   = c_area;
+            for (const Polygon& h : ex.holes) {
+                const double h_area = std::abs(h.area());
+                const Point  hc     = h.centroid();
+                sum -= h_area * Vec2d(double(hc.x()), double(hc.y()));
+                area -= h_area;
+            }
+            const Vec2d       cen = (area > 0.0) ? Vec2d(sum / area) : Vec2d(double(cc.x()), double(cc.y()));
+            const BoundingBox ebb = get_extents(ex);
+            json              p;
+            p["area_mm2"] = area * s2;
+            p["centroid"] = json::array({unscale<double>(cen.x()), unscale<double>(cen.y())});
+            p["bbox"]     = {{"min", json::array({unscale<double>(ebb.min.x()), unscale<double>(ebb.min.y())})},
+                             {"max", json::array({unscale<double>(ebb.max.x()), unscale<double>(ebb.max.y())})}};
+            p["holes"]    = static_cast<int>(ex.holes.size());
+            parts.push_back(p);
+        }
+        if (section.empty())
+            notes.push_back("the cut plane does not cross the object");
+
+        const double mean = frame.mean_size;
+        m_res_data["object"]    = obj;
+        m_res_data["instance"]  = inst;
+        m_res_data["z"]         = z;
+        m_res_data["plane"]     = {{"center", sw_slicer_vec3(frame.center)}, {"normal", sw_slicer_vec3(frame.normal)}};
+        m_res_data["mean_size"] = mean;
+        m_res_data["limits"]    = {{"size", json::array({1.0, mean})},
+                                   {"depth", json::array({1.0, mean})},
+                                   {"tolerance", json::array({0.0, 0.5 * mean})}};
+        m_res_data["section"]   = parts;
+        if (count > 0) {
+            // Checked like sw_SlicerCut does with the default plug (prism, circle, depth 3 mm).
+            json suggested = nullptr;
+            if (!section.empty()) {
+                SwSlicerConnectorSpec spec;
+                spec.size  = static_cast<float>(size);
+                spec.depth = 3.f;
+                spec.uv    = sw_slicer_connector_layout(section, count, size);
+                bool ok    = static_cast<int>(spec.uv.size()) == count;
+                if (ok) {
+                    try {
+                        sw_slicer_check_connectors(spec, frame, section);
+                    } catch (const std::exception&) {
+                        ok = false;
+                    }
+                }
+                if (ok) {
+                    suggested = json::array();
+                    for (const Vec2d& p : spec.uv)
+                        suggested.push_back(json::array({p.x(), p.y()}));
+                    notes.push_back("suggested positions were checked as plugs with depth 3 mm");
+                }
+            }
+            if (suggested.is_null())
+                notes.push_back("no automatic placement found for " + std::to_string(count) + " connectors of size " +
+                                sw_slicer_fmt_mm(size) + " mm; choose positions inside the section");
+            m_res_data["suggested"] = suggested;
+        }
+        m_res_data["notes"] = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Merge objects into one object with several parts, like "Assemble" in the object menu
+// (ObjectList::merge(true)). Cut objects and objects with several instances are refused.
+// Params: {objects:[i, j, ...], discard_part_settings?}.
+void SSWCP_SliceProject_Instance::sw_SlicerMergeObjects()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_fff();
+        sw_slicer_require_3d_view();
+
+        Model&    model = plater->model();
+        const int n     = static_cast<int>(model.objects.size());
+        if (!sw_slicer_has_param(m_param_data, "objects") || !m_param_data.at("objects").is_array() ||
+            m_param_data.at("objects").size() < 2)
+            throw std::runtime_error("'objects' must be a list of at least two object indices");
+        std::vector<int> objs;
+        for (const json& j : m_param_data.at("objects")) {
+            if (!j.is_number_integer() || j.get<long long>() < 0 || j.get<long long>() >= n)
+                throw std::runtime_error("object index " + j.dump() + " in 'objects' does not exist (there are " +
+                                         std::to_string(n) + " objects, 0-based)");
+            const int obj = j.get<int>();
+            if (std::find(objs.begin(), objs.end(), obj) != objs.end())
+                throw std::runtime_error("object index " + std::to_string(obj) + " appears twice in 'objects'");
+            objs.push_back(obj);
+        }
+        int with_ranges = 0;
+        bool painted    = false;
+        for (int obj : objs) {
+            const ModelObject* mo = model.objects[obj];
+            // ObjectList::remove() would ask about breaking the cut link (dialog outside API mode).
+            if (mo->is_cut())
+                throw std::runtime_error("object " + std::to_string(obj) + " is a cut part; merging is not possible (like in the app)");
+            if (mo->instances.size() > 1)
+                throw std::runtime_error("object " + std::to_string(obj) + " has " + std::to_string(mo->instances.size()) +
+                                         " instances; split them first (sw_SlicerInstanceToObject)");
+            if (!mo->layer_config_ranges.empty())
+                ++with_ranges;
+            painted = painted || mo->is_fdm_support_painted() || mo->is_seam_painted() || mo->is_mm_painted() ||
+                      mo->is_fuzzy_skin_painted();
+        }
+
+        // What ObjectList::merge(true) does not keep (GUI_ObjectList.cpp): the object settings are
+        // joined with "first object wins" and then apply to all parts; the part settings of an object
+        // with a single volume are not copied; the variable layer height and the brim ears are not
+        // taken over. Only with discard_part_settings:true.
+        if (sw_slicer_has_param(m_param_data, "discard_part_settings") && !m_param_data.at("discard_part_settings").is_boolean())
+            throw std::runtime_error("'discard_part_settings' must be true or false");
+        const bool               discard = sw_slicer_get_bool(m_param_data, "discard_part_settings", false);
+        std::vector<std::string> losses;
+        {
+            std::set<std::string> keys;
+            for (int obj : objs)
+                for (const std::string& k : model.objects[obj]->config.keys())
+                    if (k != "extruder")
+                        keys.insert(k);
+            std::string differing;
+            for (const std::string& k : keys) {
+                std::optional<std::string> first_value;
+                bool                       same = true;
+                for (size_t i = 0; i < objs.size() && same; ++i) {
+                    const ConfigOption* opt   = model.objects[objs[i]]->config.option(k);
+                    const std::string   value = opt != nullptr ? opt->serialize() : std::string("<not set>");
+                    if (!first_value.has_value())
+                        first_value = value;
+                    else if (*first_value != value)
+                        same = false;
+                }
+                if (!same)
+                    differing += (differing.empty() ? "" : ", ") + k;
+            }
+            if (!differing.empty())
+                losses.push_back("object settings that differ (the first object's value applies to all parts): " + differing);
+            for (int obj : objs) {
+                const ModelObject* mo = model.objects[obj];
+                if (mo->volumes.size() == 1) {
+                    const ModelVolume*  v       = mo->volumes.front();
+                    const ConfigOption* obj_ext = mo->config.option("extruder");
+                    std::string         lost;
+                    for (const std::string& k : v->config.keys()) {
+                        // The extruder of the object is put on the part (merge keeps that one).
+                        if (k == "extruder" && obj_ext != nullptr && v->config.option(k)->getInt() == obj_ext->getInt())
+                            continue;
+                        lost += (lost.empty() ? "" : ", ") + k;
+                    }
+                    if (!lost.empty())
+                        losses.push_back("part settings of '" + v->name + "' (" + lost + ")");
+                }
+                if (!mo->layer_height_profile.empty())
+                    losses.push_back("variable layer height of '" + mo->name + "'");
+                if (!mo->brim_points.empty())
+                    losses.push_back("brim ears of '" + mo->name + "'");
+            }
+        }
+        if (!losses.empty() && !discard) {
+            std::string list;
+            for (const std::string& l : losses)
+                list += (list.empty() ? "" : "; ") + l;
+            throw std::runtime_error("merging objects loses: " + list + "; pass discard_part_settings");
+        }
+
+        // Select the objects like sw_SlicerSelect does: merge(true) works on the selection of the
+        // object list, which update_selections() takes over from the canvas.
+        GLCanvas3D* canvas = sw_slicer_canvas();
+        Selection&  sel    = canvas->get_selection();
+        sel.clear();
+        for (size_t i = 0; i < objs.size(); ++i)
+            sel.add_object(static_cast<unsigned int>(objs[i]), i == 0);
+        ObjectList* obj_list = wxGetApp().obj_list();
+        obj_list->update_selections();
+        canvas->update_gizmos_on_off_state();
+        if (!obj_list->can_merge_to_multipart_object())
+            throw std::runtime_error("the app does not allow merging this selection");
+
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Merge objects");
+            obj_list->merge(true);
+            notes = sswcp_api::notes();
+        }
+        canvas->set_as_dirty();
+        canvas->request_extra_frame();
+
+        // The merged object is appended; the merged objects are removed.
+        const int n_after = static_cast<int>(model.objects.size());
+        if (n_after != n - static_cast<int>(objs.size()) + 1)
+            throw std::runtime_error(sw_slicer_join_notes("merging failed", notes));
+        const int          new_obj = n_after - 1;
+        const ModelObject* nmo     = model.objects[new_obj];
+        notes.push_back("the merged object keeps the positions of the objects; its plate follows from that position");
+        if (with_ranges > 1)
+            notes.push_back("height ranges: the first range wins on overlap");
+        if (painted)
+            notes.push_back("painting stays per part");
+        for (const std::string& l : losses)
+            notes.push_back("discarded: " + l);
+
+        json objects = json::array();
+        for (int i = 0; i < n_after; ++i)
+            objects.push_back({{"object", i}, {"name", model.objects[i]->name}});
+        int plate = plater->get_partplate_list().find_instance_belongs(new_obj, 0);
+        if (plate < 0)
+            plate = plater->get_partplate_list().find_instance(new_obj, 0);
+        m_res_data["object"]  = new_obj;
+        m_res_data["name"]    = nmo->name;
+        m_res_data["volumes"] = static_cast<int>(nmo->volumes.size());
+        m_res_data["plate"]   = plate >= 0 ? plate : -1;
+        m_res_data["merged"]  = objs;
+        m_res_data["objects"] = objects;
+        m_res_data["notes"]   = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Merge all solid parts of an object into one part. The app's own route (ObjectList::merge(false)
+// -> ModelObject::merge(), not in any menu of this app) joins the raw meshes without their
+// volume transformations and also joins modifiers and negative volumes into the solid mesh;
+// therefore the parts are joined here like sw_SlicerMeshBoolean builds its result (mesh in the
+// object frame, add_volume, delete_volume). Modifiers, negative volumes, blockers and enforcers
+// stay separate. What would be lost (part settings, a different filament, painting, text/SVG
+// shape) needs discard_part_settings:true. Params: {object, discard_part_settings?}.
+void SSWCP_SliceProject_Instance::sw_SlicerMergeParts()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_fff();
+        sw_slicer_get_index(m_param_data, "object");
+        const int    obj   = sw_slicer_resolve_object(m_param_data);
+        Model&       model = plater->model();
+        ModelObject* mo    = model.objects[obj];
+        if (sw_slicer_has_param(m_param_data, "discard_part_settings") && !m_param_data.at("discard_part_settings").is_boolean())
+            throw std::runtime_error("'discard_part_settings' must be true or false");
+        const bool discard = sw_slicer_get_bool(m_param_data, "discard_part_settings", false);
+        // Deleting a volume of a cut object asks for confirmation in the app (dialog).
+        if (mo->is_cut())
+            throw std::runtime_error("object " + std::to_string(obj) + " is a cut part; merging is not possible (like in the app)");
+
+        std::vector<int> parts;
+        for (size_t i = 0; i < mo->volumes.size(); ++i)
+            if (mo->volumes[i]->is_model_part())
+                parts.push_back(static_cast<int>(i));
+        const int volumes_before = static_cast<int>(mo->volumes.size());
+        if (parts.size() < 2) {
+            m_res_data["object"]         = obj;
+            m_res_data["volumes_before"] = volumes_before;
+            m_res_data["volumes_after"]  = volumes_before;
+            m_res_data["notes"]          = json::array({"the object has only one part; nothing changed"});
+            send_to_js();
+            finish_job();
+            return;
+        }
+
+        // What merging loses; the merged part keeps the filament of the first part.
+        const ModelVolume*  first     = mo->volumes[parts.front()];
+        const ConfigOption* first_ext = first->config.option("extruder");
+        const int           first_e   = first_ext != nullptr ? first_ext->getInt() : 0;
+        std::vector<std::string> losses;
+        for (int i : parts) {
+            const ModelVolume* v = mo->volumes[i];
+            for (const std::string& key : v->config.keys())
+                if (key != "extruder") {
+                    losses.push_back("part settings of '" + v->name + "'");
+                    break;
+                }
+            const ConfigOption* ext = v->config.option("extruder");
+            if ((ext != nullptr ? ext->getInt() : 0) != first_e)
+                losses.push_back("filament of '" + v->name + "'");
+            if (v->is_fdm_support_painted() || v->is_seam_painted() || v->is_mm_painted() || v->is_fuzzy_skin_painted())
+                losses.push_back("painting of '" + v->name + "'");
+            if (v->is_text())
+                losses.push_back("text '" + v->name + "' (becomes a plain mesh)");
+            else if (v->is_svg())
+                losses.push_back("SVG '" + v->name + "' (becomes a plain mesh)");
+        }
+        if (!losses.empty() && !discard) {
+            std::string list;
+            for (const std::string& l : losses)
+                list += (list.empty() ? "" : ", ") + l;
+            throw std::runtime_error("merging parts loses: " + list + "; pass discard_part_settings");
+        }
+
+        TriangleMesh merged;
+        for (int i : parts) {
+            TriangleMesh m = mo->volumes[i]->mesh();
+            m.transform(mo->volumes[i]->get_matrix(), true);
+            merged.merge(m);
+        }
+        if (merged.empty())
+            throw std::runtime_error("the parts have no mesh");
+
+        std::vector<std::string> notes;
+        const bool keeps_others = static_cast<int>(parts.size()) < volumes_before;
+        bool       had_groups   = false;
+        for (int i : parts)
+            had_groups = had_groups || mo->volumes[i]->merged_group_id().valid();
+        if (had_groups)
+            notes.push_back("the assembly grouping of the parts is not kept (a later split to objects gives one object)");
+        sw_slicer_select(obj, -1, -1);
+        ModelVolume* nv = nullptr;
+        {
+            sswcp_api::Scope     api_scope;
+            Plater::TakeSnapshot snapshot(plater, "API: Merge parts");
+            nv       = mo->add_volume(std::move(merged), ModelVolumeType::MODEL_PART);
+            nv->name = mo->name;
+            nv->set_material_id(first->material_id());
+            if (first_ext != nullptr)
+                nv->config.set_key_value("extruder", first_ext->clone());
+            first     = nullptr;
+            first_ext = nullptr;
+            // add_volume() appends at the end, so the old indices are still valid; highest first.
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it)
+                mo->delete_volume(static_cast<size_t>(*it));
+
+            // Same refresh as sw_SlicerMeshBoolean.
+            plater->update();
+            ObjectList* obj_list = wxGetApp().obj_list();
+            if (mo->volumes.size() > 1) {
+                wxDataViewItemArray items =
+                    obj_list->reorder_volumes_and_get_selection(obj, [nv](const ModelVolume* v) { return v == nv; });
+                if (!items.IsEmpty())
+                    obj_list->select_item(items.front());
+            } else {
+                obj_list->update_info_items(static_cast<size_t>(obj));
+                obj_list->add_volumes_to_object_in_list(static_cast<size_t>(obj));
+                plater->changed_object(obj);
+                sw_slicer_select(obj, -1, -1);
+            }
+            sw_slicer_add_notes(notes, sswcp_api::notes());
+        }
+        sw_slicer_canvas()->set_as_dirty();
+        sw_slicer_canvas()->request_extra_frame();
+        if (keeps_others)
+            notes.push_back("modifiers, negative volumes and support blockers/enforcers stay separate");
+        if (!losses.empty())
+            notes.push_back("discarded: " + sw_slicer_join_notes("", losses).substr(2));
+
+        m_res_data["object"]         = obj;
+        m_res_data["volumes_before"] = volumes_before;
+        m_res_data["volumes_after"]  = static_cast<int>(mo->volumes.size());
+        m_res_data["notes"]          = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Same test as Plater::clear_before_change_mesh: support, seam, color or fuzzy skin painting.
+static bool sw_slicer_object_has_paint(const ModelObject* mo)
+{
+    for (const ModelVolume* mv : mo->volumes)
+        if (!mv->supported_facets.empty() || !mv->seam_facets.empty() || !mv->mmu_segmentation_facets.empty() ||
+            !mv->fuzzy_skin_facets.empty())
+            return true;
+    return false;
+}
+
+// State of a mesh job: owned by a shared_ptr, so the job never refers to the model.
+struct SwSlicerMeshJobState
+{
+    indexed_triangle_set its;
+    uint32_t             triangles = 0;
+    float                max_error = std::numeric_limits<float>::max();
+    bool                 done = false, ok = false;
+    std::string          error;
+};
+
+// Run 'work' as a job on the plater's job worker and wait for it (like the text jobs). Every
+// exception is caught in process (PlaterJob::finalize would otherwise show an error dialog) and
+// finalize clears eptr. On a time-out the job is cancelled and the error is rethrown; the job
+// then keeps running on its own shared_ptr and its result is dropped.
+// The job only owns a copy of the data; the result is applied by the caller on the GUI thread.
+static void sw_slicer_run_mesh_job(Plater* plater, std::shared_ptr<SwSlicerMeshJobState> st,
+                                   std::function<void(SwSlicerMeshJobState&, Job::Ctl&)> work, unsigned budget_ms, const char* what)
+{
+    const bool queued = queue_job(
+        plater->get_ui_job_worker(),
+        [st, work](Job::Ctl& ctl) {
+            try {
+                work(*st, ctl);
+                st->ok = true;
+            } catch (std::exception& e) {
+                st->error = e.what();
+            } catch (...) {
+                st->error = "unknown error";
+            }
+        },
+        [st](bool canceled, std::exception_ptr& eptr) {
+            st->done = true;
+            if (canceled)
+                st->ok = false;
+            eptr = nullptr;
+        });
+    if (!queued)
+        throw std::runtime_error(std::string(what) + " could not be started");
+    try {
+        SwSlicerJobBudget(budget_ms, what).wait_for_idle(plater);
+    } catch (...) {
+        // Our job already finished (the worker is busy with a later job, e.g. of the user): do not
+        // cancel that one; a finished result is used.
+        if (st->done) {
+            if (st->ok)
+                return;
+            throw;
+        }
+        plater->get_ui_job_worker().cancel();
+        plater->get_ui_job_worker().wait_for_current_job(5000);
+        throw;
+    }
+}
+
+// Simplify one part like the Simplify tool (its_quadric_edge_collapse), as a job with waiting.
+// Painting of the object is removed (Plater::clear_before_change_mesh) only with
+// discard_paint:true. Params: {object, volume?, ratio? | triangles? | max_error?, discard_paint?}.
+void SSWCP_SliceProject_Instance::sw_SlicerSimplify()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_get_index(m_param_data, "object");
+        const int    obj   = sw_slicer_resolve_object(m_param_data);
+        Model&       model = plater->model();
+        ModelObject* mo    = model.objects[obj];
+        int          vol   = -1;
+        if (sw_slicer_has_param(m_param_data, "volume")) {
+            vol = sw_slicer_get_index(m_param_data, "volume");
+            sw_slicer_check_indices(obj, -1, vol);
+        } else {
+            // Without 'volume': the only solid part of the object.
+            const int n_parts = sw_slicer_count_model_parts(mo);
+            if (n_parts != 1)
+                throw std::runtime_error("the object has " + std::to_string(n_parts) + " parts; specify 'volume'");
+            for (size_t i = 0; i < mo->volumes.size(); ++i)
+                if (mo->volumes[i]->is_model_part())
+                    vol = static_cast<int>(i);
+        }
+        ModelVolume* mv = mo->volumes[vol];
+        if (mv->emboss_shape.has_value())
+            throw std::runtime_error("text and SVG parts are regenerated from their shape; simplify is not useful here");
+        if (mv->is_cut_connector())
+            throw std::runtime_error("this part is a cut connector; simplify is not possible there");
+        const size_t n_before = mv->mesh().its.indices.size();
+        if (n_before == 0)
+            throw std::runtime_error("the part has no mesh");
+        if (n_before > 5000000)
+            throw std::runtime_error("the mesh is too large for the API (" + std::to_string(n_before) + " triangles; at most 5000000)");
+
+        const bool has_ratio = sw_slicer_has_param(m_param_data, "ratio");
+        const bool has_tris  = sw_slicer_has_param(m_param_data, "triangles");
+        const bool has_error = sw_slicer_has_param(m_param_data, "max_error");
+        if (int(has_ratio) + int(has_tris) + int(has_error) != 1)
+            throw std::runtime_error("specify exactly one of ratio, triangles or max_error");
+        auto st = std::make_shared<SwSlicerMeshJobState>();
+        if (has_ratio) {
+            double ratio = 0.0;
+            if (!sw_slicer_get_number(m_param_data, "ratio", 0.0, ratio) || ratio < 1.0 || ratio > 99.0)
+                throw std::runtime_error("ratio must be a number between 1 and 99 (percent of the triangles to remove)");
+            // GLGizmoSimplify::Configuration::fix_count_by_ratio
+            st->triangles = static_cast<uint32_t>(std::round(double(n_before) * (100.0 - ratio) / 100.0));
+        } else if (has_tris) {
+            const json& j = m_param_data.at("triangles");
+            if (!j.is_number_integer() || j.get<long long>() < 4 || j.get<long long>() > static_cast<long long>(n_before) - 1)
+                throw std::runtime_error("triangles must be an integer between 4 and " + std::to_string(n_before - 1) +
+                                         " (the part has " + std::to_string(n_before) + ")");
+            st->triangles = static_cast<uint32_t>(j.get<long long>());
+        } else {
+            double err = 0.0;
+            if (!sw_slicer_get_number(m_param_data, "max_error", 0.0, err) || err < 0.0001 || err > 1.0)
+                throw std::runtime_error("max_error must be a number between 0.0001 and 1");
+            st->max_error = static_cast<float>(err);
+        }
+        if (sw_slicer_has_param(m_param_data, "discard_paint") && !m_param_data.at("discard_paint").is_boolean())
+            throw std::runtime_error("'discard_paint' must be true or false");
+        const bool discard_paint = sw_slicer_get_bool(m_param_data, "discard_paint", false);
+        if (sw_slicer_object_has_paint(mo) && !discard_paint)
+            throw std::runtime_error("simplifying removes all painting of this object (support, seam, color, fuzzy skin); pass discard_paint");
+
+        // Only IDs and a mesh copy go to the job; the volume is looked up again afterwards.
+        const ObjectID                      vol_id      = mv->id();
+        const ObjectID                      obj_id      = mo->id();
+        const std::shared_ptr<const TriangleMesh> mesh_before = mv->mesh_ptr();
+        st->its                             = mv->mesh().its;
+        mv                                  = nullptr;
+        mo                                  = nullptr;
+        const std::string status_text = _u8L("Simplify");
+        sw_slicer_run_mesh_job(
+            plater, st,
+            [status_text](SwSlicerMeshJobState& s, Job::Ctl& ctl) {
+                auto throw_on_cancel = [&ctl]() {
+                    if (ctl.was_canceled())
+                        throw std::runtime_error("canceled");
+                };
+                auto statusfn = [&ctl, &status_text](int percent) { ctl.update_status(percent, status_text); };
+                its_quadric_edge_collapse(s.its, s.triangles, &s.max_error, throw_on_cancel, statusfn);
+            },
+            60000, "the simplify job");
+        if (!st->done || !st->ok)
+            throw std::runtime_error("simplify failed: " + (st->error.empty() ? std::string("no result") : st->error));
+
+        // Look the part up again (the model may have changed while waiting).
+        int r_obj = -1, r_vol = -1;
+        for (size_t o = 0; o < model.objects.size() && r_obj < 0; ++o) {
+            if (model.objects[o]->id() != obj_id)
+                continue;
+            for (size_t v = 0; v < model.objects[o]->volumes.size(); ++v)
+                if (model.objects[o]->volumes[v]->id() == vol_id) {
+                    r_obj = static_cast<int>(o);
+                    r_vol = static_cast<int>(v);
+                    break;
+                }
+        }
+        if (r_obj < 0 || model.objects[r_obj]->volumes[r_vol]->mesh_ptr() != mesh_before)
+            throw std::runtime_error("the part was changed or removed while simplifying; nothing changed");
+        mo = model.objects[r_obj];
+        mv = mo->volumes[r_vol];
+        // GUI events ran while waiting: decide on the state now. A paint tool opened meanwhile
+        // would keep its own copy of the painting; painting added meanwhile belongs to the old mesh.
+        sw_slicer_require_free_gizmo();
+        const bool paint_now = sw_slicer_object_has_paint(mo);
+        if (paint_now && !discard_paint)
+            throw std::runtime_error("the object was painted while simplifying; nothing changed");
+
+        const size_t             n_after = st->its.indices.size();
+        std::vector<std::string> notes;
+        bool                     paint_removed = false;
+        if (n_after >= n_before || n_after == 0) {
+            notes.push_back("the mesh could not be reduced further; nothing changed");
+        } else {
+            {
+                sswcp_api::Scope     api_scope;
+                Plater::TakeSnapshot snapshot(plater, "API: Simplify");
+                // Same steps as GLGizmoSimplify::apply_simplify (without closing the gizmo).
+                if (paint_now) {
+                    plater->clear_before_change_mesh(r_obj);
+                    paint_removed = true;
+                }
+                mv->set_mesh(std::move(st->its));
+                mv->calculate_convex_hull();
+                mv->invalidate_convex_hull_2d();
+                mv->set_new_unique_id();
+                mo->invalidate_bounding_box();
+                mo->ensure_on_bed();
+                plater->changed_mesh(r_obj);
+                wxGetApp().obj_list()->update_item_error_icon(r_obj, -1);
+                if (NotificationManager* nm = plater->get_notification_manager())
+                    nm->remove_simplify_suggestion_with_id(mo->id());
+                const std::vector<std::string>& api_notes = sswcp_api::notes();
+                notes.insert(notes.end(), api_notes.begin(), api_notes.end());
+            }
+            sw_slicer_canvas()->set_as_dirty();
+            sw_slicer_canvas()->request_extra_frame();
+            if (paint_removed)
+                notes.push_back("painting removed (support, seam, color, fuzzy skin)");
+        }
+        const size_t n_result = (n_after >= n_before || n_after == 0) ? n_before : n_after;
+        m_res_data["object"]           = r_obj;
+        m_res_data["volume"]           = r_vol;
+        m_res_data["name"]             = mv->name;
+        m_res_data["triangles_before"] = static_cast<long long>(n_before);
+        m_res_data["triangles_after"]  = static_cast<long long>(n_result);
+        m_res_data["removed_percent"]  = std::round(1000.0 * double(n_before - n_result) / double(n_before)) / 10.0;
+        m_res_data["max_error"]        = (st->max_error < std::numeric_limits<float>::max()) ? json(st->max_error) : json(nullptr);
+        m_res_data["paint_removed"]    = paint_removed;
+        m_res_data["notes"]            = notes;
         send_to_js();
         finish_job();
     } catch (std::exception& e) {

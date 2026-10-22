@@ -4767,6 +4767,16 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerGetCalibration();
     } else if (m_cmd == "sw_SlicerApplyCalibration") {
         sw_SlicerApplyCalibration();
+    } else if (m_cmd == "sw_SlicerGetText") {
+        sw_SlicerGetText();
+    } else if (m_cmd == "sw_SlicerCutSection") {
+        sw_SlicerCutSection();
+    } else if (m_cmd == "sw_SlicerMergeObjects") {
+        sw_SlicerMergeObjects();
+    } else if (m_cmd == "sw_SlicerMergeParts") {
+        sw_SlicerMergeParts();
+    } else if (m_cmd == "sw_SlicerSimplify") {
+        sw_SlicerSimplify();
     } else {
         handle_general_fail();
     }
@@ -8097,6 +8107,8 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_SlicerDiscardPresetChanges",
     // Calibration
     "sw_SlicerListCalibrations", "sw_SlicerCalibrate", "sw_SlicerGetCalibration", "sw_SlicerApplyCalibration",
+    // Toolbar extras
+    "sw_SlicerGetText", "sw_SlicerCutSection", "sw_SlicerMergeObjects", "sw_SlicerMergeParts", "sw_SlicerSimplify",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.
