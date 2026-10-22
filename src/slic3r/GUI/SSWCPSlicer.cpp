@@ -37,6 +37,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/CutUtils.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/Layer.hpp"
 #include "libslic3r/Slicing.hpp"
 #include "libslic3r/BrimEarsPoint.hpp"
 #include "libslic3r/TriangleMeshSlicer.hpp"
@@ -57,11 +58,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <initializer_list>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -110,7 +113,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 12;
+        m_res_data["phase"]    = 13;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -3431,10 +3434,25 @@ static bool sw_slicer_project_dirty()
 // Do the presets have unsaved edits?
 static bool sw_slicer_presets_dirty() { return wxGetApp().has_current_preset_changes(); }
 
+// Set while sw_SlicerCalibrate creates its test project: the loading progress dialog of the test model
+// lets other requests through, which must not change the project or the presets halfway.
+static bool& sw_slicer_calib_in_progress()
+{
+    static bool busy = false;
+    return busy;
+}
+
+static void sw_slicer_require_no_calibration_running()
+{
+    if (sw_slicer_calib_in_progress())
+        throw std::runtime_error("not possible while a calibration project is being created");
+}
+
 // Project switches, saving and deleting are refused while slicing is in progress or while a
 // project is being loaded (the loading progress dialog lets other requests through).
 static void sw_slicer_require_not_slicing()
 {
+    sw_slicer_require_no_calibration_running();
     Plater* plater = wxGetApp().plater();
     if (plater->is_background_process_slicing())
         throw std::runtime_error("not possible while slicing is in progress");
@@ -3721,6 +3739,8 @@ void SSWCP_SliceProject_Instance::sw_SlicerGetProjectState()
     }
 }
 
+static bool sw_slicer_calib_reset_mode(); // calibration section
+
 // Start a new, empty project. Unsaved project changes require discard_unsaved:true and unsaved
 // preset edits require preset_changes:'keep'|'discard'. Clears the undo stack: no undo step.
 void SSWCP_SliceProject_Instance::sw_SlicerNewProject()
@@ -3740,6 +3760,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerNewProject()
         const bool        was_dirty = sw_slicer_project_dirty();
 
         std::vector<std::string> notes;
+        bool                     calib_reset = false;
         {
             sswcp_api::Scope api_scope;
             if (presets == "discard")
@@ -3747,8 +3768,13 @@ void SSWCP_SliceProject_Instance::sw_SlicerNewProject()
             // skip_confirm: the checks above replace close_with_confirm(). Without the confirmation
             // the preset edits are kept (reset() reloads the edited presets).
             plater->new_project(/*skip_confirm=*/true, /*silent=*/false);
+            // Like load_files(): leave calibration mode, so a later model without a file import is not
+            // sliced as a calibration test.
+            calib_reset = sw_slicer_calib_reset_mode();
             notes = sswcp_api::notes();
         }
+        if (calib_reset)
+            notes.push_back("calibration mode reset");
         if (was_dirty)
             notes.push_back("unsaved changes discarded");
         if (presets == "keep")
@@ -6180,6 +6206,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerDisconnectPrinter()
 // other requests through).
 static void sw_slicer_require_not_loading()
 {
+    sw_slicer_require_no_calibration_running();
     if (wxGetApp().plater()->is_loading_project())
         throw std::runtime_error("not possible while a project is being loaded");
 }
@@ -9810,6 +9837,1495 @@ void SSWCP_SliceProject_Instance::sw_SlicerDiscardPresetChanges()
         sw_slicer_add_note(notes, "the discarded values cannot be restored (presets are not part of undo)");
         sw_slicer_add_notes(notes, api_notes);
         reply();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Calibration: list, create, mapping, apply ---------------------------------
+// The test projects of the Calibration menu without its dialogs. The API fills Calib_Params itself, with
+// the defaults and input rules of the dialogs (calib_dlg.cpp), and calls the same Plater::calib_* functions.
+// A test changes the edited presets (not saved); the API records these changes, so that
+// sw_SlicerApplyCalibration can restore them before it sets the chosen value. Nothing here sends anything
+// to a printer: slicing, sending and printing stay separate commands.
+
+namespace {
+// One parameter of a test. kind: 'n' number, 'i' list of whole numbers, 'b' bool, 'e' choice.
+struct SwCalibParamDef
+{
+    const char*              name;
+    char                     kind;
+    double                   def;
+    std::vector<const char*> choices;
+    const char*              unit;
+};
+
+// One test of the Calibration menu. result_type == nullptr: there is no slicer setting to apply.
+struct SwCalibTestDef
+{
+    const char*                  id;
+    const char*                  menu;
+    CalibMode                    mode;
+    std::vector<SwCalibParamDef> params;
+    const char*                  rules;
+    const char*                  result_type;
+    std::vector<const char*>     result_keys;
+};
+
+// What the last sw_SlicerCalibrate did (memory only). Only names, values and the model id are kept, no
+// pointers into the model or the presets.
+struct SwCalibRecord
+{
+    struct Change
+    {
+        Preset::Type                  type;
+        std::string                   key;
+        std::unique_ptr<ConfigOption> before; // nullptr: the key was missing
+        std::unique_ptr<ConfigOption> after;  // nullptr: the key was removed
+    };
+    std::string         test;
+    json                params;
+    std::string         project_name;
+    std::vector<size_t> object_ids; // ids of the test objects right after creation
+    std::string         presets[3]; // printer, print, filament
+    double              flow_ratio = 0; // filament_flow_ratio[0] before the test
+    std::vector<Change> changes;
+};
+} // namespace
+
+static const Preset::Type sw_slicer_calib_types[3] = {Preset::TYPE_PRINTER, Preset::TYPE_PRINT, Preset::TYPE_FILAMENT};
+
+// API limits that the dialogs do not have.
+static const double SW_SLICER_CALIB_MAX_STEPS = 100;
+static const size_t SW_SLICER_CALIB_MAX_LIST  = 10;
+
+// The tests of the Calibration menu (MainFrame.cpp), with the defaults of their dialogs (calib_dlg.cpp).
+// Defaults that depend on the extruder type or the material: sw_slicer_calib_default().
+static const std::vector<SwCalibTestDef>& sw_slicer_calib_tests()
+{
+    static const std::vector<const char*> extruders = {"dde", "bowden"};
+    static const std::vector<const char*> materials = {"pla", "abs_asa", "petg", "pctg", "tpu", "pa_cf", "pet_cf"};
+    static const std::vector<const char*> models    = {"ringing_tower", "fast_tower"};
+    static const std::vector<const char*> pa_keys   = {"pressure_advance", "enable_pressure_advance"};
+    static const std::vector<const char*> flow_keys = {"filament_flow_ratio"};
+    static const char* const              flow_rules = "no parameters";
+    static const std::vector<SwCalibTestDef> tests = {
+        {"pa_tower", "Pressure advance > PA Tower", CalibMode::Calib_PA_Tower,
+         {{"extruder", 'e', 0, extruders, ""}, {"start", 'n', 0.0, {}, ""}, {"end", 'n', 0.1, {}, ""}, {"step", 'n', 0.002, {}, ""}},
+         "start >= 0, end >= start + step, step >= 0.0001, at most 100 steps", "filament", pa_keys},
+        {"pa_line", "Pressure advance > PA Line", CalibMode::Calib_PA_Line,
+         {{"extruder", 'e', 0, extruders, ""},
+          {"start", 'n', 0.0, {}, ""},
+          {"end", 'n', 0.1, {}, ""},
+          {"step", 'n', 0.002, {}, ""},
+          {"print_numbers", 'b', 1, {}, ""}},
+         "start >= 0, end >= start + step, step >= 0.0001, at most 100 lines", "filament", pa_keys},
+        {"pa_pattern", "Pressure advance > PA Pattern", CalibMode::Calib_PA_Pattern,
+         {{"extruder", 'e', 0, extruders, ""},
+          {"start", 'n', 0.0, {}, ""},
+          {"end", 'n', 0.08, {}, ""},
+          {"step", 'n', 0.005, {}, ""},
+          {"accelerations", 'i', 0, {}, "mm/s²"},
+          {"speeds", 'i', 0, {}, "mm/s"}},
+         "start >= 0, end >= start + step, step >= 0.0001, at most 100 patterns; accelerations and speeds: at most 10 "
+         "positive whole numbers each (empty = the app's default)",
+         "filament", pa_keys},
+        {"flow_pass1", "Flow rate > Pass 1", CalibMode::Calib_None, {}, flow_rules, "filament", flow_keys},
+        {"flow_pass2", "Flow rate > Pass 2", CalibMode::Calib_None, {}, flow_rules, "filament", flow_keys},
+        {"flow_yolo", "Flow rate > YOLO (Recommended)", CalibMode::Calib_None, {}, flow_rules, "filament", flow_keys},
+        {"flow_yolo_perfectionist", "Flow rate > YOLO (perfectionist version)", CalibMode::Calib_None, {}, flow_rules, "filament", flow_keys},
+        {"temp_tower", "Temperature", CalibMode::Calib_Temp_Tower,
+         {{"material", 'e', 0, materials, ""}, {"start", 'n', 230, {}, "°C"}, {"end", 'n', 190, {}, "°C"}, {"step", 'n', 5, {}, "°C"}},
+         "start <= 350, end >= 170, end <= start - 5, multiples of 5, step is always 5", "filament", {"nozzle_temperature"}},
+        {"max_flowrate", "Max flowrate", CalibMode::Calib_Vol_speed_Tower,
+         {{"start", 'n', 5, {}, "mm³/s"}, {"end", 'n', 20, {}, "mm³/s"}, {"step", 'n', 0.5, {}, "mm³/s"}},
+         "start > 0, step > 0, end >= start + step", "filament", {"filament_max_volumetric_speed"}},
+        {"retraction", "Retraction test", CalibMode::Calib_Retraction_tower,
+         {{"start", 'n', 0, {}, "mm"}, {"end", 'n', 2, {}, "mm"}, {"step", 'n', 0.1, {}, "mm"}},
+         "start >= 0, step > 0, end >= start + step", "filament", {"filament_retraction_length"}},
+        {"vfa", "VFA", CalibMode::Calib_VFA_Tower,
+         {{"start", 'n', 40, {}, "mm/s"}, {"end", 'n', 200, {}, "mm/s"}, {"step", 'n', 10, {}, "mm/s"}},
+         "start > 10, step > 0, end >= start + step", nullptr, {}},
+        {"input_shaping_freq", "Input Shaping > Frequency", CalibMode::Calib_Input_shaping_freq,
+         {{"model", 'e', 0, models, ""},
+          {"freq_start_x", 'n', 15, {}, "Hz"},
+          {"freq_end_x", 'n', 110, {}, "Hz"},
+          {"freq_start_y", 'n', 15, {}, "Hz"},
+          {"freq_end_y", 'n', 110, {}, "Hz"},
+          {"damping", 'n', 0.15, {}, ""}},
+         "0 < freq_start < freq_end <= 500 per axis, 0 <= damping < 1", nullptr, {}},
+        {"input_shaping_damp", "Input Shaping > Damping/zeta factor", CalibMode::Calib_Input_shaping_damp,
+         {{"model", 'e', 0, models, ""},
+          {"freq_x", 'n', 30, {}, "Hz"},
+          {"freq_y", 'n', 30, {}, "Hz"},
+          {"damping_start", 'n', 0.0, {}, ""},
+          {"damping_end", 'n', 0.4, {}, ""}},
+         "0 <= freq_x, freq_y <= 500, 0 <= damping_start < damping_end <= 1", nullptr, {}},
+        {"junction_deviation", "Cornering > Junction Deviation", CalibMode::Calib_Junction_Deviation,
+         {{"model", 'e', 0, models, ""}, {"start", 'n', 0.0, {}, "mm"}, {"end", 'n', 0.25, {}, "mm"}},
+         "0 <= start < end < 1; end > 0.3 may cause layer shift", "printer", {"machine_max_junction_deviation"}},
+    };
+    return tests;
+}
+
+static std::string sw_slicer_calib_mode_name(CalibMode mode)
+{
+    switch (mode) {
+    case CalibMode::Calib_PA_Line:            return "pa_line";
+    case CalibMode::Calib_PA_Pattern:         return "pa_pattern";
+    case CalibMode::Calib_PA_Tower:           return "pa_tower";
+    case CalibMode::Calib_Flow_Rate:          return "flow_rate";
+    case CalibMode::Calib_Temp_Tower:         return "temp_tower";
+    case CalibMode::Calib_Vol_speed_Tower:    return "max_flowrate";
+    case CalibMode::Calib_VFA_Tower:          return "vfa";
+    case CalibMode::Calib_Retraction_tower:   return "retraction";
+    case CalibMode::Calib_Input_shaping_freq: return "input_shaping_freq";
+    case CalibMode::Calib_Input_shaping_damp: return "input_shaping_damp";
+    case CalibMode::Calib_Junction_Deviation: return "junction_deviation";
+    default:                                  return "none";
+    }
+}
+
+static bool sw_slicer_calib_is_pa(const SwCalibTestDef& t)
+{
+    return t.mode == CalibMode::Calib_PA_Tower || t.mode == CalibMode::Calib_PA_Line || t.mode == CalibMode::Calib_PA_Pattern;
+}
+
+static bool sw_slicer_calib_is_flow(const SwCalibTestDef& t) { return std::string(t.id).rfind("flow_", 0) == 0; }
+
+static const SwCalibTestDef& sw_slicer_calib_test_by_id(const std::string& id)
+{
+    for (const SwCalibTestDef& t : sw_slicer_calib_tests())
+        if (id == t.id)
+            return t;
+    throw std::runtime_error("unknown calibration test '" + id + "'");
+}
+
+// The test of a calibration mode (flow tests have no mode); nullptr if none.
+static const SwCalibTestDef* sw_slicer_calib_test_by_mode(CalibMode mode)
+{
+    if (mode == CalibMode::Calib_None)
+        return nullptr;
+    for (const SwCalibTestDef& t : sw_slicer_calib_tests())
+        if (t.mode == mode)
+            return &t;
+    return nullptr;
+}
+
+// Required parameter 'test'.
+static const SwCalibTestDef& sw_slicer_calib_test(const json& params)
+{
+    if (!sw_slicer_has_param(params, "test") || !params.at("test").is_string())
+        throw std::runtime_error("specify 'test' (see sw_SlicerListCalibrations)");
+    return sw_slicer_calib_test_by_id(params.at("test").get<std::string>());
+}
+
+// A number as text for replies and messages (independent of the app's locale).
+static std::string sw_slicer_calib_num(double v)
+{
+    std::ostringstream ss;
+    ss.imbue(std::locale::classic());
+    ss << std::setprecision(10) << v;
+    return ss.str();
+}
+
+static double sw_slicer_calib_round(double v, int decimals)
+{
+    const double f = std::pow(10.0, decimals);
+    return std::round(v * f) / f;
+}
+
+// Start and end temperature of a material, as the temperature dialog sets them (on_filament_type_changed()).
+static std::pair<int, int> sw_slicer_calib_material_temps(const std::string& material)
+{
+    if (material == "abs_asa")
+        return {270, 230};
+    if (material == "petg")
+        return {250, 230};
+    if (material == "pctg")
+        return {280, 240};
+    if (material == "tpu")
+        return {240, 210};
+    if (material == "pa_cf" || material == "pet_cf")
+        return {320, 280};
+    return {230, 190};
+}
+
+// Default of a parameter. 'resolved' holds the parameters before it (extruder and material come first):
+// the PA dialog changes end and step for a Bowden extruder (its reset_params()), the
+// temperature dialog start and end per material.
+static json sw_slicer_calib_default(const SwCalibTestDef& t, const SwCalibParamDef& p, const json& resolved)
+{
+    const std::string name = p.name;
+    if (sw_slicer_calib_is_pa(t) && resolved.is_object() && resolved.value("extruder", std::string("dde")) == "bowden") {
+        if (name == "end")
+            return 1.0;
+        if (name == "step")
+            return t.mode == CalibMode::Calib_PA_Pattern ? 0.05 : 0.02;
+    }
+    if (t.mode == CalibMode::Calib_Temp_Tower) {
+        const std::pair<int, int> temps = sw_slicer_calib_material_temps(resolved.is_object() ? resolved.value("material", std::string("pla")) : "pla");
+        if (name == "start")
+            return temps.first;
+        if (name == "end")
+            return temps.second;
+        if (name == "step")
+            return 5;
+    }
+    switch (p.kind) {
+    case 'e': return std::string(p.choices.front());
+    case 'b': return p.def != 0;
+    case 'i': return json::array();
+    default:  return p.def;
+    }
+}
+
+// A list of positive whole numbers, at most SW_SLICER_CALIB_MAX_LIST values. The dialog drops other
+// values silently (ParseStringValues()); the API refuses them.
+static json sw_slicer_calib_int_list(const json& j, const std::string& key)
+{
+    const std::string err = "'" + key + "' must be a list of positive whole numbers";
+    if (!j.is_array())
+        throw std::runtime_error(err);
+    if (j.size() > SW_SLICER_CALIB_MAX_LIST)
+        throw std::runtime_error("'" + key + "' has more than 10 values");
+    json out = json::array();
+    for (const json& v : j) {
+        if (!v.is_number())
+            throw std::runtime_error(err);
+        const double d = v.get<double>();
+        if (!std::isfinite(d) || d <= 0 || d != std::floor(d) || d > 1e6)
+            throw std::runtime_error(err);
+        out.push_back(static_cast<int>(d));
+    }
+    return out;
+}
+
+// Refuse more than SW_SLICER_CALIB_MAX_STEPS steps, lines or patterns.
+static void sw_slicer_calib_require_steps(double n, const char* what)
+{
+    if (n > SW_SLICER_CALIB_MAX_STEPS)
+        throw std::runtime_error(std::string("too many ") + what + " (" + sw_slicer_calib_num(std::min(n, 1e15)) + "); at most 100");
+}
+
+// The input rules of the dialogs (the on_start() handlers in calib_dlg.cpp), plus the API limits.
+static void sw_slicer_calib_check_rules(const SwCalibTestDef& t, json& r)
+{
+    auto num = [&r](const char* k) { return r.at(k).get<double>(); };
+    switch (t.mode) {
+    case CalibMode::Calib_PA_Tower:
+    case CalibMode::Calib_PA_Line:
+    case CalibMode::Calib_PA_Pattern: {
+        const double s = num("start"), e = num("end"), st = num("step");
+        if (s < 0 || st < EPSILON || e < s + st)
+            throw std::runtime_error("invalid values: start >= 0, end >= start + step, step >= 0.0001");
+        // The counts of the app: tower height in mm (_calib_pa_tower), lines (GCode.cpp), patterns (calib.hpp).
+        if (t.mode == CalibMode::Calib_PA_Tower)
+            sw_slicer_calib_require_steps(std::ceil((e - s) / st) + 1, "steps");
+        else if (t.mode == CalibMode::Calib_PA_Line)
+            sw_slicer_calib_require_steps(std::ceil((e - s) / st) + 1, "lines");
+        else
+            sw_slicer_calib_require_steps(std::ceil((e - s) / st + 1), "patterns");
+        break;
+    }
+    case CalibMode::Calib_Temp_Tower: {
+        const double s = num("start"), e = num("end"), st = num("step");
+        if (s > 350 || e < 170 || e > s - 5)
+            throw std::runtime_error("invalid values: start <= 350, end >= 170, end <= start - 5");
+        if (std::fmod(s, 5.0) != 0 || std::fmod(e, 5.0) != 0)
+            throw std::runtime_error("temperatures must be multiples of 5");
+        if (st != 5)
+            throw std::runtime_error("'step' can only be 5 (the tower has blocks of 5 degrees)");
+        r["start"] = static_cast<int>(s);
+        r["end"]   = static_cast<int>(e);
+        r["step"]  = 5;
+        break;
+    }
+    case CalibMode::Calib_Vol_speed_Tower: {
+        const double s = num("start"), e = num("end"), st = num("step");
+        if (s <= 0 || st <= 0 || e < s + st)
+            throw std::runtime_error("invalid values: start > 0, step > 0, end >= start + step");
+        break;
+    }
+    case CalibMode::Calib_Retraction_tower: {
+        const double s = num("start"), e = num("end"), st = num("step");
+        if (s < 0 || st <= 0 || e < s + st)
+            throw std::runtime_error("invalid values: start >= 0, step > 0, end >= start + step");
+        break;
+    }
+    case CalibMode::Calib_VFA_Tower: {
+        const double s = num("start"), e = num("end"), st = num("step");
+        if (s <= 10 || st <= 0 || e < s + st)
+            throw std::runtime_error("invalid values: start > 10, step > 0, end >= start + step");
+        break;
+    }
+    case CalibMode::Calib_Input_shaping_freq: {
+        // Both axes are checked (the dialog checks freq_end_x twice and freq_end_y not at all).
+        const double sx = num("freq_start_x"), ex = num("freq_end_x"), sy = num("freq_start_y"), ey = num("freq_end_y");
+        if (sx < 0 || sx >= ex || ex > 500 || sy < 0 || sy >= ey || ey > 500)
+            throw std::runtime_error("invalid values: 0 <= freq_start < freq_end <= 500");
+        // API rule: the app also writes a frequency for layer 1, below freq_start (GCode.cpp), and a
+        // negative frequency stops slicing (GCodeWriter::set_input_shaping()).
+        if (sx <= 0 || sy <= 0)
+            throw std::runtime_error("invalid values: freq_start_x and freq_start_y must be > 0");
+        const double d = num("damping");
+        if (d < 0 || d >= 1)
+            throw std::runtime_error("invalid damping factor: 0 <= damping < 1");
+        break;
+    }
+    case CalibMode::Calib_Input_shaping_damp: {
+        const double fx = num("freq_x"), fy = num("freq_y");
+        if (fx < 0 || fx > 500 || fy < 0 || fy > 500)
+            throw std::runtime_error("invalid values: 0 <= freq <= 500");
+        const double ds = num("damping_start"), de = num("damping_end");
+        if (ds < 0 || de > 1 || ds >= de)
+            throw std::runtime_error("invalid damping factors: 0 <= damping_start < damping_end <= 1");
+        break;
+    }
+    case CalibMode::Calib_Junction_Deviation: {
+        const double s = num("start"), e = num("end");
+        if (s < 0 || e >= 1 || s >= e)
+            throw std::runtime_error("invalid values: 0 <= start < end < 1");
+        break;
+    }
+    default: break;
+    }
+}
+
+// The full parameter set of a test: the given values (checked) plus the defaults of the dialog.
+// 'given' is the 'params' object of the request (null = none).
+static json sw_slicer_calib_resolve_params(const SwCalibTestDef& t, const json& given_in)
+{
+    const json given = given_in.is_null() ? json::object() : given_in;
+    if (!given.is_object())
+        throw std::runtime_error("'params' must be an object");
+    for (auto it = given.begin(); it != given.end(); ++it)
+        if (std::none_of(t.params.begin(), t.params.end(), [&it](const SwCalibParamDef& p) { return it.key() == p.name; }))
+            throw std::runtime_error("unknown parameter '" + it.key() + "' for test '" + t.id + "'");
+    json r = json::object();
+    for (const SwCalibParamDef& p : t.params) {
+        const std::string k = p.name;
+        if (!sw_slicer_has_param(given, k.c_str())) {
+            r[k] = sw_slicer_calib_default(t, p, r);
+            continue;
+        }
+        const json& v = given.at(k);
+        switch (p.kind) {
+        case 'n':
+            if (!v.is_number() || !std::isfinite(v.get<double>()))
+                throw std::runtime_error("'" + k + "' must be a number");
+            r[k] = v.get<double>();
+            break;
+        case 'b':
+            if (!v.is_boolean())
+                throw std::runtime_error("'" + k + "' must be true or false");
+            r[k] = v.get<bool>();
+            break;
+        case 'e': {
+            const std::string s = v.is_string() ? v.get<std::string>() : std::string();
+            if (std::none_of(p.choices.begin(), p.choices.end(), [&s](const char* c) { return s == c; })) {
+                std::string list;
+                for (const char* c : p.choices)
+                    list += (list.empty() ? "" : ", ") + std::string(c);
+                throw std::runtime_error("'" + k + "' must be one of: " + list);
+            }
+            r[k] = s;
+            break;
+        }
+        default: r[k] = sw_slicer_calib_int_list(v, k); break;
+        }
+    }
+    sw_slicer_calib_check_rules(t, r);
+    return r;
+}
+
+// Calib_Params for a test. Every field is set: Calib_Params initializes only mode and extruder_id
+// (calib.hpp), the dialogs reuse their member.
+static Calib_Params sw_slicer_calib_params(const SwCalibTestDef& t, const json& r)
+{
+    Calib_Params cp;
+    cp.extruder_id   = 0;
+    cp.start         = 0;
+    cp.end           = 0;
+    cp.step          = 0;
+    cp.print_numbers = false;
+    cp.freqStartX    = 0;
+    cp.freqEndX      = 0;
+    cp.freqStartY    = 0;
+    cp.freqEndY      = 0;
+    cp.test_model    = 0;
+    cp.accelerations.clear();
+    cp.speeds.clear();
+    cp.mode = t.mode;
+    auto num   = [&r](const char* k) { return r.at(k).get<double>(); };
+    auto model = [&r]() { return r.at("model").get<std::string>() == "fast_tower" ? 1 : 0; };
+    switch (t.mode) {
+    case CalibMode::Calib_PA_Tower:
+    case CalibMode::Calib_PA_Line:
+    case CalibMode::Calib_PA_Pattern:
+        cp.start = num("start");
+        cp.end   = num("end");
+        cp.step  = num("step");
+        // The dialog: off for the tower, the checkbox for lines, always on for the pattern.
+        cp.print_numbers = t.mode == CalibMode::Calib_PA_Line ? r.at("print_numbers").get<bool>() : t.mode == CalibMode::Calib_PA_Pattern;
+        if (t.mode == CalibMode::Calib_PA_Pattern) {
+            for (const json& v : r.at("accelerations"))
+                cp.accelerations.push_back(v.get<double>());
+            for (const json& v : r.at("speeds"))
+                cp.speeds.push_back(v.get<double>());
+        }
+        break;
+    case CalibMode::Calib_Temp_Tower:
+        cp.start = num("start");
+        cp.end   = num("end");
+        cp.step  = 5;
+        break;
+    case CalibMode::Calib_Vol_speed_Tower:
+    case CalibMode::Calib_Retraction_tower:
+    case CalibMode::Calib_VFA_Tower:
+        cp.start = num("start");
+        cp.end   = num("end");
+        cp.step  = num("step");
+        break;
+    case CalibMode::Calib_Input_shaping_freq:
+        cp.freqStartX = num("freq_start_x");
+        cp.freqEndX   = num("freq_end_x");
+        cp.freqStartY = num("freq_start_y");
+        cp.freqEndY   = num("freq_end_y");
+        cp.start      = num("damping");
+        cp.test_model = model();
+        break;
+    case CalibMode::Calib_Input_shaping_damp:
+        cp.freqStartX = num("freq_x");
+        cp.freqStartY = num("freq_y");
+        cp.start      = num("damping_start");
+        cp.end        = num("damping_end");
+        cp.test_model = model();
+        break;
+    case CalibMode::Calib_Junction_Deviation:
+        cp.start      = num("start");
+        cp.end        = num("end");
+        cp.test_model = model();
+        break;
+    default: break;
+    }
+    return cp;
+}
+
+// The parameters of a test made in the app, in the form of the API (only the fields the test uses).
+static json sw_slicer_calib_params_json(const SwCalibTestDef& t, const Calib_Params& cp)
+{
+    json r = json::object();
+    const char* model = cp.test_model == 1 ? "fast_tower" : "ringing_tower";
+    switch (t.mode) {
+    case CalibMode::Calib_PA_Tower:
+    case CalibMode::Calib_PA_Line:
+    case CalibMode::Calib_PA_Pattern:
+        r["start"] = cp.start;
+        r["end"]   = cp.end;
+        r["step"]  = cp.step;
+        if (t.mode == CalibMode::Calib_PA_Line)
+            r["print_numbers"] = cp.print_numbers;
+        if (t.mode == CalibMode::Calib_PA_Pattern) {
+            r["accelerations"] = cp.accelerations;
+            r["speeds"]        = cp.speeds;
+        }
+        break;
+    case CalibMode::Calib_Temp_Tower:
+        r["start"] = static_cast<int>(std::lround(cp.start));
+        r["end"]   = static_cast<int>(std::lround(cp.end));
+        r["step"]  = 5;
+        break;
+    case CalibMode::Calib_Vol_speed_Tower:
+    case CalibMode::Calib_Retraction_tower:
+    case CalibMode::Calib_VFA_Tower:
+        r["start"] = cp.start;
+        r["end"]   = cp.end;
+        r["step"]  = cp.step;
+        break;
+    case CalibMode::Calib_Input_shaping_freq:
+        r["model"]        = model;
+        r["freq_start_x"] = cp.freqStartX;
+        r["freq_end_x"]   = cp.freqEndX;
+        r["freq_start_y"] = cp.freqStartY;
+        r["freq_end_y"]   = cp.freqEndY;
+        r["damping"]      = cp.start;
+        break;
+    case CalibMode::Calib_Input_shaping_damp:
+        r["model"]         = model;
+        r["freq_x"]        = cp.freqStartX;
+        r["freq_y"]        = cp.freqStartY;
+        r["damping_start"] = cp.start;
+        r["damping_end"]   = cp.end;
+        break;
+    case CalibMode::Calib_Junction_Deviation:
+        r["model"] = model;
+        r["start"] = cp.start;
+        r["end"]   = cp.end;
+        break;
+    default: break;
+    }
+    return r;
+}
+
+static std::string sw_slicer_calib_flavor()
+{
+    const DynamicPrintConfig& cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    return cfg.has("gcode_flavor") ? cfg.opt_serialize("gcode_flavor") : std::string();
+}
+
+// Does the test work with the selected printer? GCodeWriter::set_junction_deviation() writes M205 J only
+// for Marlin 2; input shaping is SET_INPUT_SHAPER for Klipper and M593 otherwise.
+static json sw_slicer_calib_support(const SwCalibTestDef& t)
+{
+    json              j;
+    const std::string flavor = sw_slicer_calib_flavor();
+    j["supported"]           = true;
+    if (t.mode == CalibMode::Calib_Junction_Deviation && flavor != "marlin2") {
+        j["supported"] = false;
+        j["reason"]    = "junction deviation is only written for Marlin 2 firmware (gcode_flavor is '" + flavor + "')";
+    } else if ((t.mode == CalibMode::Calib_Input_shaping_freq || t.mode == CalibMode::Calib_Input_shaping_damp) &&
+               flavor != "klipper" && flavor != "marlin2" && flavor != "reprapfirmware") {
+        j["note"] = "the app writes M593 for this firmware (gcode_flavor is '" + flavor + "'); check that the firmware supports it";
+    }
+    return j;
+}
+
+// The test changes the edited filament preset but prints with filament 1 (a loaded test model has no
+// 'extruder' setting): refuse if they differ. Empty = no problem.
+static std::string sw_slicer_calib_filament_problem()
+{
+    PresetBundle*     bundle = wxGetApp().preset_bundle;
+    const std::string edited = bundle->filaments.get_edited_preset().name;
+    if (bundle->filament_presets.empty())
+        return "no filament is selected for slot 1";
+    const std::string& slot1 = bundle->filament_presets.front();
+    if (slot1 == edited)
+        return "";
+    return "the test prints with filament 1 ('" + slot1 + "'), but the filament settings being edited belong to '" + edited +
+           "'; select '" + slot1 + "' for editing first";
+}
+
+// Lives as long as the app: the PA pattern keeps a reference to these parameters (CalibPressureAdvancePattern::m_params) and uses it at every reslice, like the dialog's own member.
+static Calib_Params& sw_slicer_calib_storage()
+{
+    static Calib_Params s;
+    return s;
+}
+
+static std::optional<SwCalibRecord>& sw_slicer_calib_record()
+{
+    static std::optional<SwCalibRecord> r;
+    return r;
+}
+
+// The record of the last API calibration, if it still belongs to this project and these presets: at
+// least one test object is still in the model (object ids are unique and kept by undo/redo; the id of
+// the plater's Model never changes, also not on a new project) and the presets have the same names.
+static SwCalibRecord* sw_slicer_calib_valid_record()
+{
+    std::optional<SwCalibRecord>& r = sw_slicer_calib_record();
+    if (!r)
+        return nullptr;
+    const ModelObjectPtrs& objects = wxGetApp().plater()->model().objects;
+    if (std::none_of(objects.begin(), objects.end(), [&r](const ModelObject* mo) {
+            return std::find(r->object_ids.begin(), r->object_ids.end(), mo->id().id) != r->object_ids.end();
+        }))
+        return nullptr;
+    for (int i = 0; i < 3; ++i)
+        if (sw_slicer_preset_collection(sw_slicer_calib_types[i]).get_edited_preset().name != r->presets[i])
+            return nullptr;
+    return &*r;
+}
+
+// The Print of plate 1, which carries the calibration settings: the calib_* functions set them on the
+// Print of the current plate right after their new project, which is plate 1. Plater::fff_print() is
+// not used: that is the plater's own Print object, not the one of a plate.
+static Print* sw_slicer_calib_print()
+{
+    PartPlate* pp = wxGetApp().plater()->get_partplate_list().get_plate(0);
+    return pp != nullptr ? pp->fff_print() : nullptr;
+}
+
+// Leave calibration mode on every plate (and on the plater's own Print), like load_files() does for the
+// current plate. Returns whether a mode was active.
+static bool sw_slicer_calib_reset_mode()
+{
+    Plater* plater = wxGetApp().plater();
+    bool    was    = plater->fff_print().calib_mode() != CalibMode::Calib_None;
+    plater->fff_print().calib_mode() = CalibMode::Calib_None;
+    PartPlateList& plates = plater->get_partplate_list();
+    for (int i = 0; i < plates.get_plate_count(); ++i)
+        if (PartPlate* pp = plates.get_plate(i); pp != nullptr && pp->fff_print() != nullptr) {
+            was = was || pp->fff_print()->calib_mode() != CalibMode::Calib_None;
+            pp->fff_print()->calib_mode() = CalibMode::Calib_None;
+        }
+    return was;
+}
+
+// Value of a (cloned) option as text, like sw_slicer_option_value(): null if missing or nil, cut off
+// above SW_SLICER_MAX_VALUE_CHARS.
+static json sw_slicer_calib_option_text(const ConfigOption* opt, bool& truncated)
+{
+    if (opt == nullptr || opt->is_nil())
+        return nullptr;
+    std::string s = opt->serialize();
+    if (s.size() > SW_SLICER_MAX_VALUE_CHARS) {
+        size_t cut = SW_SLICER_MAX_VALUE_CHARS;
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+            --cut;
+        s         = s.substr(0, cut) + "\xE2\x80\xA6"; // U+2026 horizontal ellipsis
+        truncated = true;
+    }
+    return s;
+}
+
+// The keys whose options differ between two snapshots of the edited presets (printer, print, filament),
+// with cloned options. Vector elements set directly (max_layer_height[0]) are included.
+static std::vector<SwCalibRecord::Change> sw_slicer_calib_diff(const DynamicPrintConfig before[3], const DynamicPrintConfig after[3])
+{
+    std::vector<SwCalibRecord::Change> out;
+    for (int i = 0; i < 3; ++i) {
+        std::set<std::string> keys;
+        for (const std::string& k : before[i].keys())
+            keys.insert(k);
+        for (const std::string& k : after[i].keys())
+            keys.insert(k);
+        for (const std::string& k : keys) {
+            const ConfigOption* a = before[i].option(k);
+            const ConfigOption* b = after[i].option(k);
+            if (a != nullptr && b != nullptr && *a == *b)
+                continue;
+            SwCalibRecord::Change c;
+            c.type = sw_slicer_calib_types[i];
+            c.key  = k;
+            if (a != nullptr)
+                c.before.reset(a->clone());
+            if (b != nullptr)
+                c.after.reset(b->clone());
+            out.push_back(std::move(c));
+        }
+    }
+    return out;
+}
+
+static int sw_slicer_calib_type_order(Preset::Type t) { return t == Preset::TYPE_PRINTER ? 0 : t == Preset::TYPE_PRINT ? 1 : 2; }
+
+// [{type, key, label?, before, after, truncated?}], sorted by type (printer, print, filament) and key.
+static json sw_slicer_calib_changes_json(const std::vector<SwCalibRecord::Change>& changes)
+{
+    std::vector<const SwCalibRecord::Change*> sorted;
+    for (const SwCalibRecord::Change& c : changes)
+        sorted.push_back(&c);
+    std::sort(sorted.begin(), sorted.end(), [](const SwCalibRecord::Change* l, const SwCalibRecord::Change* r) {
+        const int lo = sw_slicer_calib_type_order(l->type), ro = sw_slicer_calib_type_order(r->type);
+        return lo != ro ? lo < ro : l->key < r->key;
+    });
+    json items = json::array();
+    for (const SwCalibRecord::Change* c : sorted) {
+        bool truncated = false;
+        json item;
+        item["type"] = sw_slicer_preset_type_name(c->type);
+        item["key"]  = c->key;
+        if (const ConfigOptionDef* def = print_config_def.get(c->key); def != nullptr && !def->label.empty())
+            item["label"] = def->label;
+        item["before"] = sw_slicer_calib_option_text(c->before.get(), truncated);
+        item["after"]  = sw_slicer_calib_option_text(c->after.get(), truncated);
+        if (truncated)
+            item["truncated"] = true;
+        items.push_back(item);
+    }
+    return items;
+}
+
+// Per object the keys of its own settings (names only; sw_SlicerGetObjectConfig reads the values).
+static json sw_slicer_calib_object_settings()
+{
+    const Model& model = wxGetApp().plater()->model();
+    json         out   = json::array();
+    for (size_t i = 0; i < model.objects.size(); ++i) {
+        const ModelObject* mo   = model.objects[i];
+        t_config_option_keys keys = mo->config.keys();
+        std::sort(keys.begin(), keys.end());
+        out.push_back({{"object", static_cast<int>(i)}, {"name", mo->name}, {"keys", keys}});
+    }
+    return out;
+}
+
+// The undo steps of the app after the last project separator (new project): add_model's
+// "Import Object: ...", the primitive of the PA pattern. They are not "API: " steps.
+static std::vector<std::string> sw_slicer_calib_app_undo_steps()
+{
+    const std::vector<UndoRedo::Snapshot>& snaps = wxGetApp().plater()->undo_redo_stack_main().snapshots();
+    size_t                                 first = 0;
+    for (size_t i = 0; i < snaps.size(); ++i)
+        if (snaps[i].snapshot_data.snapshot_type == UndoRedo::SnapshotType::ProjectSeparator)
+            first = i + 1;
+    std::vector<std::string> names;
+    for (size_t i = first; i < snaps.size(); ++i)
+        if (!snaps[i].is_topmost() && UndoRedo::snapshot_modifies_project(snaps[i]))
+            names.push_back(snaps[i].name);
+    return names;
+}
+
+// Height of the model above the bed: the sliced range of the (cut) test model.
+static double sw_slicer_calib_model_height()
+{
+    double h = 0;
+    for (const ModelObject* mo : wxGetApp().plater()->model().objects)
+        if (!mo->instances.empty()) {
+            const BoundingBoxf3 bb = mo->instance_bounding_box(0);
+            h                      = std::max(h, bb.max.z() - std::max(0.0, bb.min.z()));
+        }
+    return h;
+}
+
+// The layer heights (print_z) the G-code goes through, counted like m_layer_count in GCode::_do_export()
+// for printing by layer: all object and support layers, merged when closer than EPSILON. Empty if the
+// plate is not sliced (or slicing runs).
+static std::vector<double> sw_slicer_calib_layer_zs(const Print* print)
+{
+    std::vector<double> out;
+    if (print == nullptr || wxGetApp().plater()->is_background_process_slicing() || !print->is_step_done(psSlicingFinished))
+        return out;
+    std::vector<double> zs;
+    for (const PrintObject* o : print->objects()) {
+        for (const Layer* l : o->layers())
+            zs.push_back(l->print_z);
+        for (const SupportLayer* l : o->support_layers())
+            zs.push_back(l->print_z);
+    }
+    std::sort(zs.begin(), zs.end());
+    for (double z : zs)
+        if (out.empty() || std::abs(z - out.back()) >= EPSILON)
+            out.push_back(z);
+    return out;
+}
+
+// The mapping height/line/pattern/object/layer -> value as the app uses it when slicing (GCode.cpp,
+// calib.cpp, the object settings of the flow tests). 'p' are the parameters in the form of the API;
+// app_units: a max flowrate test made in the app (its parameters are stored in mm/s). Read-only.
+static json sw_slicer_calib_mapping(const SwCalibTestDef& t, const json& p, const Print* print, double flow_ratio, bool app_units)
+{
+    json        m;
+    json        table = json::array();
+    json        notes = json::array();
+    const double h    = sw_slicer_calib_model_height();
+    auto        d     = [&p](const char* k) { return p.at(k).get<double>(); };
+    const size_t max_rows = 2000;
+    m["value_key"] = t.result_type != nullptr ? json{{"type", t.result_type}, {"key", t.result_keys.front()}} : json(nullptr);
+    m["unit"]      = "";
+    // Rows per height band: [z_from, z_to) of the layer top (print_z), cut at the model height.
+    auto band = [&table, h](double z_from, double z_to, double value) {
+        table.push_back({{"z_from", sw_slicer_calib_round(z_from, 3)}, {"z_to", sw_slicer_calib_round(std::min(z_to, h), 3)}, {"value", value}});
+    };
+    auto covered_up_to = [&notes, &table](double end, bool descending) {
+        if (table.empty())
+            return;
+        const double last = table.back().at("value").get<double>();
+        if (!descending && last < end - 1e-9)
+            notes.push_back("the model covers values up to " + sw_slicer_calib_num(last) + "; higher values are not printed");
+        if (descending && last > end + 1e-9)
+            notes.push_back("the model covers values down to " + sw_slicer_calib_num(last) + "; lower values are not printed");
+    };
+    switch (t.mode) {
+    case CalibMode::Calib_PA_Tower: {
+        m["axis"]    = "z";
+        m["formula"] = "start + floor(z) * step";
+        for (int k = 0; k < h && table.size() < max_rows; ++k)
+            band(k, k + 1, sw_slicer_calib_round(d("start") + k * d("step"), 6));
+        covered_up_to(d("end"), false);
+        break;
+    }
+    case CalibMode::Calib_Temp_Tower: {
+        m["axis"]    = "z";
+        m["unit"]    = "°C";
+        m["formula"] = "start - 5 * floor(z / 10.001)";
+        for (int b = 0; b * 10.001 < h && table.size() < max_rows; ++b)
+            band(b * 10.001, (b + 1) * 10.001, d("start") - 5.0 * b);
+        covered_up_to(d("end"), true);
+        break;
+    }
+    case CalibMode::Calib_VFA_Tower: {
+        m["axis"]    = "z";
+        m["unit"]    = "mm/s";
+        m["formula"] = "round(start + floor(z / 5) * step) (outer wall speed)";
+        for (int b = 0; b * 5.0 < h && table.size() < max_rows; ++b)
+            band(b * 5.0, (b + 1) * 5.0, std::round(d("start") + b * d("step")));
+        covered_up_to(d("end"), false);
+        break;
+    }
+    case CalibMode::Calib_Vol_speed_Tower: {
+        m["axis"] = "z";
+        m["unit"] = app_units ? "mm/s" : "mm³/s";
+        m["formula"] = app_units ? "start + z * step (outer wall speed, rounded to whole mm/s)" :
+                                   "start + z * step (outer wall speed = this / mm³ per mm, rounded to whole mm/s)";
+        for (int k = 0; k < h && table.size() < max_rows; ++k)
+            band(k, k + 1, sw_slicer_calib_round(d("start") + k * d("step"), 4));
+        notes.push_back("the value is the one at the bottom of each band; it rises continuously with the height");
+        if (app_units)
+            notes.push_back("this test was made in the app, which stores its values as outer wall speed in mm/s");
+        covered_up_to(d("end"), false);
+        break;
+    }
+    case CalibMode::Calib_Retraction_tower: {
+        m["axis"]    = "z";
+        m["unit"]    = "mm";
+        m["formula"] = "start + floor(max(0, z - 0.4)) * step";
+        if (h > 0)
+            band(0, 1.4, sw_slicer_calib_round(d("start"), 4));
+        for (int k = 1; 0.4 + k < h && table.size() < max_rows; ++k)
+            band(0.4 + k, 0.4 + k + 1, sw_slicer_calib_round(d("start") + k * d("step"), 4));
+        covered_up_to(d("end"), false);
+        break;
+    }
+    case CalibMode::Calib_PA_Line: {
+        // GCode.cpp: count = llround(ceil((end - start) / step)) + 1, limited by the bed depth in
+        // CalibPressureAdvanceLine::generate_test(); line i at start_y + i * 3.5 mm (front to back).
+        m["axis"]    = "line";
+        m["formula"] = "start + i * step, i = 0 ... count-1, count = ceil((end - start) / step) + 1; a number at every 2nd line";
+        long long count = std::llround(std::ceil((d("end") - d("start")) / d("step"))) + 1;
+        const ConfigOptionPoints* area = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionPoints>("printable_area");
+        if (area != nullptr && area->values.size() <= 4 && !area->values.empty()) {
+            const long long fit = static_cast<long long>((get_extents(area->values).size().y() - 10) / 3.5);
+            if (fit < count) {
+                notes.push_back("the bed fits only " + std::to_string(fit) + " lines; the app prints only the first " + std::to_string(fit));
+                count = fit;
+            }
+        } else if (area != nullptr && area->values.size() > 4) {
+            notes.push_back("on a round bed the app may print fewer lines");
+        }
+        const bool numbers = p.value("print_numbers", true);
+        for (long long i = 0; i < count && table.size() < max_rows; ++i)
+            table.push_back({{"index", i}, {"value", sw_slicer_calib_round(d("start") + i * d("step"), 6)}, {"labeled", numbers && i % 2 == 0}});
+        m["count"] = count;
+        notes.push_back("line 0 is the front line; the lines go to the back of the bed");
+        break;
+    }
+    case CalibMode::Calib_PA_Pattern: {
+        m["axis"]    = "pattern";
+        m["formula"] = "start + j * step, j = 0 ... count-1, count = ceil((end - start) / step + 1), left to right; a number at every 2nd pattern";
+        const int count = static_cast<int>(std::ceil((d("end") - d("start")) / d("step") + 1));
+        for (int j = 0; j < count && table.size() < max_rows; ++j)
+            table.push_back({{"index", j}, {"value", sw_slicer_calib_round(d("start") + j * d("step"), 6)}, {"labeled", j % 2 == 0}});
+        m["count"] = count;
+        // Speed and acceleration of each test from the object name pa_pattern_<speed>_<accel> (_calib_pa_pattern()).
+        json         objects = json::array();
+        const Model& model   = wxGetApp().plater()->model();
+        for (size_t i = 0; i < model.objects.size(); ++i) {
+            const std::string& name = model.objects[i]->name;
+            int                speed = 0, accel = 0;
+            if (std::sscanf(name.c_str(), "pa_pattern_%d_%d", &speed, &accel) == 2)
+                objects.push_back({{"object", static_cast<int>(i)}, {"name", name}, {"speed", speed}, {"acceleration", accel}});
+        }
+        m["objects"] = objects;
+        break;
+    }
+    case CalibMode::Calib_Input_shaping_freq:
+    case CalibMode::Calib_Input_shaping_damp:
+    case CalibMode::Calib_Junction_Deviation: {
+        // GCode.cpp: the layer index i counts from 0 (layer 1 in the preview); 'layer' below is i + 1.
+        m["axis"] = "layer";
+        if (t.mode == CalibMode::Calib_Input_shaping_freq) {
+            m["unit"]    = "Hz";
+            m["formula"] = "layer 1 and from layer 3: freq_start + (freq_end - freq_start) * (layer - 3) / (layer_count - 3) per axis; "
+                           "layer 2: damping = damping (layer 1 gives a frequency below freq_start)";
+        } else if (t.mode == CalibMode::Calib_Input_shaping_damp) {
+            m["formula"] = "layer 2: frequencies freq_x, freq_y; other layers: damping_start + (damping_end - damping_start) * (layer - 1) / layer_count";
+        } else {
+            m["unit"]    = "mm";
+            m["formula"] = "start + (end - start) * (layer - 1) / layer_count";
+        }
+        const std::vector<double> zs = sw_slicer_calib_layer_zs(print);
+        if (zs.empty()) {
+            table = nullptr;
+            notes.push_back("slice first for a per-layer table");
+            break;
+        }
+        const unsigned int count = static_cast<unsigned int>(zs.size());
+        m["layer_count"]         = count;
+        // Same arithmetic as GCode.cpp (m_layer_count is unsigned).
+        const double freq_div = static_cast<double>(count - 3u);
+        if (t.mode == CalibMode::Calib_Input_shaping_freq) {
+            if (count <= 3)
+                notes.push_back("only " + std::to_string(count) + " layers: the frequency formula divides by layer_count - 3, so the values are not usable");
+            const double low = std::min(d("freq_start_x") - 2 * (d("freq_end_x") - d("freq_start_x")) / freq_div,
+                                        d("freq_start_y") - 2 * (d("freq_end_y") - d("freq_start_y")) / freq_div);
+            if (count > 3 && low < 0)
+                notes.push_back("slicing fails: the frequency for layer 1 is below 0 (" + sw_slicer_calib_num(sw_slicer_calib_round(low, 2)) +
+                                " Hz); use a higher freq_start or a smaller range");
+        }
+        for (unsigned int i = 0; i < count && table.size() < max_rows; ++i) {
+            json row;
+            row["layer"] = i + 1;
+            row["z"]     = sw_slicer_calib_round(zs[i], 3);
+            if (t.mode == CalibMode::Calib_Input_shaping_freq) {
+                row["freq_x"]  = nullptr;
+                row["freq_y"]  = nullptr;
+                row["damping"] = nullptr;
+                if (i == 1)
+                    row["damping"] = d("damping");
+                else {
+                    // Layer 1 (i = 0) takes this branch too in GCode.cpp: (0 - 2) gives a value below freq_start.
+                    row["freq_x"] = sw_slicer_calib_round(d("freq_start_x") + (d("freq_end_x") - d("freq_start_x")) * (static_cast<int>(i) - 2) / freq_div, 2);
+                    row["freq_y"] = sw_slicer_calib_round(d("freq_start_y") + (d("freq_end_y") - d("freq_start_y")) * (static_cast<int>(i) - 2) / freq_div, 2);
+                }
+            } else if (t.mode == CalibMode::Calib_Input_shaping_damp) {
+                row["freq_x"]  = nullptr;
+                row["freq_y"]  = nullptr;
+                row["damping"] = nullptr;
+                if (i == 1) {
+                    row["freq_x"] = d("freq_x");
+                    row["freq_y"] = d("freq_y");
+                } else
+                    row["damping"] = sw_slicer_calib_round(d("damping_start") + (d("damping_end") - d("damping_start")) * i / count, 3);
+            } else {
+                row["value"] = sw_slicer_calib_round(d("start") + (d("end") - d("start")) * i / count, 3);
+            }
+            table.push_back(row);
+        }
+        if (print != nullptr && print->config().print_sequence == PrintSequence::ByObject)
+            notes.push_back("the table assumes printing by layer; printing by object counts the layers of every object");
+        break;
+    }
+    default: {
+        if (!sw_slicer_calib_is_flow(t))
+            break;
+        // Flow tests: print_flow_ratio per object, set from the object name flowrate_<modifier>
+        // (adjust_settings_for_flowrate_calib(), 'm' = minus).
+        const bool linear = std::string(t.id).rfind("flow_yolo", 0) == 0;
+        m["axis"]         = "object";
+        m["formula"]      = linear ? "flow_ratio + modifier" : "flow_ratio * (1 + modifier / 100)";
+        const Model& model = wxGetApp().plater()->model();
+        for (size_t i = 0; i < model.objects.size(); ++i) {
+            const ModelObject* mo = model.objects[i];
+            if (mo->name.rfind("flowrate_", 0) != 0)
+                continue;
+            json row;
+            row["object"] = static_cast<int>(i);
+            row["name"]   = mo->name;
+            std::string text = mo->name.substr(9);
+            if (!text.empty() && text[0] == 'm')
+                text[0] = '-';
+            std::istringstream ss(text);
+            ss.imbue(std::locale::classic());
+            double modifier = 0;
+            row["modifier"] = (ss >> modifier) ? json(modifier) : json(nullptr);
+            const double pfr = mo->config.has("print_flow_ratio") ? mo->config.opt_float("print_flow_ratio") : 1.0;
+            row["print_flow_ratio"] = sw_slicer_calib_round(pfr, 6);
+            row["flow_ratio"]       = flow_ratio > 0 ? json(sw_slicer_calib_round(flow_ratio * pfr, 4)) : json(nullptr);
+            table.push_back(row);
+        }
+        if (flow_ratio > 0)
+            m["flow_ratio_before"] = flow_ratio;
+        break;
+    }
+    }
+    if (table.is_array() && table.size() >= max_rows)
+        notes.push_back("the table was cut off after " + std::to_string(max_rows) + " rows");
+    m["table"] = table;
+    m["notes"] = notes;
+    return m;
+}
+
+// List the calibration tests of the Calibration menu with parameters, defaults, rules, result key and
+// whether the test works with the selected printer. Read-only.
+void SSWCP_SliceProject_Instance::sw_SlicerListCalibrations()
+{
+    try {
+        sw_slicer_require_fff();
+        json tests = json::array();
+        for (const SwCalibTestDef& t : sw_slicer_calib_tests()) {
+            json jt;
+            jt["test"] = t.id;
+            jt["menu"] = t.menu;
+            jt["mode"] = sw_slicer_calib_mode_name(t.mode);
+            json params   = json::array();
+            json defaults = json::object();
+            for (const SwCalibParamDef& p : t.params) {
+                json jp;
+                jp["name"] = p.name;
+                jp["type"] = p.kind == 'n' ? "number" : p.kind == 'i' ? "int_list" : p.kind == 'b' ? "bool" : "enum";
+                jp["default"]       = sw_slicer_calib_default(t, p, defaults);
+                defaults[p.name]    = jp["default"];
+                if (p.kind == 'e') {
+                    json choices = json::array();
+                    for (const char* c : p.choices)
+                        choices.push_back(c);
+                    jp["choices"] = choices;
+                }
+                if (p.unit != nullptr && *p.unit != '\0')
+                    jp["unit"] = p.unit;
+                const std::string name = p.name;
+                if (sw_slicer_calib_is_pa(t) && (name == "end" || name == "step"))
+                    jp["default_bowden"] = sw_slicer_calib_default(t, p, json{{"extruder", "bowden"}});
+                if (t.mode == CalibMode::Calib_Temp_Tower && (name == "start" || name == "end")) {
+                    json by = json::object();
+                    for (const char* mat : t.params.front().choices)
+                        by[mat] = sw_slicer_calib_default(t, p, json{{"material", mat}});
+                    jp["defaults_by_material"] = by;
+                }
+                params.push_back(jp);
+            }
+            jt["params"] = params;
+            jt["rules"]  = t.rules;
+            if (t.result_type != nullptr) {
+                json keys = json::array();
+                for (const char* k : t.result_keys)
+                    keys.push_back(k);
+                jt["result"] = {{"type", t.result_type}, {"keys", keys}};
+            } else
+                jt["result"] = nullptr;
+            jt.update(sw_slicer_calib_support(t));
+            tests.push_back(jt);
+        }
+
+        const DynamicPrintConfig& printer = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+        const ConfigOptionFloats* nozzle  = printer.option<ConfigOptionFloats>("nozzle_diameter");
+        json                      jprinter;
+        jprinter["name"]            = wxGetApp().preset_bundle->printers.get_edited_preset().name;
+        jprinter["gcode_flavor"]    = sw_slicer_calib_flavor();
+        jprinter["nozzle_diameter"] = (nozzle != nullptr && !nozzle->values.empty()) ? json(nozzle->get_at(0)) : json(nullptr);
+
+        const std::vector<std::string>& slots   = wxGetApp().preset_bundle->filament_presets;
+        const std::string               problem = sw_slicer_calib_filament_problem();
+        json                            jfilament;
+        jfilament["edited"] = wxGetApp().preset_bundle->filaments.get_edited_preset().name;
+        jfilament["slot_1"] = slots.empty() ? json(nullptr) : json(slots.front());
+        jfilament["ok"]     = problem.empty();
+        if (!problem.empty())
+            jfilament["problem"] = problem;
+
+        m_res_data["tests"]    = tests;
+        m_res_data["printer"]  = jprinter;
+        m_res_data["filament"] = jfilament;
+        m_res_data["notes"]    = json::array();
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Create a calibration test project like the Calibration menu, without its dialogs. Closes the current
+// project (F1 contract: discard_unsaved, preset_changes). The test changes preset values (not saved);
+// the reply lists them. Never prints.
+void SSWCP_SliceProject_Instance::sw_SlicerCalibrate()
+{
+    try {
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr) {
+            handle_general_fail(-1, "no active plater");
+            return;
+        }
+        // 1. Guards.
+        sw_slicer_require_free_gizmo();
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_no_export();
+        sw_slicer_require_fff();
+
+        // 2.-3. Test, parameters, printer and filament: all checked before anything changes.
+        const SwCalibTestDef& def      = sw_slicer_calib_test(m_param_data);
+        const json            resolved = sw_slicer_calib_resolve_params(def, m_param_data.count("params") ? m_param_data.at("params") : json());
+        const json            support  = sw_slicer_calib_support(def);
+        if (!support.at("supported").get<bool>())
+            throw std::runtime_error(support.at("reason").get<std::string>());
+        const std::string problem = sw_slicer_calib_filament_problem();
+        if (!problem.empty())
+            throw std::runtime_error(problem);
+
+        // 4. Project switch (as sw_SlicerNewProject).
+        sw_slicer_require_discard(m_param_data);
+        const std::string presets   = sw_slicer_preset_choice(m_param_data, /*allow_keep=*/true);
+        const bool        was_dirty = sw_slicer_project_dirty();
+
+        // 5. Create the test.
+        DynamicPrintConfig       before[3];
+        DynamicPrintConfig       after[3];
+        std::vector<std::string> api_notes;
+        {
+            // RAII: refuse other model and preset changes until the test project is complete.
+            struct InProgress
+            {
+                InProgress() { sw_slicer_calib_in_progress() = true; }
+                ~InProgress() { sw_slicer_calib_in_progress() = false; }
+            } in_progress;
+            sswcp_api::Scope api_scope;
+            // Start from a clean project first (same steps as sw_SlicerNewProject), so the values captured
+            // below are the ones the test starts from; the calib_* function then opens its own new project
+            // on a clean plater, which asks nothing (close_with_confirm).
+            if (presets == "discard")
+                sw_slicer_discard_preset_changes();
+            plater->new_project(/*skip_confirm=*/true, /*silent=*/false);
+            for (int i = 0; i < 3; ++i)
+                before[i] = sw_slicer_preset_collection(sw_slicer_calib_types[i]).get_edited_preset().config;
+            Calib_Params& cp = sw_slicer_calib_storage();
+            cp               = sw_slicer_calib_params(def, resolved);
+            const std::string id = def.id;
+            switch (def.mode) {
+            case CalibMode::Calib_PA_Tower:
+            case CalibMode::Calib_PA_Line:
+            case CalibMode::Calib_PA_Pattern:         plater->calib_pa(sw_slicer_calib_storage()); break;
+            case CalibMode::Calib_Temp_Tower:         plater->calib_temp(cp); break;
+            case CalibMode::Calib_Vol_speed_Tower:    plater->calib_max_vol_speed(cp); break;
+            case CalibMode::Calib_Retraction_tower:   plater->calib_retraction(cp); break;
+            case CalibMode::Calib_VFA_Tower:          plater->calib_VFA(cp); break;
+            case CalibMode::Calib_Input_shaping_freq: plater->calib_input_shaping_freq(cp); break;
+            case CalibMode::Calib_Input_shaping_damp: plater->calib_input_shaping_damp(cp); break;
+            case CalibMode::Calib_Junction_Deviation: plater->calib_junction_deviation(cp); break;
+            default:
+                plater->calib_flowrate(/*is_linear=*/id == "flow_yolo" || id == "flow_yolo_perfectionist",
+                                       /*pass=*/(id == "flow_pass2" || id == "flow_yolo_perfectionist") ? 2 : 1);
+                break;
+            }
+            // calib_retraction and calib_pa do not refresh every tab.
+            for (Preset::Type t : sw_slicer_calib_types) {
+                Tab* tab = sw_slicer_preset_tab(t);
+                tab->update_dirty();
+                tab->reload_config();
+            }
+            api_notes = sswcp_api::notes();
+        }
+
+        // 6. Check the result.
+        Print* print = sw_slicer_calib_print();
+        if (plater->model().objects.empty() || (def.mode != CalibMode::Calib_None && (print == nullptr || print->calib_mode() != def.mode)))
+            throw std::runtime_error(sw_slicer_join_notes("the calibration project could not be created", api_notes));
+
+        // 7. Record what the test changed.
+        for (int i = 0; i < 3; ++i)
+            after[i] = sw_slicer_preset_collection(sw_slicer_calib_types[i]).get_edited_preset().config;
+        SwCalibRecord rec;
+        rec.test         = def.id;
+        rec.params       = resolved;
+        rec.project_name = into_u8(plater->get_project_name());
+        for (const ModelObject* mo : plater->model().objects)
+            rec.object_ids.push_back(mo->id().id);
+        for (int i = 0; i < 3; ++i)
+            rec.presets[i] = sw_slicer_preset_collection(sw_slicer_calib_types[i]).get_edited_preset().name;
+        if (const ConfigOptionFloats* fr = before[2].option<ConfigOptionFloats>("filament_flow_ratio"); fr != nullptr && !fr->values.empty())
+            rec.flow_ratio = fr->get_at(0);
+        rec.changes = sw_slicer_calib_diff(before, after);
+        const json changes = sw_slicer_calib_changes_json(rec.changes);
+        const size_t n_changes = rec.changes.size();
+        const std::string project_name = rec.project_name;
+        const double flow_ratio = rec.flow_ratio;
+        sw_slicer_calib_record() = std::move(rec);
+
+        // 8. Reply.
+        json objects = json::array();
+        for (const json& o : sw_slicer_objects_json())
+            objects.push_back({{"object", o.at("object")}, {"name", o.at("name")}, {"plate", o.at("plate")}});
+        const int  plates  = plater->get_partplate_list().get_plate_count();
+        const json mapping = sw_slicer_calib_mapping(def, resolved, print, flow_ratio, false);
+
+        // 9. Notes.
+        std::vector<std::string> notes;
+        sw_slicer_add_note(notes, "new project '" + project_name + "'; the previous project was closed (this cannot be undone)");
+        if (was_dirty)
+            sw_slicer_add_note(notes, "unsaved changes discarded");
+        if (presets == "keep")
+            sw_slicer_add_note(notes, "preset changes kept for the test");
+        else if (presets == "discard")
+            sw_slicer_add_note(notes, "preset changes discarded");
+        if (n_changes > 0)
+            sw_slicer_add_note(notes, "the test changed " + std::to_string(n_changes) +
+                                          " preset values; they are unsaved and are restored by sw_SlicerApplyCalibration");
+        else
+            sw_slicer_add_note(notes, "the test changed no preset values");
+        const std::vector<std::string> steps = sw_slicer_calib_app_undo_steps();
+        if (!steps.empty()) {
+            std::string list;
+            for (const std::string& s : steps)
+                list += (list.empty() ? "'" : ", '") + s + "'";
+            sw_slicer_add_note(notes, steps.size() == 1 ? "the app added its own undo step " + list + " (sw_SlicerUndo cannot revert it)" :
+                                                          "the app added its own undo steps " + list + " (sw_SlicerUndo cannot revert them)");
+        }
+        if (def.mode == CalibMode::Calib_PA_Pattern && plates > 1)
+            sw_slicer_add_note(notes, "the test patterns did not fit on one plate; only plate 1 carries the calibration settings (as in the "
+                                      "app); use fewer speeds or accelerations");
+        for (const json& n : mapping.at("notes"))
+            sw_slicer_add_note(notes, n.get<std::string>());
+        if (def.mode == CalibMode::Calib_Junction_Deviation && resolved.at("end").get<double>() > 0.3)
+            sw_slicer_add_note(notes, "high values may cause layer shift");
+        if (support.count("note"))
+            sw_slicer_add_note(notes, support.at("note").get<std::string>());
+        sw_slicer_add_note(notes, "slice with sw_SlicerSlice; the API never starts a print");
+        sw_slicer_add_notes(notes, api_notes);
+
+        m_res_data["test"]            = def.id;
+        m_res_data["params"]          = resolved;
+        m_res_data["project_name"]    = project_name;
+        m_res_data["objects"]         = objects;
+        m_res_data["plates"]          = plates;
+        m_res_data["preset_changes"]  = changes;
+        m_res_data["object_settings"] = sw_slicer_calib_object_settings();
+        m_res_data["calibration"]     = mapping;
+        m_res_data["project_dirty"]   = sw_slicer_project_dirty();
+        m_res_data["presets_dirty"]   = sw_slicer_presets_dirty();
+        m_res_data["notes"]           = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Which calibration test is active and the mapping height/line/pattern/object/layer -> value, as the app
+// uses it when slicing. Read-only.
+void SSWCP_SliceProject_Instance::sw_SlicerGetCalibration()
+{
+    try {
+        sw_slicer_require_fff();
+        Plater*              plater = wxGetApp().plater();
+        const Print*         print  = sw_slicer_calib_print();
+        const CalibMode      mode   = print != nullptr ? print->calib_mode() : CalibMode::Calib_None;
+        const SwCalibRecord* rec    = sw_slicer_calib_valid_record();
+        std::vector<std::string> notes;
+
+        const SwCalibTestDef* def = nullptr;
+        json                  params;
+        std::string           source;
+        if (rec != nullptr) {
+            def    = &sw_slicer_calib_test_by_id(rec->test);
+            params = rec->params;
+            source = "api";
+        } else if ((def = sw_slicer_calib_test_by_mode(mode)) != nullptr) {
+            params = sw_slicer_calib_params_json(*def, print->calib_params());
+            source = "app";
+        }
+        bool active = false;
+        if (def != nullptr) {
+            active = sw_slicer_calib_is_flow(*def) || mode == def->mode;
+            if (rec != nullptr && !active)
+                sw_slicer_add_note(notes, "the calibration mode was reset (for example by a model import); the test model no longer slices with the calibration steps");
+        }
+        if (mode != CalibMode::Calib_None && plater->model().objects.empty())
+            sw_slicer_add_note(notes, "the calibration mode is still active from an earlier test; it is reset by the next model import (app behaviour)");
+        if (active && plater->get_partplate_list().get_curr_plate_index() != 0)
+            sw_slicer_add_note(notes, "the calibration settings belong to plate 1");
+
+        json mapping = nullptr;
+        if (def != nullptr) {
+            const bool app_units = source == "app" && def->mode == CalibMode::Calib_Vol_speed_Tower;
+            mapping = sw_slicer_calib_mapping(*def, params, print, rec != nullptr ? rec->flow_ratio : 0, app_units);
+        }
+
+        m_res_data["active"]        = active;
+        m_res_data["test"]          = def != nullptr ? json(def->id) : json(nullptr);
+        m_res_data["mode"]          = sw_slicer_calib_mode_name(mode);
+        m_res_data["source"]        = source.empty() ? json(nullptr) : json(source);
+        m_res_data["params"]        = def != nullptr ? params : json(nullptr);
+        m_res_data["project_name"]  = rec != nullptr ? rec->project_name : into_u8(plater->get_project_name());
+        m_res_data["record_valid"]  = rec != nullptr;
+        m_res_data["mapping"]       = mapping;
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Restore the preset values the last API calibration changed and set the chosen value in the preset
+// that holds the result. Nothing is saved (sw_SlicerSavePreset does that); presets are not part of undo.
+void SSWCP_SliceProject_Instance::sw_SlicerApplyCalibration()
+{
+    try {
+        // 1. Guards.
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_fff();
+
+        // 2. Which test.
+        SwCalibRecord*           rec      = sw_slicer_calib_valid_record();
+        const bool               has_test = sw_slicer_has_param(m_param_data, "test");
+        std::vector<std::string> notes;
+        if (has_test && !m_param_data.at("test").is_string())
+            throw std::runtime_error("'test' must be a test name (see sw_SlicerListCalibrations)");
+        if (rec == nullptr && !has_test)
+            throw std::runtime_error("no calibration made through the API in this project; pass 'test'");
+        const SwCalibTestDef& def = sw_slicer_calib_test_by_id(has_test ? m_param_data.at("test").get<std::string>() : rec->test);
+        if (rec != nullptr && rec->test != def.id)
+            throw std::runtime_error("the last calibration was '" + rec->test + "'");
+        bool restore = true;
+        if (sw_slicer_has_param(m_param_data, "restore_test_settings")) {
+            if (!m_param_data.at("restore_test_settings").is_boolean())
+                throw std::runtime_error("'restore_test_settings' must be true or false");
+            restore = m_param_data.at("restore_test_settings").get<bool>();
+        }
+
+        // 3. Result key.
+        if (def.result_type == nullptr)
+            throw std::runtime_error("'" + std::string(def.id) + "' has no slicer setting to apply; use the mapping (sw_SlicerGetCalibration)");
+        const Preset::Type result_type = sw_slicer_preset_type(def.result_type);
+
+        // 4. Value.
+        const bool flow       = sw_slicer_calib_is_flow(def);
+        const bool has_value  = sw_slicer_has_param(m_param_data, "value");
+        const bool has_object = sw_slicer_has_param(m_param_data, "object");
+        if (has_object && !flow)
+            throw std::runtime_error("'object' is only for the flow rate tests");
+        if (has_value && has_object)
+            throw std::runtime_error("pass either 'value' or 'object', not both");
+        double value = 0;
+        if (has_object) {
+            if (rec == nullptr)
+                throw std::runtime_error("'object' needs the calibration of sw_SlicerCalibrate in this project; pass 'value' instead");
+            if (!m_param_data.at("object").is_number_integer())
+                throw std::runtime_error("'object' must be an object index");
+            const int  obj     = m_param_data.at("object").get<int>();
+            const json mapping = sw_slicer_calib_mapping(def, rec->params, sw_slicer_calib_print(), rec->flow_ratio, false);
+            bool       found   = false;
+            for (const json& row : mapping.at("table"))
+                if (row.at("object").get<int>() == obj && row.at("flow_ratio").is_number()) {
+                    value = row.at("flow_ratio").get<double>();
+                    found = true;
+                }
+            if (!found)
+                throw std::runtime_error("object " + std::to_string(obj) + " is not a flow test object (see the mapping of sw_SlicerGetCalibration)");
+        } else if (has_value) {
+            const json& v = m_param_data.at("value");
+            if (!v.is_number() || !std::isfinite(v.get<double>()))
+                throw std::runtime_error("'value' must be a number");
+            value = v.get<double>();
+        } else {
+            throw std::runtime_error("specify 'value'");
+        }
+        const bool temp = def.mode == CalibMode::Calib_Temp_Tower;
+        if (flow && (value <= 0 || value > 2))
+            throw std::runtime_error("'value' must be > 0 and <= 2");
+        if (temp && (value != std::floor(value) || value < 150 || value > 350))
+            throw std::runtime_error("'value' must be a whole number from 150 to 350");
+        if (sw_slicer_calib_is_pa(def) && (value < 0 || value > 2))
+            throw std::runtime_error("'value' must be from 0 to 2");
+        if (def.mode == CalibMode::Calib_Vol_speed_Tower && (value <= 0 || value > 200))
+            throw std::runtime_error("'value' must be > 0 and <= 200");
+        if (def.mode == CalibMode::Calib_Retraction_tower && (value < 0 || value > 10))
+            throw std::runtime_error("'value' must be from 0 to 10");
+        if (def.mode == CalibMode::Calib_Junction_Deviation && (value < 0 || value >= 1))
+            throw std::runtime_error("'value' must be >= 0 and < 1");
+        if (rec != nullptr && !flow && rec->params.count("start") && rec->params.count("end")) {
+            const double a = rec->params.at("start").get<double>(), b = rec->params.at("end").get<double>();
+            if (value < std::min(a, b) - 1e-9 || value > std::max(a, b) + 1e-9)
+                sw_slicer_add_note(notes, sw_slicer_calib_num(value) + " is outside the tested range " + sw_slicer_calib_num(a) + "\xE2\x80\x93" +
+                                              sw_slicer_calib_num(b));
+        }
+
+        // 5. Restore the test settings: every recorded change whose value is still the test value.
+        json                   restored     = json::array();
+        json                   not_restored = json::array();
+        std::set<Preset::Type> touched;
+        auto is_result_key = [&](const SwCalibRecord::Change& c) {
+            return c.type == result_type && std::any_of(def.result_keys.begin(), def.result_keys.end(), [&c](const char* k) { return c.key == k; });
+        };
+        auto same = [](const ConfigOption* a, const ConfigOption* b) { return a == nullptr ? b == nullptr : (b != nullptr && *a == *b); };
+        if (restore && rec == nullptr)
+            sw_slicer_add_note(notes, "test settings not restored: no API calibration record (check sw_SlicerGetPresetChanges)");
+        if (restore && rec != nullptr) {
+            // The flow-variant vectors follow the *_flow_support list (as in sw_SlicerDiscardPresetChanges):
+            // when the test changed that list, all changes of that type must be restorable together.
+            for (Preset::Type t : {Preset::TYPE_PRINT, Preset::TYPE_FILAMENT}) {
+                ConfigFlowDomain domain = ConfigFlowDomain::Process;
+                if (sw_slicer_flow_options(t, domain) == nullptr)
+                    continue;
+                const std::string         support_key = flow_support_key(domain);
+                const DynamicPrintConfig& cfg         = sw_slicer_preset_collection(t).get_edited_preset().config;
+                bool                      support_changed = false, blocked = false;
+                for (const SwCalibRecord::Change& c : rec->changes) {
+                    if (c.type != t)
+                        continue;
+                    support_changed = support_changed || c.key == support_key;
+                    const ConfigOption* cur = cfg.option(c.key);
+                    blocked = blocked || (!same(cur, c.after.get()) && !same(cur, c.before.get()) && !is_result_key(c));
+                }
+                if (support_changed && blocked)
+                    throw std::runtime_error("the test changed the flow variants and they were changed again afterwards; discard all " +
+                                             sw_slicer_preset_type_name(t) + " changes instead (sw_SlicerDiscardPresetChanges)");
+            }
+        }
+
+        std::vector<std::string> api_notes;
+        json                     applied = json::array();
+        {
+            sswcp_api::Scope api_scope;
+            if (restore && rec != nullptr) {
+                for (const SwCalibRecord::Change& c : rec->changes) {
+                    DynamicPrintConfig& cfg = sw_slicer_preset_collection(c.type).get_edited_preset().config;
+                    const ConfigOption* cur = cfg.option(c.key);
+                    if (same(cur, c.before.get()))
+                        continue; // already restored (an earlier apply)
+                    if (!same(cur, c.after.get())) {
+                        if (!is_result_key(c)) // the result key is set below anyway
+                            not_restored.push_back({{"type", sw_slicer_preset_type_name(c.type)}, {"key", c.key}, {"reason", "changed after the calibration"}});
+                        continue;
+                    }
+                    if (c.before == nullptr) {
+                        // Not erased: a preset without the key would be incomplete. Left as it is.
+                        not_restored.push_back({{"type", sw_slicer_preset_type_name(c.type)}, {"key", c.key}, {"reason", "missing before the test; left as it is"}});
+                        continue;
+                    }
+                    cfg.set_key_value(c.key, c.before->clone());
+                    bool truncated = false;
+                    json item      = {{"type", sw_slicer_preset_type_name(c.type)}, {"key", c.key}, {"value", sw_slicer_calib_option_text(c.before.get(), truncated)}};
+                    if (truncated)
+                        item["truncated"] = true;
+                    restored.push_back(item);
+                    touched.insert(c.type);
+                }
+            }
+
+            // 6. Set the result in every element of the option (flow variants and extruders stay consistent).
+            DynamicPrintConfig& cfg = sw_slicer_preset_collection(result_type).get_edited_preset().config;
+            for (const char* key : def.result_keys) {
+                const std::string   k    = key;
+                const std::string   elem = k == "enable_pressure_advance" ? std::string("1") :
+                                           temp                          ? std::to_string(static_cast<int>(value)) :
+                                                                           sw_slicer_calib_num(value);
+                const ConfigOption* cur  = cfg.option(k);
+                size_t              n    = 1;
+                if (cur != nullptr && cur->is_vector())
+                    n = std::max<size_t>(1, static_cast<const ConfigOptionVectorBase*>(cur)->size());
+                std::string text;
+                for (size_t i = 0; i < n; ++i)
+                    text += (i == 0 ? "" : ",") + elem;
+                bool              truncated = false;
+                const json        before_v  = sw_slicer_calib_option_text(cur, truncated);
+                DynamicPrintConfig probe     = cfg;
+                probe.set_deserialize_strict(k, text); // throws for an invalid value, before anything is set
+                cfg.set_key_value(k, probe.option(k)->clone());
+                applied.push_back({{"type", def.result_type}, {"key", k}, {"before", before_v}, {"after", sw_slicer_calib_option_text(cfg.option(k), truncated)}});
+            }
+            touched.insert(result_type);
+            for (Preset::Type t : touched) {
+                Tab* tab = sw_slicer_preset_tab(t);
+                tab->update_dirty();
+                tab->reload_config();
+            }
+            api_notes = sswcp_api::notes();
+        }
+
+        // 7. Reply.
+        if (!restored.empty())
+            sw_slicer_add_note(notes, "the test's preset settings were restored; the test model itself still slices with the calibration steps "
+                                      "(calibration mode and object settings stay); start a new project to leave the test");
+        if (temp)
+            sw_slicer_add_note(notes, "only nozzle_temperature was set; nozzle_temperature_initial_layer is unchanged (set it with sw_SlicerSetConfig if wanted)");
+        sw_slicer_add_note(notes, "the values are unsaved preset changes; save them with sw_SlicerSavePreset (type '" +
+                                      std::string(def.result_type) + "')");
+        sw_slicer_add_note(notes, "presets are not part of undo");
+        sw_slicer_add_notes(notes, api_notes);
+        m_res_data["test"]          = def.id;
+        m_res_data["applied"]       = applied;
+        m_res_data["restored"]      = restored;
+        m_res_data["not_restored"]  = not_restored;
+        m_res_data["presets_dirty"] = sw_slicer_presets_dirty();
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
     }

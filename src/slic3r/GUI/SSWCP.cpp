@@ -4759,6 +4759,14 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerDeletePreset();
     } else if (m_cmd == "sw_SlicerDiscardPresetChanges") {
         sw_SlicerDiscardPresetChanges();
+    } else if (m_cmd == "sw_SlicerListCalibrations") {
+        sw_SlicerListCalibrations();
+    } else if (m_cmd == "sw_SlicerCalibrate") {
+        sw_SlicerCalibrate();
+    } else if (m_cmd == "sw_SlicerGetCalibration") {
+        sw_SlicerGetCalibration();
+    } else if (m_cmd == "sw_SlicerApplyCalibration") {
+        sw_SlicerApplyCalibration();
     } else {
         handle_general_fail();
     }
@@ -8087,6 +8095,8 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     // Preset management
     "sw_SlicerGetPresetChanges", "sw_SlicerComparePresets", "sw_SlicerSavePreset", "sw_SlicerDeletePreset",
     "sw_SlicerDiscardPresetChanges",
+    // Calibration
+    "sw_SlicerListCalibrations", "sw_SlicerCalibrate", "sw_SlicerGetCalibration", "sw_SlicerApplyCalibration",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.

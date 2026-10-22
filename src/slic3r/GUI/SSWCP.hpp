@@ -796,6 +796,12 @@ private:
     void sw_SlicerSavePreset();
     void sw_SlicerDeletePreset();
     void sw_SlicerDiscardPresetChanges();
+
+    // Calibration: list tests, create a test project, read the value mapping, apply a result.
+    void sw_SlicerListCalibrations();
+    void sw_SlicerCalibrate();
+    void sw_SlicerGetCalibration();
+    void sw_SlicerApplyCalibration();
 };
 
 // Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the
