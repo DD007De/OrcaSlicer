@@ -4749,6 +4749,16 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerExportStl();
     } else if (m_cmd == "sw_SlicerExport3mf") {
         sw_SlicerExport3mf();
+    } else if (m_cmd == "sw_SlicerGetPresetChanges") {
+        sw_SlicerGetPresetChanges();
+    } else if (m_cmd == "sw_SlicerComparePresets") {
+        sw_SlicerComparePresets();
+    } else if (m_cmd == "sw_SlicerSavePreset") {
+        sw_SlicerSavePreset();
+    } else if (m_cmd == "sw_SlicerDeletePreset") {
+        sw_SlicerDeletePreset();
+    } else if (m_cmd == "sw_SlicerDiscardPresetChanges") {
+        sw_SlicerDiscardPresetChanges();
     } else {
         handle_general_fail();
     }
@@ -8074,6 +8084,9 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     // Object management and model export
     "sw_SlicerCopy", "sw_SlicerPaste", "sw_SlicerSetVisible", "sw_SlicerSetInstanceCount",
     "sw_SlicerInstanceToObject", "sw_SlicerMoveToPlate", "sw_SlicerExportStl", "sw_SlicerExport3mf",
+    // Preset management
+    "sw_SlicerGetPresetChanges", "sw_SlicerComparePresets", "sw_SlicerSavePreset", "sw_SlicerDeletePreset",
+    "sw_SlicerDiscardPresetChanges",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.

@@ -72,6 +72,7 @@
 #include <thread>
 #include <vector>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/log/trivial.hpp>
 #include <wx/font.h>
@@ -109,7 +110,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 11;
+        m_res_data["phase"]    = 12;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -8840,6 +8841,975 @@ void SSWCP_SliceProject_Instance::sw_SlicerExport3mf()
         m_res_data["notes"]   = notes;
         send_to_js();
         finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Preset management: changes, compare, save, delete, discard ---------------------------------
+// Read the unsaved changes of the printer/print/filament presets, compare presets, save the edited
+// settings as a user preset, delete a user preset and discard unsaved changes, without dialogs.
+// Presets are not part of the undo stack: no command here takes a snapshot. Nothing here talks to the
+// cloud: saving and deleting are refused while the user preset sync can run, and presets linked to a
+// cloud copy are neither deleted nor replaced by another preset.
+
+// Values longer than this are cut off in diff replies, unless the key was asked for in 'keys'.
+static const size_t SW_SLICER_MAX_VALUE_CHARS = 2000;
+
+// Only FFF printers have the print/filament tabs and the option lists used here.
+static void sw_slicer_require_fff()
+{
+    if (wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() != ptFFF)
+        throw std::runtime_error("only FFF printers are supported");
+}
+
+static Tab* sw_slicer_preset_tab(Preset::Type type)
+{
+    Tab* tab = wxGetApp().get_tab(type);
+    if (tab == nullptr || tab->get_presets() == nullptr)
+        throw std::runtime_error("no settings tab for this preset type");
+    return tab;
+}
+
+// The API name of a preset type; the reverse of sw_slicer_preset_type().
+static std::string sw_slicer_preset_type_name(Preset::Type type)
+{
+    if (type == Preset::TYPE_PRINTER)
+        return "printer";
+    if (type == Preset::TYPE_FILAMENT)
+        return "filament";
+    return "print";
+}
+
+// Add a note once (several checks can produce the same text).
+static void sw_slicer_add_note(std::vector<std::string>& notes, const std::string& text)
+{
+    if (std::find(notes.begin(), notes.end(), text) == notes.end())
+        notes.push_back(text);
+}
+
+static void sw_slicer_add_notes(std::vector<std::string>& notes, const std::vector<std::string>& more)
+{
+    for (const std::string& n : more)
+        sw_slicer_add_note(notes, n);
+}
+
+static std::string sw_slicer_join_ints(const std::vector<int>& values)
+{
+    std::string out;
+    for (int v : values)
+        out += (out.empty() ? "" : ", ") + std::to_string(v);
+    return out;
+}
+
+// Optional parameter 'keys': a non-empty list of distinct option names (or the pseudo key
+// "extruders_count" of the printer diff). Missing = no filter.
+static std::optional<std::vector<std::string>> sw_slicer_parse_keys(const json& params)
+{
+    if (!sw_slicer_has_param(params, "keys"))
+        return std::nullopt;
+    const json& j = params.at("keys");
+    if (!j.is_array() || j.empty())
+        throw std::runtime_error("'keys' must be a non-empty list of option names");
+    std::vector<std::string> keys;
+    for (const json& k : j) {
+        if (!k.is_string() || k.get<std::string>().empty())
+            throw std::runtime_error("'keys' must be a non-empty list of option names");
+        const std::string key = k.get<std::string>();
+        if (std::find(keys.begin(), keys.end(), key) != keys.end())
+            throw std::runtime_error("'" + key + "' appears twice in 'keys'");
+        if (key != "extruders_count" && print_config_def.get(key) == nullptr)
+            throw std::runtime_error("unknown option '" + key + "'");
+        keys.push_back(key);
+    }
+    return keys;
+}
+
+// Can the app's user preset sync run? The conditions of GUI_App::start_sync_user_preset() and its
+// callers: not in stealth mode, "Auto sync user presets" on and a cloud account logged in. While it
+// runs, the sync thread uploads created/updated presets and deletes cloud copies within seconds.
+static bool sw_slicer_cloud_sync_active()
+{
+    GUI_App& app = wxGetApp();
+    return !app.app_config->get_stealth_mode() && app.app_config->get("sync_user_preset") == "true" && app.is_user_login();
+}
+
+static void sw_slicer_require_no_cloud_sync(const char* what)
+{
+    if (sw_slicer_cloud_sync_active())
+        throw std::runtime_error(std::string("user preset sync with the cloud is on (Preferences); ") + what +
+                                 " is refused so that nothing is uploaded or deleted in the cloud");
+}
+
+// Preset summary for replies. No cloud ids: only whether a cloud copy is linked.
+static json sw_slicer_preset_info_json(const Preset& p)
+{
+    json j;
+    j["name"]         = p.name;
+    j["system"]       = p.is_system;
+    j["user"]         = p.is_user();
+    j["project"]      = p.is_project_embedded;
+    j["inherits"]     = p.inherits();
+    j["compatible"]   = p.is_compatible;
+    j["cloud_linked"] = !p.setting_id.empty();
+    if (p.is_user() && !p.file.empty())
+        j["file"] = p.file;
+    return j;
+}
+
+// Value of an option as text in the form of sw_SlicerGetConfig (opt_serialize); with index >= 0 one
+// element of a vector option. null if the option is missing, nil or the index is out of range. A
+// nullable vector is nil only if all its elements are; a single nil element is returned as "nil".
+// Without 'full', values longer than SW_SLICER_MAX_VALUE_CHARS are cut off and 'truncated' is set.
+static json sw_slicer_option_value(const DynamicPrintConfig& cfg, const std::string& key, int index, bool full, bool& truncated)
+{
+    const ConfigOption* opt = cfg.option(key);
+    if (opt == nullptr || opt->is_nil())
+        return nullptr;
+    std::string s;
+    if (index < 0 || !opt->is_vector()) {
+        s = cfg.opt_serialize(key);
+    } else {
+        const std::vector<std::string> values = static_cast<const ConfigOptionVectorBase*>(opt)->vserialize();
+        if (index >= static_cast<int>(values.size()))
+            return nullptr;
+        s = values[static_cast<size_t>(index)];
+    }
+    if (!full && s.size() > SW_SLICER_MAX_VALUE_CHARS) {
+        size_t cut = SW_SLICER_MAX_VALUE_CHARS;
+        // Do not cut a UTF-8 sequence in half.
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+            --cut;
+        s = s.substr(0, cut) + "\xE2\x80\xA6"; // U+2026 horizontal ellipsis
+        truncated = true;
+    }
+    return s;
+}
+
+// "key#3" -> ("key", 3); otherwise index -1 (like get_pure_opt_key() in UnsavedChangesDialog.cpp).
+static void sw_slicer_split_key(const std::string& k, std::string& pure, int& index)
+{
+    const size_t pos = k.find('#');
+    if (pos == std::string::npos || pos == 0 || pos + 1 >= k.size() ||
+        !std::all_of(k.begin() + pos + 1, k.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; })) {
+        pure  = k;
+        index = -1;
+        return;
+    }
+    pure  = k.substr(0, pos);
+    index = std::atoi(k.c_str() + pos + 1);
+}
+
+// Flow-variant option lists of a preset type (print, filament); nullptr for printers.
+static const std::vector<std::string>* sw_slicer_flow_options(Preset::Type type, ConfigFlowDomain& domain)
+{
+    if (type == Preset::TYPE_FILAMENT) {
+        domain = ConfigFlowDomain::Filament;
+        return &filament_flow_variant_options();
+    }
+    if (type == Preset::TYPE_PRINT) {
+        domain = ConfigFlowDomain::Process;
+        return &process_flow_variant_options();
+    }
+    return nullptr;
+}
+
+// Index in the reference config of element 'cur_index' of a flow-variant option of the current config:
+// the element with the same flow mode, like get_flow_variant_string_value() in UnsavedChangesDialog.cpp.
+// -1 = no such element (shown as null).
+static int sw_slicer_flow_ref_index(const DynamicPrintConfig& ref, const DynamicPrintConfig& cur, ConfigFlowDomain domain, int cur_index)
+{
+    const auto* cur_modes = cur.option<ConfigOptionStrings>(flow_support_key(domain));
+    if (cur_modes == nullptr || cur_index >= static_cast<int>(cur_modes->values.size()))
+        return cur_index;
+    const auto* ref_modes = ref.option<ConfigOptionStrings>(flow_support_key(domain));
+    if (ref_modes == nullptr)
+        return -1;
+    const auto it = std::find(ref_modes->values.begin(), ref_modes->values.end(), cur_modes->values[static_cast<size_t>(cur_index)]);
+    return it == ref_modes->values.end() ? -1 : static_cast<int>(std::distance(ref_modes->values.begin(), it));
+}
+
+// Sort diff items by key, then index (items without index first).
+static void sw_slicer_sort_diff(json& items)
+{
+    std::sort(items.begin(), items.end(), [](const json& l, const json& r) {
+        const std::string& lk = l.at("key").get_ref<const std::string&>();
+        const std::string& rk = r.at("key").get_ref<const std::string&>();
+        if (lk != rk)
+            return lk < rk;
+        const int li = l.count("index") ? l.at("index").get<int>() : -1;
+        const int ri = r.count("index") ? r.at("index").get<int>() : -1;
+        return li < ri;
+    });
+}
+
+// One item per changed key {key, index?, label?, <ref_name>, <cur_name>, truncated?}, filtered on the
+// pure key by 'only', sorted by key and index. 'flow_options' (print/filament): elements of these options
+// are matched by flow mode in the reference config.
+static json sw_slicer_diff_json(const std::vector<std::string>&               keys,
+                                const DynamicPrintConfig&                     ref,
+                                const DynamicPrintConfig&                     cur,
+                                const char*                                   ref_name,
+                                const char*                                   cur_name,
+                                const std::optional<std::vector<std::string>>& only,
+                                const std::vector<std::string>*               flow_options = nullptr,
+                                ConfigFlowDomain                              flow_domain  = ConfigFlowDomain::Process)
+{
+    json items = json::array();
+    for (const std::string& k : keys) {
+        std::string pure;
+        int         index = -1;
+        sw_slicer_split_key(k, pure, index);
+        const bool asked = only && std::find(only->begin(), only->end(), pure) != only->end();
+        if (only && !asked)
+            continue;
+        int ref_index = index;
+        if (index >= 0 && flow_options != nullptr &&
+            std::find(flow_options->begin(), flow_options->end(), pure) != flow_options->end())
+            ref_index = sw_slicer_flow_ref_index(ref, cur, flow_domain, index);
+        bool truncated = false;
+        json item;
+        item["key"] = pure;
+        if (index >= 0)
+            item["index"] = index;
+        if (const ConfigOptionDef* def = print_config_def.get(pure); def != nullptr && !def->label.empty())
+            item["label"] = def->label;
+        item[ref_name] = (index >= 0 && ref_index < 0) ? json(nullptr) : sw_slicer_option_value(ref, pure, ref_index, asked, truncated);
+        item[cur_name] = sw_slicer_option_value(cur, pure, index, asked, truncated);
+        if (truncated)
+            item["truncated"] = true;
+        items.push_back(item);
+    }
+    sw_slicer_sort_diff(items);
+    return items;
+}
+
+// The changed keys of the edited preset of a type, chosen like UnsavedChangesDialog::update_tree():
+// deep compare (per extruder, "key#i") for printers; for print/filament the flow-variant options per
+// element ("key#i"). Against the saved preset or (against_parent) the parent preset. Read-only.
+static std::vector<std::string> sw_slicer_changed_keys(const PresetCollection& c, Preset::Type type, bool against_parent)
+{
+    const bool               deep = (type == Preset::TYPE_PRINTER);
+    std::vector<std::string> keys = against_parent ? c.current_different_from_parent_options(deep) : c.current_dirty_options(deep);
+    ConfigFlowDomain                domain = ConfigFlowDomain::Process;
+    const std::vector<std::string>* flow   = sw_slicer_flow_options(type, domain);
+    if (flow != nullptr) {
+        keys.erase(std::remove_if(keys.begin(), keys.end(),
+                                  [flow](const std::string& k) { return std::find(flow->begin(), flow->end(), k) != flow->end(); }),
+                   keys.end());
+        const std::vector<std::string> flow_keys = against_parent ? c.current_flow_variant_different_from_parent_options(domain, *flow) :
+                                                                    c.current_flow_variant_dirty_options(domain, *flow);
+        keys.insert(keys.end(), flow_keys.begin(), flow_keys.end());
+    }
+    // Keys that PresetCollection::is_dirty() ignores; keep equal to skipped_in_dirty in Preset.cpp.
+    static const std::set<std::string> skipped = {"printer_settings_id", "print_settings_id", "filament_settings_id",
+                                                  "mixed_filament_definitions"};
+    keys.erase(std::remove_if(keys.begin(), keys.end(),
+                              [](const std::string& k) {
+                                  std::string pure;
+                                  int         index = -1;
+                                  sw_slicer_split_key(k, pure, index);
+                                  return skipped.count(pure) > 0;
+                              }),
+               keys.end());
+    return keys;
+}
+
+// The pure option names of a list of changed keys, unique and sorted.
+static std::vector<std::string> sw_slicer_pure_keys(const std::vector<std::string>& keys)
+{
+    std::set<std::string> out;
+    for (const std::string& k : keys) {
+        std::string pure;
+        int         index = -1;
+        sw_slicer_split_key(k, pure, index);
+        out.insert(pure);
+    }
+    return std::vector<std::string>(out.begin(), out.end());
+}
+
+// The filament slots (1-based) that use a filament preset.
+static std::vector<int> sw_slicer_slots_using(const std::string& name)
+{
+    std::vector<int>                slots;
+    const std::vector<std::string>& presets = wxGetApp().preset_bundle->filament_presets;
+    for (size_t i = 0; i < presets.size(); ++i)
+        if (presets[i] == name)
+            slots.push_back(static_cast<int>(i) + 1);
+    return slots;
+}
+
+// Number of extruders of a printer config (length of the option), or -1.
+static int sw_slicer_extruder_count(const DynamicPrintConfig& cfg, const char* key)
+{
+    const ConfigOption* opt = cfg.option(key);
+    if (opt == nullptr || !opt->is_vector())
+        return -1;
+    return static_cast<int>(static_cast<const ConfigOptionVectorBase*>(opt)->size());
+}
+
+// Does any other preset of the collection inherit from 'name'?
+static std::vector<std::string> sw_slicer_presets_inheriting(const PresetCollection& c, const std::string& name)
+{
+    std::vector<std::string> out;
+    for (const Preset& p : c)
+        if (p.inherits() == name)
+            out.push_back(p.name);
+    return out;
+}
+
+// Which settings of the selected presets are changed: not saved yet (against "saved", like the
+// unsaved-changes dialog) or different from the parent preset (against "parent", like the markers in
+// the settings tab). Read-only: nothing is selected, marked or saved.
+void SSWCP_SliceProject_Instance::sw_SlicerGetPresetChanges()
+{
+    try {
+        sw_slicer_require_fff();
+        const bool                has_type = sw_slicer_has_param(m_param_data, "type");
+        std::vector<Preset::Type> types;
+        if (has_type)
+            types.push_back(sw_slicer_preset_type(sw_slicer_type_param(m_param_data)));
+        else
+            types = {Preset::TYPE_PRINTER, Preset::TYPE_PRINT, Preset::TYPE_FILAMENT};
+        std::string against = "saved";
+        if (sw_slicer_has_param(m_param_data, "against")) {
+            const json& j = m_param_data.at("against");
+            against       = j.is_string() ? j.get<std::string>() : std::string();
+            if (against != "saved" && against != "parent")
+                throw std::runtime_error("against must be 'saved' or 'parent'");
+        }
+        const bool parent = against == "parent";
+        if (sw_slicer_has_param(m_param_data, "keys") && !has_type)
+            throw std::runtime_error("'keys' needs 'type'");
+        const std::optional<std::vector<std::string>> only = sw_slicer_parse_keys(m_param_data);
+
+        std::vector<std::string> notes;
+        json                     presets   = json::array();
+        const char*              ref_field = parent ? "parent" : "saved";
+        for (Preset::Type t : types) {
+            const PresetCollection& c        = sw_slicer_preset_collection(t);
+            const Preset&           edited   = c.get_edited_preset();
+            const Preset&           selected = c.get_selected_preset();
+            const std::string       tname    = sw_slicer_preset_type_name(t);
+            json                    e;
+            e["type"]    = tname;
+            e["name"]    = edited.name;
+            e["dirty"]   = c.current_is_dirty();
+            e["against"] = against;
+            const Preset* ref = parent ? c.get_selected_preset_parent() : &selected;
+            json          changes = json::array();
+            if (ref == nullptr) {
+                e["reference"] = nullptr;
+                sw_slicer_add_note(notes, tname + " preset '" + edited.name + "' has no parent preset");
+            } else {
+                e["reference"] = ref->name;
+                ConfigFlowDomain                domain = ConfigFlowDomain::Process;
+                const std::vector<std::string>* flow   = sw_slicer_flow_options(t, domain);
+                changes = sw_slicer_diff_json(sw_slicer_changed_keys(c, t, parent), ref->config, edited.config, ref_field, "current",
+                                              only, flow, domain);
+                // A changed number of extruders, as the unsaved-changes dialog shows it.
+                if (t == Preset::TYPE_PRINTER) {
+                    const int n = sw_slicer_extruder_count(ref->config, "nozzle_diameter");
+                    const int m = sw_slicer_extruder_count(edited.config, "nozzle_diameter");
+                    if (n >= 0 && m >= 0 && n != m &&
+                        (!only || std::find(only->begin(), only->end(), "extruders_count") != only->end())) {
+                        json item;
+                        item["key"]     = "extruders_count";
+                        item["label"]   = "Extruders count";
+                        item[ref_field] = n;
+                        item["current"] = m;
+                        changes.push_back(item);
+                        sw_slicer_sort_diff(changes);
+                    }
+                }
+            }
+            e["preset"]  = sw_slicer_preset_info_json(selected);
+            e["changes"] = changes;
+            if (t == Preset::TYPE_FILAMENT) {
+                const std::vector<int> slots = sw_slicer_slots_using(edited.name);
+                e["slots"]                   = slots;
+                if (slots.empty())
+                    sw_slicer_add_note(notes, "the filament settings being edited ('" + edited.name + "') are not used by any slot");
+            }
+            presets.push_back(e);
+        }
+        m_res_data["presets"]       = presets;
+        m_res_data["presets_dirty"] = sw_slicer_presets_dirty();
+        m_res_data["notes"]         = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Compare two presets of one type, like "Compare presets" (DiffPresetDialog::update_tree): names mean
+// the saved presets, also for the selected one. Without 'b', 'a' is compared with the edited settings
+// (including unsaved changes). Read-only.
+void SSWCP_SliceProject_Instance::sw_SlicerComparePresets()
+{
+    try {
+        sw_slicer_require_fff();
+        const std::string  type = sw_slicer_type_param(m_param_data);
+        const Preset::Type t    = sw_slicer_preset_type(type);
+        if (!sw_slicer_has_param(m_param_data, "a") || !m_param_data.at("a").is_string() || m_param_data.at("a").get<std::string>().empty())
+            throw std::runtime_error("specify 'a' (see sw_SlicerListPresets)");
+        const std::string a     = m_param_data.at("a").get<std::string>();
+        const bool        has_b = sw_slicer_has_param(m_param_data, "b");
+        if (has_b && (!m_param_data.at("b").is_string() || m_param_data.at("b").get<std::string>().empty()))
+            throw std::runtime_error("'b' must be a preset name; omit it to compare with the unsaved changes");
+        const std::string b = has_b ? m_param_data.at("b").get<std::string>() : std::string();
+        if (has_b && a == b)
+            throw std::runtime_error("'a' and 'b' are the same preset; omit 'b' to compare with the unsaved changes");
+        const std::optional<std::vector<std::string>> only = sw_slicer_parse_keys(m_param_data);
+
+        // find_preset(..., real = true): the saved preset, not the edited copy of the selected one.
+        PresetCollection& c  = sw_slicer_preset_collection(t);
+        const Preset*     pa = c.find_preset(a, false, true);
+        if (pa == nullptr || pa->is_default)
+            throw std::runtime_error("preset '" + a + "' does not exist");
+        const Preset* pb = nullptr;
+        if (has_b) {
+            pb = c.find_preset(b, false, true);
+            if (pb == nullptr || pb->is_default)
+                throw std::runtime_error("preset '" + b + "' does not exist");
+        } else {
+            pb = &c.get_edited_preset();
+        }
+        if (pa->printer_technology() != pb->printer_technology())
+            throw std::runtime_error("the presets are for different printer technologies");
+
+        // The keys as in DiffPresetDialog::update_tree(); for print/filament the flow-variant options per
+        // element (b is the "edited" side, as in sw_slicer_changed_keys). The *_settings_id, inherits and
+        // compatible_* differences are kept: the dialog shows them too.
+        const bool deep         = (t == Preset::TYPE_PRINTER);
+        const int  a_extruders  = sw_slicer_extruder_count(pa->config, "extruder_colour");
+        const int  b_extruders  = sw_slicer_extruder_count(pb->config, "extruder_colour");
+        std::vector<std::string> keys = (t == Preset::TYPE_PRINTER && a_extruders < b_extruders) ?
+                                            PresetCollection::dirty_options(pb, pa, deep) :
+                                            PresetCollection::dirty_options(pa, pb, deep);
+        ConfigFlowDomain                domain = ConfigFlowDomain::Process;
+        const std::vector<std::string>* flow   = sw_slicer_flow_options(t, domain);
+        // Without the flow-support option flow_variant_dirty_options() reports nothing: keep the plain keys.
+        if (flow != nullptr && pb->config.option(flow_support_key(domain)) != nullptr) {
+            keys.erase(std::remove_if(keys.begin(), keys.end(),
+                                      [flow](const std::string& k) { return std::find(flow->begin(), flow->end(), k) != flow->end(); }),
+                       keys.end());
+            const std::vector<std::string> flow_keys = PresetCollection::flow_variant_dirty_options(pb, pa, domain, *flow);
+            keys.insert(keys.end(), flow_keys.begin(), flow_keys.end());
+        }
+        json differences = sw_slicer_diff_json(keys, pa->config, pb->config, "a", "b", only, flow, domain);
+        size_t count = keys.size();
+        if (t == Preset::TYPE_PRINTER && a_extruders >= 0 && b_extruders >= 0 && a_extruders != b_extruders) {
+            ++count;
+            if (!only || std::find(only->begin(), only->end(), "extruders_count") != only->end()) {
+                json item;
+                item["key"]   = "extruders_count";
+                item["label"] = "Extruders count";
+                item["a"]     = a_extruders;
+                item["b"]     = b_extruders;
+                differences.push_back(item);
+                sw_slicer_sort_diff(differences);
+            }
+        }
+
+        std::vector<std::string> notes;
+        const std::string        selected = c.get_selected_preset_name();
+        const bool               dirty    = c.current_is_dirty();
+        json                     ja       = sw_slicer_preset_info_json(*pa);
+        json                     jb       = sw_slicer_preset_info_json(*pb);
+        if (!has_b) {
+            jb["edited"] = true;
+            jb["dirty"]  = dirty;
+            if (a == selected && !dirty)
+                sw_slicer_add_note(notes, "no unsaved changes; the edited state equals '" + a + "'");
+        }
+        if (t != Preset::TYPE_PRINTER) {
+            if (!pa->is_compatible)
+                sw_slicer_add_note(notes, "'" + a + "' is not compatible with the selected printer (compared anyway)");
+            if (has_b && !pb->is_compatible)
+                sw_slicer_add_note(notes, "'" + b + "' is not compatible with the selected printer (compared anyway)");
+        }
+        if (has_b && dirty) {
+            if (a == selected)
+                sw_slicer_add_note(notes, "'" + a + "' is compared as saved; it has unsaved changes (omit 'b' to compare with them)");
+            if (b == selected)
+                sw_slicer_add_note(notes, "'" + b + "' is compared as saved; it has unsaved changes (pass it as 'a' and omit 'b' to compare with them)");
+        }
+
+        m_res_data["type"]        = type;
+        m_res_data["a"]           = ja;
+        m_res_data["b"]           = jb;
+        m_res_data["equal"]       = count == 0;
+        m_res_data["count"]       = count;
+        m_res_data["differences"] = differences;
+        m_res_data["notes"]       = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Why a name cannot be used to save a preset ("" = valid): the rules of the save dialog, in its order
+// (SavePresetDialog::Item::update()), plus API rules for the file name (path_from_name()): no ".json"
+// suffix, no control characters, no Windows device name. An existing user preset is not an error here;
+// the caller asks for overwrite:true.
+static std::string sw_slicer_preset_name_error(const PresetCollection& c, const std::string& name)
+{
+    if (name.find_first_of("<>[]:/\\|?*\"") != std::string::npos)
+        return "the name contains an illegal character (one of <>[]:/\\|?*\")";
+    if (name.find(PresetCollection::get_suffix_modified()) != std::string::npos || name.find("(modified)") != std::string::npos)
+        return "the name must not contain '(modified)'";
+    if (name == "Default Setting" || name == "Default Filament" || name == "Default Printer")
+        return "this name is reserved";
+    const Preset* existing = c.find_preset(name, false);
+    if (existing != nullptr && (existing->is_default || existing->is_system))
+        return "overwriting a system preset is not allowed";
+    if (name.empty())
+        return "the name must not be empty";
+    if (name.front() == ' ' || name.back() == ' ')
+        return "the name must not start or end with a space";
+    if (c.get_preset_name_by_alias(name) != name)
+        return "the name equals the alias of a system preset";
+    if (boost::algorithm::iends_with(name, ".json"))
+        return "the name must not end in .json";
+    if (std::any_of(name.begin(), name.end(), [](char ch) { return static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F; }))
+        return "the name must not contain control characters";
+    // The file is "<name>.json": Windows reserves these names, also with any extension.
+    static const char* const devices[] = {"CON",  "PRN",  "AUX",  "NUL",  "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+                                          "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
+    const std::string stem = boost::algorithm::trim_right_copy(name.substr(0, name.find('.')));
+    for (const char* d : devices)
+        if (boost::algorithm::iequals(stem, d))
+            return "the name is reserved by Windows (" + std::string(d) + ")";
+    return std::string();
+}
+
+// Save the edited settings of a type as a user preset, like the save icon of the settings tab with a
+// name typed in the save dialog (Tab::save_preset with a name: no dialog). An existing user preset is
+// replaced only with overwrite:true; system presets never. Not part of undo.
+void SSWCP_SliceProject_Instance::sw_SlicerSavePreset()
+{
+    try {
+        // 1. Guards.
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_fff();
+
+        // 2. Parameters.
+        const std::string  type = sw_slicer_type_param(m_param_data);
+        const Preset::Type t    = sw_slicer_preset_type(type);
+        if (!sw_slicer_has_param(m_param_data, "name") || !m_param_data.at("name").is_string() ||
+            m_param_data.at("name").get<std::string>().empty())
+            throw std::runtime_error("specify 'name'");
+        const std::string name      = m_param_data.at("name").get<std::string>();
+        const bool        overwrite = sw_slicer_flag_true(m_param_data, "overwrite");
+        PresetBundle*     bundle    = wxGetApp().preset_bundle;
+        int               slot      = 0;
+        if (sw_slicer_has_param(m_param_data, "filament")) {
+            if (t != Preset::TYPE_FILAMENT)
+                throw std::runtime_error("'filament' only applies to type 'filament'");
+            const json&   j     = m_param_data.at("filament");
+            const size_t  count = bundle->filament_presets.size();
+            if (!j.is_number_integer() || j.get<long long>() < 1 || j.get<long long>() > static_cast<long long>(count))
+                throw std::runtime_error("filament slot must be between 1 and " + std::to_string(count));
+            slot = j.get<int>();
+        }
+
+        // 3. Name rules of the save dialog.
+        PresetCollection& c   = sw_slicer_preset_collection(t);
+        const std::string err = sw_slicer_preset_name_error(c, name);
+        if (!err.empty())
+            throw std::runtime_error(err);
+
+        // 4. Physical printers are not supported (the save dialog would update them).
+        if (t == Preset::TYPE_PRINTER && bundle->physical_printers.has_selection())
+            throw std::runtime_error("a physical printer is selected; save printer presets in the app");
+
+        // 5. No cloud traffic.
+        sw_slicer_require_no_cloud_sync("saving a preset");
+
+        // 6. Filament slot: only a check, nothing is selected.
+        std::vector<std::string> notes;
+        const std::string        edited_name = c.get_edited_preset().name;
+        if (slot > 0) {
+            const std::string& in_slot = bundle->filament_presets[static_cast<size_t>(slot - 1)];
+            if (in_slot != edited_name)
+                throw std::runtime_error("slot " + std::to_string(slot) + " uses '" + in_slot + "'; the filament settings being edited belong to '" +
+                                         edited_name + "' (select that preset in slot " + std::to_string(slot) + " first)");
+        } else if (t == Preset::TYPE_FILAMENT) {
+            const std::vector<int> used = sw_slicer_slots_using(edited_name);
+            if (used.size() > 1)
+                sw_slicer_add_note(notes, "the edited filament preset is used by slots " + sw_slicer_join_ints(used) +
+                                              "; all of them follow the new name");
+        }
+
+        // 7. An existing preset with this name. File names ignore case on Windows: a preset whose name
+        // differs only in case, or whose file is the file of the new preset, counts as the same preset
+        // (saving would overwrite its file). A preset file that is not loaded is only replaced with overwrite.
+        const std::string selected    = c.get_selected_preset_name();
+        Preset*           existing    = c.find_preset(name, false, /*real=*/true);
+        bool              orphan_file = false;
+        if (existing == nullptr) {
+            const std::string path = c.path_from_name(name, /*detach=*/false);
+            for (Preset& p : c)
+                if (boost::algorithm::iequals(p.name, name) || (!p.file.empty() && boost::algorithm::iequals(p.file, path))) {
+                    existing = &p;
+                    break;
+                }
+            if (existing != nullptr) {
+                if (existing->is_default || existing->is_system)
+                    throw std::runtime_error("overwriting a system preset is not allowed (names differ only in case: '" + existing->name + "')");
+                if (existing->name == selected)
+                    throw std::runtime_error("the name differs only in case from the selected preset '" + selected +
+                                             "'; use that exact name to save it");
+            } else {
+                boost::system::error_code ec;
+                orphan_file = boost::filesystem::exists(sw_slicer_path_from_utf8(path), ec);
+            }
+        }
+        const std::string existing_name = existing != nullptr ? existing->name : std::string();
+        const bool        case_variant  = existing != nullptr && existing_name != name;
+        if (existing != nullptr && existing->is_project_embedded)
+            throw std::runtime_error("'" + existing_name + "' is a preset stored in the project; the API only saves user presets");
+        if (existing != nullptr && !overwrite)
+            throw std::runtime_error(case_variant ? "a preset named '" + existing_name +
+                                                        "' already exists (names differ only in case); pass overwrite:true to replace it" :
+                                                    "preset '" + name + "' already exists; pass overwrite:true to replace it");
+        if (orphan_file && !overwrite)
+            throw std::runtime_error("a preset file with this name already exists in the preset folder; pass overwrite:true to replace it");
+        if (existing != nullptr && existing_name != selected) {
+            if (!sw_slicer_presets_inheriting(c, existing_name).empty())
+                throw std::runtime_error("other presets inherit from '" + existing_name + "'; it cannot be replaced");
+            if (!existing->setting_id.empty())
+                throw std::runtime_error("'" + existing_name + "' is linked to a cloud copy; replace it in the app");
+            if (t == Preset::TYPE_FILAMENT) {
+                const std::vector<int> used = sw_slicer_slots_using(existing_name);
+                // The slots keep the old name: with another spelling they would point to a deleted preset.
+                if (!used.empty() && case_variant)
+                    throw std::runtime_error("'" + existing_name + "' is used by filament slot(s) " + sw_slicer_join_ints(used) +
+                                             "; save it under its exact name");
+                if (!used.empty())
+                    sw_slicer_add_note(notes, "slot(s) " + sw_slicer_join_ints(used) + " use '" + existing_name + "' and now get the new values");
+            }
+            if (!existing->is_compatible)
+                sw_slicer_add_note(notes, "'" + existing_name + "' was not compatible with the selected printer; it is replaced by a compatible preset");
+        }
+
+        auto reply = [&](bool created, bool replaced, const std::vector<std::string>& saved_changes) {
+            m_res_data["type"]          = type;
+            m_res_data["name"]          = name;
+            m_res_data["previous"]      = selected;
+            m_res_data["created"]       = created;
+            m_res_data["replaced"]      = replaced;
+            m_res_data["preset"]        = sw_slicer_preset_info_json(c.get_selected_preset());
+            m_res_data["saved_changes"] = saved_changes;
+            if (t == Preset::TYPE_FILAMENT)
+                m_res_data["slots"] = sw_slicer_slots_using(c.get_selected_preset_name());
+            m_res_data["project_dirty"] = sw_slicer_project_dirty();
+            m_res_data["notes"]         = notes;
+            send_to_js();
+            finish_job();
+        };
+
+        // 8. Nothing to save.
+        if (name == selected && !c.current_is_dirty()) {
+            sw_slicer_add_note(notes, "no unsaved changes; nothing changed");
+            reply(false, false, {});
+            return;
+        }
+
+        // 9. Before saving. 'existing' is not used after the save: deleting and saving change the deque.
+        const bool                     had_existing       = existing != nullptr;
+        const std::vector<std::string> saved_changes      = sw_slicer_pure_keys(sw_slicer_changed_keys(c, t, false));
+        const bool                     edited_from_system = c.get_edited_preset().is_system;
+        Tab*                           tab                = sw_slicer_preset_tab(t);
+
+        // 10. Save.
+        std::vector<std::string> api_notes;
+        {
+            sswcp_api::Scope api_scope;
+            // Replacing another preset works like the save dialog: delete it first, then save the edited
+            // settings under its name (SavePresetDialog::Item::accept). No cloud copy exists (checked above).
+            if (existing != nullptr && existing_name != selected) {
+                existing->sync_info = "delete";
+                c.delete_preset(existing_name);
+            }
+            existing = nullptr;
+            tab->save_preset(name, /*detach=*/false, /*save_to_project=*/false);
+            api_notes = sswcp_api::notes();
+        }
+
+        // 11. Check. Settings checks during the refresh can adjust values after the file was written: then
+        // the save succeeded, but the preset shows unsaved changes.
+        boost::system::error_code ec;
+        const Preset&             saved = c.get_selected_preset();
+        if (c.get_selected_preset_name() != name ||
+            (saved.is_user() && !boost::filesystem::exists(sw_slicer_path_from_utf8(saved.file), ec)))
+            throw std::runtime_error(sw_slicer_join_notes("the preset could not be saved", api_notes));
+        if (c.current_is_dirty())
+            sw_slicer_add_note(notes, "values were adjusted after saving; the preset shows unsaved changes");
+
+        // 12./13. Reply.
+        const bool created = !had_existing || name != selected;
+        if (orphan_file)
+            sw_slicer_add_note(notes, "an existing preset file with this name (not loaded in the app) was replaced");
+        if (!had_existing)
+            sw_slicer_add_note(notes, "saved as a new user preset and selected; '" + selected + "' is unchanged");
+        else if (name == selected)
+            sw_slicer_add_note(notes, "the stored values of '" + name + "' were replaced; the old values cannot be restored (presets are not part of undo)");
+        else if (case_variant)
+            sw_slicer_add_note(notes, "preset '" + existing_name + "' was replaced by '" + name + "' and selected; its old values cannot be restored");
+        else
+            sw_slicer_add_note(notes, "preset '" + name + "' was replaced and selected; its old values cannot be restored");
+        if (name != selected)
+            sw_slicer_add_note(notes, "presets are not part of undo; select 'previous' to switch back");
+        if (t == Preset::TYPE_FILAMENT && edited_from_system) {
+            const std::string printer = bundle->printers.get_selected_preset_base().name;
+            const auto*       compat  = saved.config.option<ConfigOptionStrings>("compatible_printers");
+            if (compat != nullptr && compat->values.size() == 1 && compat->values.front() == printer)
+                sw_slicer_add_note(notes, "the new filament preset is only compatible with printer '" + printer + "' (as in the app)");
+        }
+        sw_slicer_add_note(notes, "saved locally only (user preset cloud sync is off)");
+        if (wxGetApp().is_user_login())
+            sw_slicer_add_note(notes, "a cloud account is logged in; the preset is marked for upload if preset sync is turned on later");
+        sw_slicer_add_notes(notes, api_notes);
+        reply(created, had_existing || orphan_file, saved_changes);
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Delete a user preset that is not selected, like deleting a preset in the filament manager
+// (delete_filament_preset_by_name): the preset files are removed. System presets, the selected preset,
+// presets used by a filament slot or inherited by other presets, custom printer roots, presets of a
+// physical printer and presets linked to a cloud copy are refused. Not part of undo.
+void SSWCP_SliceProject_Instance::sw_SlicerDeletePreset()
+{
+    try {
+        // 1. Guards.
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_fff();
+
+        // 2. Explicit confirmation.
+        if (!sw_slicer_flag_true(m_param_data, "confirm_delete"))
+            throw std::runtime_error("pass confirm_delete:true to delete a preset (this cannot be undone)");
+
+        // 3. The preset.
+        const std::string  type = sw_slicer_type_param(m_param_data);
+        const Preset::Type t    = sw_slicer_preset_type(type);
+        if (!sw_slicer_has_param(m_param_data, "name") || !m_param_data.at("name").is_string() ||
+            m_param_data.at("name").get<std::string>().empty())
+            throw std::runtime_error("specify 'name'");
+        const std::string name   = m_param_data.at("name").get<std::string>();
+        PresetBundle*     bundle = wxGetApp().preset_bundle;
+        PresetCollection& c      = sw_slicer_preset_collection(t);
+        const Preset*     p      = c.find_preset(name, false, /*real=*/true);
+        if (p == nullptr)
+            throw std::runtime_error("preset '" + name + "' does not exist");
+
+        // 4. Refusals.
+        if (p->is_default || p->is_system)
+            throw std::runtime_error("system presets cannot be deleted");
+        if (p->is_project_embedded)
+            throw std::runtime_error("presets stored in the project cannot be deleted through the API");
+        if (name == c.get_selected_preset_name())
+            throw std::runtime_error("'" + name + "' is the selected preset; select another preset first (sw_SlicerSelectPreset)");
+        if (t == Preset::TYPE_FILAMENT) {
+            const std::vector<int> used = sw_slicer_slots_using(name);
+            if (!used.empty())
+                throw std::runtime_error("'" + name + "' is used by filament slot(s) " + sw_slicer_join_ints(used) +
+                                         "; select another filament there first");
+        }
+        const std::vector<std::string> heirs = sw_slicer_presets_inheriting(c, name);
+        if (!heirs.empty()) {
+            std::string list;
+            for (const std::string& h : heirs)
+                list += (list.empty() ? "" : ", ") + h;
+            throw std::runtime_error("other presets inherit from '" + name + "': " + list);
+        }
+        if (t == Preset::TYPE_PRINTER && c.get_preset_base(*p) == p)
+            throw std::runtime_error("'" + name +
+                                     "' is a custom printer; deleting it would also delete its filament and process presets; delete it in the app");
+        if (t == Preset::TYPE_PRINTER && !bundle->physical_printers.get_printers_with_preset(name).empty())
+            throw std::runtime_error("'" + name + "' is used by a physical printer; delete it in the app");
+        if (!p->setting_id.empty())
+            throw std::runtime_error("'" + name + "' is linked to a cloud copy; delete it in the app");
+        sw_slicer_require_no_cloud_sync("deleting a preset");
+        if (c.current_is_dirty())
+            throw std::runtime_error("the " + type + " settings have unsaved changes; save or discard them first");
+        // select_preset_by_name() would pick another preset if the selected one is hidden.
+        if (!c.get_selected_preset().is_visible)
+            throw std::runtime_error("the selected " + type + " preset is hidden; select a visible preset first");
+
+        // 5.
+        const std::string selected = c.get_selected_preset_name();
+        const std::string file     = p->file;
+        Tab*              tab      = sw_slicer_preset_tab(t);
+        p                          = nullptr; // the deque changes below
+
+        // 6. Delete.
+        std::vector<std::string> notes;
+        {
+            sswcp_api::Scope api_scope;
+            // Like deleting a preset from the filament manager (delete_filament_preset_by_name): remove the
+            // files and the entry, then re-select the selected preset by name, because delete_preset() does
+            // not adjust the selected index. There are no unsaved edits (checked above).
+            c.delete_preset(name);
+            c.select_preset_by_name(selected, /*force=*/true);
+            bundle->update_compatible(PresetSelectCompatibleType::Never);
+            tab->update_tab_ui();
+            wxGetApp().plater()->sidebar().update_presets(t);
+            wxGetApp().mainframe->diff_dialog.update_presets(t);
+            bundle->export_selections(*wxGetApp().app_config);
+            notes = sswcp_api::notes();
+        }
+
+        // 7. Check.
+        boost::system::error_code ec;
+        if (c.find_preset(name, false, true) != nullptr || c.get_selected_preset_name() != selected ||
+            (!file.empty() && boost::filesystem::exists(sw_slicer_path_from_utf8(file), ec)))
+            throw std::runtime_error(sw_slicer_join_notes("the preset could not be deleted", notes));
+
+        // 8. Reply.
+        std::vector<std::string> out;
+        sw_slicer_add_note(out, "the preset files were removed; this cannot be undone (presets are not part of undo)");
+        sw_slicer_add_notes(out, notes);
+        m_res_data["type"]     = type;
+        m_res_data["name"]     = name;
+        m_res_data["deleted"]  = true;
+        m_res_data["file"]     = file;
+        m_res_data["selected"] = selected;
+        m_res_data["notes"]    = out;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// Discard unsaved preset changes: all (the "Discard" button of the unsaved-changes dialog), of one type,
+// or single options of one type (back to the saved preset). Not part of undo.
+void SSWCP_SliceProject_Instance::sw_SlicerDiscardPresetChanges()
+{
+    try {
+        // 1. Guards. No cloud check: discarding writes nothing to disk.
+        sw_slicer_require_idle();
+        sw_slicer_require_not_slicing();
+        sw_slicer_require_not_loading();
+        sw_slicer_require_fff();
+
+        // 2. Parameters.
+        const bool has_type = sw_slicer_has_param(m_param_data, "type");
+        if (sw_slicer_has_param(m_param_data, "keys") && !has_type)
+            throw std::runtime_error("'keys' needs 'type'");
+        std::vector<Preset::Type> types;
+        if (has_type)
+            types.push_back(sw_slicer_preset_type(sw_slicer_type_param(m_param_data)));
+        else
+            types = {Preset::TYPE_PRINTER, Preset::TYPE_PRINT, Preset::TYPE_FILAMENT};
+        const std::optional<std::vector<std::string>> keys = sw_slicer_parse_keys(m_param_data);
+
+        // 3. What is changed now, per type.
+        json discarded = json::array();
+        for (Preset::Type t : types) {
+            const PresetCollection& c = sw_slicer_preset_collection(t);
+            if (!c.current_is_dirty())
+                continue;
+            json e;
+            e["type"] = sw_slicer_preset_type_name(t);
+            e["name"] = c.get_edited_preset().name;
+            e["keys"] = sw_slicer_pure_keys(sw_slicer_changed_keys(c, t, false));
+            discarded.push_back(e);
+        }
+
+        std::vector<std::string> notes;
+        auto reply = [&]() {
+            m_res_data["discarded"]     = discarded;
+            m_res_data["presets_dirty"] = sw_slicer_presets_dirty();
+            m_res_data["notes"]         = notes;
+            send_to_js();
+            finish_job();
+        };
+
+        // 4. Nothing to discard.
+        if (discarded.empty()) {
+            sw_slicer_add_note(notes, "no unsaved preset changes; nothing changed");
+            reply();
+            return;
+        }
+
+        std::vector<std::string> api_notes;
+        if (!has_type) {
+            // 5. All types, exactly the "Discard" button.
+            sswcp_api::Scope api_scope;
+            sw_slicer_discard_preset_changes();
+            api_notes = sswcp_api::notes();
+        } else if (!keys) {
+            // 6. One type, like GUI_App::check_and_keep_current_preset_changes() for that type only. The
+            // other tabs reload their edited presets, so their unsaved changes stay.
+            Tab*             tab = sw_slicer_preset_tab(types.front());
+            sswcp_api::Scope api_scope;
+            tab->get_presets()->discard_current_changes();
+            wxGetApp().load_current_presets(false);
+            api_notes = sswcp_api::notes();
+        } else {
+            // 7. Single options of one type.
+            const Preset::Type       t       = types.front();
+            PresetCollection&        c       = sw_slicer_preset_collection(t);
+            const std::vector<std::string> changed = discarded.front().at("keys").get<std::vector<std::string>>();
+            if (std::find(keys->begin(), keys->end(), "extruders_count") != keys->end())
+                throw std::runtime_error("'extruders_count' cannot be discarded on its own; discard all printer changes instead (omit 'keys')");
+            for (const std::string& k : *keys)
+                if (std::find(changed.begin(), changed.end(), k) == changed.end())
+                    throw std::runtime_error("'" + k + "' has no unsaved change");
+            if (t == Preset::TYPE_PRINTER && sw_slicer_extruder_count(c.get_selected_preset().config, "nozzle_diameter") !=
+                                                 sw_slicer_extruder_count(c.get_edited_preset().config, "nozzle_diameter"))
+                throw std::runtime_error("the number of extruders was changed; discard all printer changes instead (omit 'keys')");
+            // The flow-variant vectors follow the *_flow_support list: reverting one of them without the
+            // others would leave vectors that do not match the declared variants.
+            ConfigFlowDomain                domain = ConfigFlowDomain::Process;
+            const std::vector<std::string>* flow   = sw_slicer_flow_options(t, domain);
+            if (flow != nullptr) {
+                const std::string   support_key = flow_support_key(domain);
+                const ConfigOption* saved_sup   = c.get_selected_preset().config.option(support_key);
+                const ConfigOption* edited_sup  = c.get_edited_preset().config.option(support_key);
+                const bool          changed_sup = (saved_sup == nullptr) != (edited_sup == nullptr) ||
+                                         (saved_sup != nullptr && edited_sup != nullptr && !(*saved_sup == *edited_sup));
+                const bool touches_flow = std::any_of(keys->begin(), keys->end(), [&](const std::string& k) {
+                    return k == support_key || std::find(flow->begin(), flow->end(), k) != flow->end();
+                });
+                if (changed_sup && touches_flow)
+                    throw std::runtime_error("the flow variants were changed; discard all " + sw_slicer_preset_type_name(t) +
+                                             " changes instead (omit 'keys')");
+            }
+            Tab*             tab = sw_slicer_preset_tab(t);
+            sswcp_api::Scope api_scope;
+            // Revert single options to the saved preset, like the per-option arrow in the settings tab,
+            // without Tab::load_config (which runs the full config update).
+            DynamicPrintConfig&       edited = c.get_edited_preset().config;
+            const DynamicPrintConfig& saved  = c.get_selected_preset().config;
+            for (const std::string& k : *keys) {
+                if (const ConfigOption* o = saved.option(k))
+                    edited.set_key_value(k, o->clone());
+                else
+                    edited.erase(k);
+            }
+            tab->update_dirty();
+            tab->reload_config();
+            api_notes = sswcp_api::notes();
+            discarded.front()["keys"] = *keys;
+            sw_slicer_add_note(notes, "options reverted without the full settings update (like sw_SlicerSetConfig); dependent options are re-checked at the next slice");
+        }
+
+        // 8. Reply.
+        sw_slicer_add_note(notes, "the discarded values cannot be restored (presets are not part of undo)");
+        sw_slicer_add_notes(notes, api_notes);
+        reply();
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
     }

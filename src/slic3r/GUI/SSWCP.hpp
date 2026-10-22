@@ -789,6 +789,13 @@ private:
     void sw_SlicerMoveToPlate();
     void sw_SlicerExportStl();
     void sw_SlicerExport3mf();
+
+    // Preset management: changes, compare, save, delete, discard.
+    void sw_SlicerGetPresetChanges();
+    void sw_SlicerComparePresets();
+    void sw_SlicerSavePreset();
+    void sw_SlicerDeletePreset();
+    void sw_SlicerDiscardPresetChanges();
 };
 
 // Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the
