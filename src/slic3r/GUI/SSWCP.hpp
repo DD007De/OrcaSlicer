@@ -815,6 +815,10 @@ private:
     void sw_SlicerDeleteLayerRange();
     void sw_SlicerAddSvg();
     void sw_SlicerRepair();
+    // Context: preferences, view preferences and view options.
+    void sw_SlicerGetPreferences();
+    void sw_SlicerSetViewPreferences();
+    void sw_SlicerSetViewOptions();
 };
 
 // Disconnect the current machine like the device page does (sw_Disconnect). Blocks on the

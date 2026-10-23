@@ -90,6 +90,7 @@
 #include <wx/font.h>
 #include <wx/fontenum.h>
 #include <wx/image.h>
+#include <wx/stdpaths.h>
 #include <wx/weakref.h>
 #include <wx/glcanvas.h> // after the slic3r headers (GLEW must come before gl.h)
 #ifdef _WIN32
@@ -122,7 +123,7 @@ void SSWCP_SliceProject_Instance::sw_SlicerPing()
 {
     try {
         m_res_data["patched"]  = true;
-        m_res_data["phase"]    = 15;
+        m_res_data["phase"]    = 16;
         m_res_data["commands"] = SSWCP::slicer_commands();
         send_to_js();
         finish_job();
@@ -14062,6 +14063,362 @@ void SSWCP_SliceProject_Instance::sw_SlicerRepair()
             notes.push_back("painting removed (support, seam, color, fuzzy skin)");
         reply(r_obj);
 #endif // HAS_WIN10SDK
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// --- Context: preferences and view options ---
+// These commands never change the model and make no undo step. Preferences are only read through
+// the allow list below. The only preferences written are the four View menu items, through the same
+// calls as the View menu; the app writes its own config file when idle, the API never does.
+
+enum class SwSlicerPrefKind { Bool, String, NavStyle, LoadBehaviour, LanguageActive, GcodeWindow, Navigator };
+
+struct SwSlicerPref
+{
+    const char*      key;
+    SwSlicerPrefKind kind;
+};
+
+// Read-only allow list of app preferences for the API (no paths, accounts, tokens or network settings).
+static const SwSlicerPref k_sw_slicer_prefs[] = {
+    {"use_inches", SwSlicerPrefKind::Bool},
+    {"language", SwSlicerPrefKind::String},
+    {"language_active", SwSlicerPrefKind::LanguageActive},
+    {"use_perspective_camera", SwSlicerPrefKind::Bool},
+    {"auto_perspective", SwSlicerPrefKind::Bool},
+    {"show_gcode_window", SwSlicerPrefKind::GcodeWindow},
+    {"show_3d_navigator", SwSlicerPrefKind::Navigator},
+    {"use_free_camera", SwSlicerPrefKind::Bool},
+    {"camera_navigation_style", SwSlicerPrefKind::NavStyle},
+    {"swap_mouse_buttons", SwSlicerPrefKind::Bool},
+    {"reverse_mouse_wheel_zoom", SwSlicerPrefKind::Bool},
+    {"zoom_to_mouse", SwSlicerPrefKind::Bool},
+    {"dark_color_mode", SwSlicerPrefKind::Bool},
+    {"auto_arrange", SwSlicerPrefKind::Bool},
+    {"remember_printer_config", SwSlicerPrefKind::Bool},
+    {"auto_calculate", SwSlicerPrefKind::Bool},
+    {"auto_calculate_when_filament_change", SwSlicerPrefKind::Bool},
+    {"allow_filament_temp_mixing", SwSlicerPrefKind::Bool},
+    {SETTING_PROJECT_LOAD_BEHAVIOUR, SwSlicerPrefKind::LoadBehaviour},
+};
+
+// The View menu preferences the API may change, in the order they are applied.
+static const char* const k_sw_slicer_view_prefs[] = {"auto_perspective", "use_perspective_camera", "show_gcode_window",
+                                                     "show_3d_navigator"};
+
+static AppConfig* sw_slicer_app_config()
+{
+    AppConfig* cfg = wxGetApp().app_config;
+    if (cfg == nullptr)
+        throw std::runtime_error("app preferences are not available");
+    return cfg;
+}
+
+static const SwSlicerPref* sw_slicer_find_pref(const std::string& key)
+{
+    for (const SwSlicerPref& p : k_sw_slicer_prefs)
+        if (key == p.key)
+            return &p;
+    return nullptr;
+}
+
+static std::string sw_slicer_pref_names()
+{
+    std::string out;
+    for (const SwSlicerPref& p : k_sw_slicer_prefs)
+        out += (out.empty() ? "" : ", ") + std::string(p.key);
+    return out;
+}
+
+static json sw_slicer_pref_value(const SwSlicerPref& p)
+{
+    const AppConfig* cfg = sw_slicer_app_config();
+    switch (p.kind) {
+    case SwSlicerPrefKind::Bool: return cfg->get_bool(p.key);
+    case SwSlicerPrefKind::String: return cfg->get(p.key);
+    case SwSlicerPrefKind::NavStyle: return std::string(cfg->get(p.key) == "1" ? "touchpad" : "default");
+    case SwSlicerPrefKind::LoadBehaviour: {
+        const std::string v = cfg->get(p.key);
+        for (const char* o : {OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_ALL, OPTION_PROJECT_LOAD_BEHAVIOUR_ASK_WHEN_RELEVANT,
+                              OPTION_PROJECT_LOAD_BEHAVIOUR_ALWAYS_ASK, OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_GEOMETRY})
+            if (v == o)
+                return v;
+        return std::string(OPTION_PROJECT_LOAD_BEHAVIOUR_ASK_WHEN_RELEVANT); // the app's default
+    }
+    case SwSlicerPrefKind::LanguageActive: return into_u8(wxGetApp().current_language_code_safe());
+    case SwSlicerPrefKind::GcodeWindow: return wxGetApp().show_gcode_window();
+    case SwSlicerPrefKind::Navigator: return wxGetApp().show_3d_navigator();
+    }
+    return nullptr;
+}
+
+// Only reports whether the app runs on its default data directory; never the path.
+static std::string sw_slicer_datadir_kind()
+{
+    try {
+        // A relative data directory depends on the current working directory, which can change: ambiguous.
+        const boost::filesystem::path dir = into_path(wxString::FromUTF8(data_dir()));
+        if (dir.empty() || !dir.is_absolute())
+            return "unknown";
+        boost::system::error_code ec;
+        const bool same = boost::filesystem::equivalent(dir, into_path(wxStandardPaths::Get().GetUserDataDir()), ec);
+        return ec ? "unknown" : (same ? "default" : "custom");
+    } catch (...) {
+        return "unknown";
+    }
+}
+
+// Labels and overhang highlight of the 3D view (also when another view is shown).
+static json sw_slicer_view_options_json()
+{
+    GLCanvas3D* c = sw_slicer_canvas();
+    json        j;
+    j["labels"]   = c->are_labels_shown();
+    j["overhang"] = c->is_overhang_shown();
+    return j;
+}
+
+// Shared reply part of the context commands: camera, data directory kind and current view.
+static void sw_slicer_add_context_json(json& res)
+{
+    res["camera"]  = sw_slicer_camera_json();
+    res["datadir"] = sw_slicer_datadir_kind();
+    res["view"]    = sw_slicer_canvas_view_name(wxGetApp().plater()->get_current_canvas3D());
+}
+
+static bool sw_slicer_view_pref_value(const std::string& key)
+{
+    if (key == "show_gcode_window")
+        return wxGetApp().show_gcode_window();
+    if (key == "show_3d_navigator")
+        return wxGetApp().show_3d_navigator();
+    return sw_slicer_app_config()->get_bool(key);
+}
+
+static json sw_slicer_view_prefs_json()
+{
+    json j;
+    for (const char* k : k_sw_slicer_view_prefs)
+        j[k] = sw_slicer_view_pref_value(k);
+    return j;
+}
+
+static void sw_slicer_require_params_object(const json& params)
+{
+    if (!params.is_null() && !params.is_object())
+        throw std::runtime_error("parameters must be an object");
+}
+
+// {keys?: [names]} -> {preferences, view_options, camera, datadir, view, notes}. Read only.
+void SSWCP_SliceProject_Instance::sw_SlicerGetPreferences()
+{
+    try {
+        const json& p = m_param_data;
+        sw_slicer_require_params_object(p);
+        if (wxGetApp().plater() == nullptr)
+            throw std::runtime_error("no active plater");
+        sw_slicer_app_config();
+
+        std::vector<const SwSlicerPref*> selected;
+        if (sw_slicer_has_param(p, "keys")) {
+            const json& keys = p.at("keys");
+            if (!keys.is_array() || keys.empty())
+                throw std::runtime_error("keys must be a non-empty list of preference names");
+            for (const json& k : keys) {
+                if (!k.is_string())
+                    throw std::runtime_error("keys must be a non-empty list of preference names");
+                const std::string   name = k.get<std::string>();
+                const SwSlicerPref* pref = sw_slicer_find_pref(name);
+                if (pref == nullptr)
+                    throw std::runtime_error("unknown preference '" + name + "' (available: " + sw_slicer_pref_names() + ")");
+                if (std::find(selected.begin(), selected.end(), pref) != selected.end())
+                    throw std::runtime_error("keys must be a non-empty list of preference names");
+                selected.push_back(pref);
+            }
+        } else {
+            for (const SwSlicerPref& pref : k_sw_slicer_prefs)
+                selected.push_back(&pref);
+        }
+
+        json prefs = json::object();
+        for (const SwSlicerPref* pref : selected)
+            prefs[pref->key] = sw_slicer_pref_value(*pref);
+
+        const AppConfig*         cfg = sw_slicer_app_config();
+        std::vector<std::string> notes;
+        if (cfg->get_bool("use_inches"))
+            notes.push_back("the app shows imperial units; the API always uses mm");
+        if (cfg->get_bool("auto_perspective"))
+            notes.push_back("camera presets can switch the projection (auto perspective)");
+        if (std::find(selected.begin(), selected.end(), sw_slicer_find_pref("language_active")) != selected.end() &&
+            wxGetApp().current_language_code() != wxGetApp().current_language_code_safe())
+            notes.push_back("language_active is an approximation of the app language");
+
+        m_res_data["preferences"]  = prefs;
+        m_res_data["view_options"] = sw_slicer_view_options_json();
+        sw_slicer_add_context_json(m_res_data);
+        m_res_data["notes"] = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// {use_perspective_camera?, auto_perspective?, show_gcode_window?, show_3d_navigator?} ->
+// {changed, preferences, camera, datadir, view, notes}. Same as the View menu; persistent.
+void SSWCP_SliceProject_Instance::sw_SlicerSetViewPreferences()
+{
+    try {
+        const json& p = m_param_data;
+        sw_slicer_require_params_object(p);
+        Plater* plater = wxGetApp().plater();
+        if (plater == nullptr)
+            throw std::runtime_error("no active plater");
+        AppConfig* cfg = sw_slicer_app_config();
+
+        // 1. Check every parameter before changing anything.
+        if (p.is_object())
+            for (auto it = p.begin(); it != p.end(); ++it)
+                if (std::none_of(std::begin(k_sw_slicer_view_prefs), std::end(k_sw_slicer_view_prefs),
+                                 [&it](const char* k) { return it.key() == k; }))
+                    throw std::runtime_error("'" + it.key() + "' cannot be changed through the API");
+        std::map<std::string, bool> wanted;
+        for (const char* k : k_sw_slicer_view_prefs)
+            if (std::optional<bool> v = sw_slicer_get_opt_bool(p, k))
+                wanted[k] = *v;
+        if (wanted.empty())
+            throw std::runtime_error("specify at least one of use_perspective_camera, auto_perspective, show_gcode_window, show_3d_navigator");
+
+        // 2. Only values that differ are applied.
+        std::vector<std::string> changed;
+        for (const char* k : k_sw_slicer_view_prefs)
+            if (wanted.count(k) && wanted[k] != sw_slicer_view_pref_value(k))
+                changed.push_back(k);
+        auto is_changed = [&changed](const char* k) { return std::find(changed.begin(), changed.end(), k) != changed.end(); };
+
+        // 3. Apply in the order of k_sw_slicer_view_prefs.
+        if (is_changed("auto_perspective")) {
+            // Same as View > Auto Perspective (MainFrame.cpp).
+            cfg->set_bool("auto_perspective", wanted["auto_perspective"]);
+        }
+        if (is_changed("use_perspective_camera")) {
+            // Same as View > Use Perspective View / Use Orthogonal View (MainFrame.cpp).
+            cfg->set_bool("use_perspective_camera", wanted["use_perspective_camera"]);
+            wxGetApp().update_ui_from_settings();
+        }
+        if (is_changed("show_gcode_window")) {
+            // Same as View > Show G-code Window (MainFrame.cpp); the app only offers a toggle.
+            wxGetApp().toggle_show_gcode_window();
+        }
+        if (is_changed("show_3d_navigator")) {
+            // Same as View > Show 3D Navigator (MainFrame.cpp); the app only offers a toggle.
+            wxGetApp().toggle_show_3d_navigator();
+        }
+        GLCanvas3D* c = plater->get_current_canvas3D();
+        if (!changed.empty() && c != nullptr) {
+            c->post_event(SimpleEvent(wxEVT_PAINT));
+            c->set_as_dirty();
+            c->request_extra_frame();
+        }
+
+        // 4. Verify. Applied changes are not rolled back; the error names them because they are persistent.
+        for (const auto& [k, v] : wanted)
+            if (sw_slicer_view_pref_value(k) != v) {
+                std::string applied;
+                for (const std::string& ck : changed)
+                    if (sw_slicer_view_pref_value(ck) == wanted[ck])
+                        applied += (applied.empty() ? "" : ", ") + ck;
+                throw std::runtime_error("the app did not apply '" + k + "' (already changed: " +
+                                         (applied.empty() ? std::string("none") : applied) + ")");
+            }
+
+        std::vector<std::string> notes;
+        if (changed.empty())
+            notes.push_back("view preferences unchanged; nothing changed");
+        else
+            notes.push_back("saved by the app in its own config (like the View menu)");
+        if (wanted.count("use_perspective_camera")) {
+            const Camera::EType expected = wanted["use_perspective_camera"] ? Camera::EType::Perspective : Camera::EType::Ortho;
+            if (plater->get_camera().get_type() != expected)
+                notes.push_back("the camera projection is " + plater->get_camera().get_type_as_string());
+        }
+        if (is_changed("use_perspective_camera")) {
+            if (cfg->get_bool("auto_perspective"))
+                notes.push_back("auto perspective may switch the projection again on the next camera preset");
+            if (cfg->get_bool("use_free_camera"))
+                notes.push_back("free camera: the view was corrected like the View menu does");
+        }
+        if (wanted.count("show_gcode_window")) {
+            const bool preview_with_gcode = c != nullptr && c->get_canvas_type() == GLCanvas3D::ECanvasType::CanvasPreview &&
+                                            c->get_gcode_viewer().has_data();
+            if (!preview_with_gcode)
+                notes.push_back("the G-code window is only shown in the Preview of a sliced plate");
+        }
+
+        m_res_data["changed"]     = changed;
+        m_res_data["preferences"] = sw_slicer_view_prefs_json();
+        sw_slicer_add_context_json(m_res_data);
+        m_res_data["notes"] = notes;
+        send_to_js();
+        finish_job();
+    } catch (std::exception& e) {
+        handle_general_fail(-1, wxString::FromUTF8(e.what()));
+    }
+}
+
+// {labels?, overhang?} -> {changed, view_options, camera, datadir, view, notes}. 3D view only; not persistent.
+void SSWCP_SliceProject_Instance::sw_SlicerSetViewOptions()
+{
+    try {
+        const json& p = m_param_data;
+        sw_slicer_require_params_object(p);
+        sw_slicer_require_3d_view();
+        Plater* plater = wxGetApp().plater();
+
+        if (p.is_object())
+            for (auto it = p.begin(); it != p.end(); ++it)
+                if (it.key() != "labels" && it.key() != "overhang")
+                    throw std::runtime_error("unknown parameter '" + it.key() + "' (expected labels, overhang)");
+        const std::optional<bool> labels   = sw_slicer_get_opt_bool(p, "labels");
+        const std::optional<bool> overhang = sw_slicer_get_opt_bool(p, "overhang");
+        if (!labels && !overhang)
+            throw std::runtime_error("specify at least one of labels, overhang");
+
+        GLCanvas3D*              c = sw_slicer_canvas();
+        std::vector<std::string> changed;
+        if (labels && *labels != c->are_labels_shown())
+            changed.push_back("labels");
+        if (overhang && *overhang != c->is_overhang_shown())
+            changed.push_back("overhang");
+
+        // Same as View > Show Labels / Show Overhang (not persistent).
+        if (labels && *labels != c->are_labels_shown())
+            plater->show_view3D_labels(*labels);
+        if (overhang && *overhang != c->is_overhang_shown())
+            plater->show_view3D_overhang(*overhang);
+        if (!changed.empty()) {
+            c->post_event(SimpleEvent(wxEVT_PAINT));
+            c->set_as_dirty();
+            c->request_extra_frame();
+        }
+
+        if (labels && c->are_labels_shown() != *labels)
+            throw std::runtime_error("the app did not apply 'labels'");
+        if (overhang && c->is_overhang_shown() != *overhang)
+            throw std::runtime_error("the app did not apply 'overhang'");
+
+        std::vector<std::string> notes;
+        notes.push_back(changed.empty() ? "view options unchanged; nothing changed" : "not saved; resets when the app restarts");
+
+        m_res_data["changed"]      = changed;
+        m_res_data["view_options"] = sw_slicer_view_options_json();
+        sw_slicer_add_context_json(m_res_data);
+        m_res_data["notes"] = notes;
+        send_to_js();
+        finish_job();
     } catch (std::exception& e) {
         handle_general_fail(-1, wxString::FromUTF8(e.what()));
     }

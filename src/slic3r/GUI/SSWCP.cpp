@@ -4789,6 +4789,12 @@ void SSWCP_SliceProject_Instance::process()
         sw_SlicerAddSvg();
     } else if (m_cmd == "sw_SlicerRepair") {
         sw_SlicerRepair();
+    } else if (m_cmd == "sw_SlicerGetPreferences") {
+        sw_SlicerGetPreferences();
+    } else if (m_cmd == "sw_SlicerSetViewPreferences") {
+        sw_SlicerSetViewPreferences();
+    } else if (m_cmd == "sw_SlicerSetViewOptions") {
+        sw_SlicerSetViewOptions();
     } else {
         handle_general_fail();
     }
@@ -8123,6 +8129,8 @@ std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_SlicerGetText", "sw_SlicerCutSection", "sw_SlicerMergeObjects", "sw_SlicerMergeParts", "sw_SlicerSimplify",
     "sw_SlicerGetLayerRanges", "sw_SlicerAddLayerRange", "sw_SlicerEditLayerRange", "sw_SlicerDeleteLayerRange",
     "sw_SlicerAddSvg", "sw_SlicerRepair",
+    // Context
+    "sw_SlicerGetPreferences", "sw_SlicerSetViewPreferences", "sw_SlicerSetViewOptions",
 };
 
 // All sw_Slicer* commands (sorted), reported by sw_SlicerPing.
