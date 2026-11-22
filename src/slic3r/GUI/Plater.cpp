@@ -6584,14 +6584,25 @@ void Sidebar::init_color_mix_panel(wxWindow* parent, wxSizer* sizer)
 
         auto& mgr = pb->mixed_filaments;
         auto& mfs = mgr.mixed_filaments();
+        const std::vector<MixedFilament> old_mixed = mfs;
+        size_t deleted_idx = mfs.size();
         for (int i = static_cast<int>(mfs.size()) - 1; i >= 0; --i) {
             if (mfs[i].custom && !mfs[i].deleted) {
                 mfs[i].deleted = true;
+                mfs[i].enabled = false;
+                deleted_idx = static_cast<size_t>(i);
                 break;
             }
         }
         if (auto* opt = pb->project_config.option<ConfigOptionString>("mixed_filament_definitions"))
             opt->value = mgr.serialize_custom_entries();
+        if (deleted_idx < old_mixed.size()) {
+            // Same path as the Delete item of a mixed row: remap, renumber the assignments, then refresh.
+            const size_t num_physical = p->combos_filament.size();
+            pb->update_mixed_filament_id_remap(old_mixed, num_physical, num_physical, deleted_idx);
+            const std::vector<unsigned int> delete_remap = pb->last_filament_id_remap();
+            wxGetApp().plater()->apply_mixed_filament_delete_remap(delete_remap);
+        }
         wxGetApp().plater()->post_slice_state_change_update();
         wxGetApp().plater()->on_filaments_change(p->combos_filament.size());
         update_color_mix_panel();
@@ -6980,6 +6991,10 @@ void Sidebar::update_color_mix_panel()
                 if (auto* opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionString>("mixed_filament_definitions"))
                     opt->value = mgr2.serialize_custom_entries();
                 wxGetApp().preset_bundle->update_mixed_filament_id_remap(old_mixed, num_physical, num_physical, i);
+                // Copy the remap before on_filaments_change consumes it; the object, part and layer-range
+                // assignments are renumbered first so the list refresh in on_filaments_change sees them.
+                const std::vector<unsigned int> delete_remap = wxGetApp().preset_bundle->last_filament_id_remap();
+                wxGetApp().plater()->apply_mixed_filament_delete_remap(delete_remap);
                 wxGetApp().plater()->post_slice_state_change_update();
                 wxGetApp().plater()->on_filaments_change(num_physical);
                 wxWeakRef<Sidebar> weak_this(this);
@@ -22542,6 +22557,44 @@ void Plater::on_filaments_change(size_t num_filaments)
 
     // Adding/removing filament is a parameter change too: reset dismissal.
     get_notification_manager()->reset_pla_petg_mix_warning();
+}
+
+void Plater::apply_mixed_filament_delete_remap(const std::vector<unsigned>& id_remap)
+{
+    if (id_remap.empty())
+        return;
+
+    // Total after the deletion: physical filaments plus the mixed rows that remain enabled.
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    const size_t num_physical = std::max<size_t>(sidebar().combos_filament().size(), 1);
+    const size_t total_filaments = preset_bundle != nullptr ? preset_bundle->mixed_filaments.total_filaments(num_physical)
+                                                            : num_physical;
+
+    // The `extruder` of objects, parts and layer ranges (painting is remapped by on_filaments_change).
+    for (ModelObject* mo : wxGetApp().model().objects) {
+        remap_model_config_filament_ids(mo->config, id_remap, total_filaments);
+        for (ModelVolume* mv : mo->volumes)
+            remap_model_config_filament_ids(mv->config, id_remap, total_filaments);
+        for (auto& layer_range : mo->layer_config_ranges)
+            remap_model_config_filament_ids(layer_range.second, id_remap, total_filaments);
+    }
+
+    // The global feature filament keys (wall_filament and so on).
+    remap_dynamic_config_feature_filament_ids(*p->config, id_remap, total_filaments);
+
+    // ToolChange items in the custom G-code: a deleted filament drops its items, the others are renumbered.
+    for (auto& plate_gcodes : p->model.plates_custom_gcodes) {
+        auto& gcodes = plate_gcodes.second.gcodes;
+        for (CustomGCode::Item& item : gcodes) {
+            if (item.type == CustomGCode::Type::ToolChange)
+                item.extruder = int(remap_filament_config_id(item.extruder, id_remap, total_filaments));
+        }
+        gcodes.erase(std::remove_if(gcodes.begin(), gcodes.end(), [](const CustomGCode::Item& item) {
+            return item.type == CustomGCode::Type::ToolChange && item.extruder == 0;
+        }), gcodes.end());
+    }
+
+    sidebar().obj_list()->refresh_layer_range_filament_items();
 }
 
 void Plater::on_bed_type_change(BedType bed_type)

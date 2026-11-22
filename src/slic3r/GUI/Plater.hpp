@@ -574,6 +574,11 @@ public:
 
     void on_filaments_change(size_t extruders_count);
     void on_filaments_delete(size_t extruders_count, size_t filament_id, int replace_filament_id = -1, const std::vector<unsigned char>& is_mixed_snapshot = {});
+    // After a color mix row is deleted: renumber the extruder assignments of objects, parts and layer
+    // ranges, the global feature filament keys and the ToolChange items, with the remap built by
+    // PresetBundle::update_mixed_filament_id_remap (copy it before on_filaments_change consumes it).
+    // Call this before on_filaments_change.
+    void apply_mixed_filament_delete_remap(const std::vector<unsigned>& remap);
     bool confirm_auto_generated_gradients(size_t num_physical);
     void set_auto_generated_gradient_decision(size_t num_physical, bool create_auto_gradients);
     // BBS
