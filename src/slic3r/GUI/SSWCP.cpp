@@ -5689,6 +5689,8 @@ constexpr std::chrono::milliseconds SSWCP::DEFAULT_INSTANCE_TIMEOUT;
 
 std::string SSWCP::m_active_gcode_filename = "";
 std::string SSWCP::m_display_gcode_filename = "";
+std::unique_ptr<SlicerApi::Server> SSWCP::m_slicer_api;
+std::string                        SSWCP::m_slicer_api_token;
 long long   SSWCP::m_active_file_size       = 0;
 
 std::unordered_map<std::string, std::shared_ptr<SSWCP_UserLogin_Instance::SubscribeInfo>>
@@ -5920,6 +5922,174 @@ void SSWCP::handle_web_message(std::string message, wxWebView* webview) {
     }
     catch (std::exception& e) {
     }
+}
+
+void SSWCP_ApiSliceProject_Instance::send_to_js()
+{
+    if (is_Instance_illegal())
+        return;
+    if (m_replied->exchange(true))
+        return; // already answered (for example by the timeout)
+
+    json response, payload;
+    response["header"] = m_header;
+
+    payload["code"]    = m_status;
+    payload["message"] = m_msg;
+    payload["data"]    = m_res_data;
+
+    response["payload"] = payload;
+
+    std::string json_str = response.dump(-1, ' ', true, json::error_handler_t::replace);
+
+    WCP_Logger::getInstance().add_log(json_str, false, "", "WCP", "info");
+
+    if (m_reply)
+        m_reply(std::move(json_str));
+}
+
+void SSWCP_ApiSliceProject_Instance::on_timeout()
+{
+    // Only copies: the instance is released after this call, and the GUI thread may still be in its handler.
+    std::shared_ptr<std::atomic<bool>> replied = m_replied;
+    SlicerApi::Reply                   reply   = m_reply;
+    json                               header  = m_header;
+    wxGetApp().CallAfter([replied, reply, header]() {
+        if (replied->exchange(true) || !reply)
+            return;
+        json response, payload;
+        response["header"]  = header;
+        payload["code"]     = -2;
+        payload["message"]  = "time out";
+        payload["data"]     = json::object();
+        response["payload"] = payload;
+        reply(response.dump(-1, ' ', true, json::error_handler_t::replace));
+    });
+}
+
+// Handle a message from the local slicer API
+void SSWCP::handle_api_message(const std::string& message, SlicerApi::Reply reply, std::weak_ptr<void> alive)
+{
+    // The session closed or the server stopped while the message was queued: nobody waits for it.
+    if (alive.expired())
+        return;
+
+    json                                            header;
+    std::shared_ptr<SSWCP_ApiSliceProject_Instance> instance;
+    try {
+        SlicerApi::Envelope envelope = SlicerApi::parse_envelope(message);
+        header                       = envelope.header;
+        if (!envelope.ok) {
+            reply(SlicerApi::make_error_reply(header, -1, "invalid message"));
+            return;
+        }
+        if (!SlicerApi::is_allowed_command(envelope.cmd, envelope.event_id, m_project_cmd_list)) {
+            reply(SlicerApi::make_error_reply(header, -1, "command not available through the slicer API"));
+            return;
+        }
+        if (!wxGetApp().mainframe || !wxGetApp().plater() || wxGetApp().is_recreating_gui()) {
+            reply(SlicerApi::make_error_reply(header, -1, "the app is not ready"));
+            return;
+        }
+
+        WCP_Logger::getInstance().add_log(message, false, "", "WCP", "info");
+
+        instance = std::make_shared<SSWCP_ApiSliceProject_Instance>(envelope.cmd, header, envelope.params, reply);
+        m_instance_list.add(instance.get(), instance, DEFAULT_INSTANCE_TIMEOUT);
+        instance->process();
+    } catch (...) {
+        if (instance) {
+            // No second reply from a late handler or the timeout.
+            instance->set_Instance_illegal();
+            delete_target(instance.get());
+        }
+        reply(SlicerApi::make_error_reply(header, -1, "failure"));
+    }
+}
+
+static bool parse_slicer_api_port(const std::string& value, unsigned short& port)
+{
+    // Empty or "0": the OS chooses a free port.
+    if (value.empty()) {
+        port = 0;
+        return true;
+    }
+    if (value.size() > 5 || !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return false;
+    const unsigned long n = std::stoul(value);
+    if (n != 0 && (n < 1024 || n > 65535))
+        return false;
+    port = static_cast<unsigned short>(n);
+    return true;
+}
+
+static void wipe_slicer_api_token(std::string& token)
+{
+    std::fill(token.begin(), token.end(), '\0');
+    token.clear();
+}
+
+bool SSWCP::start_slicer_api()
+{
+    if (m_slicer_api)
+        return true;
+    const AppConfig* config = wxGetApp().app_config;
+    if (!config || !config->get_bool("slicer_api_enabled"))
+        return false;
+
+    unsigned short port = 0;
+    if (!parse_slicer_api_port(config->get("slicer_api_port"), port)) {
+        BOOST_LOG_TRIVIAL(error) << "slicer API: invalid slicer_api_port, not started";
+        return false;
+    }
+
+    try {
+        m_slicer_api_token = SlicerApi::generate_token();
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "slicer API: " << e.what() << ", not started";
+        return false;
+    }
+
+    SlicerApi::Options options;
+    options.port  = port;
+    options.token = m_slicer_api_token;
+    // The handler runs on the io thread; the commands run on the GUI thread.
+    auto server = std::make_unique<SlicerApi::Server>(std::move(options), [](std::string message, SlicerApi::Reply reply,
+                                                                             std::weak_ptr<void> alive) {
+        wxGetApp().CallAfter([message = std::move(message), reply = std::move(reply), alive = std::move(alive)]() {
+            SSWCP::handle_api_message(message, reply, alive);
+        });
+    });
+
+    std::string error;
+    if (!server->start(error)) {
+        BOOST_LOG_TRIVIAL(error) << "slicer API: not started: " << error;
+        wipe_slicer_api_token(m_slicer_api_token);
+        return false;
+    }
+
+    // A server without a reachable token is of no use.
+    const boost::filesystem::path file = boost::filesystem::path(data_dir()) / SlicerApi::CONNECTION_FILE;
+    if (!SlicerApi::write_connection_file(file, server->port(), m_slicer_api_token, error)) {
+        BOOST_LOG_TRIVIAL(error) << "slicer API: " << error << ", not started";
+        server->stop();
+        wipe_slicer_api_token(m_slicer_api_token);
+        return false;
+    }
+
+    m_slicer_api = std::move(server);
+    return true;
+}
+
+void SSWCP::stop_slicer_api()
+{
+    if (!m_slicer_api)
+        return;
+    // Joins the io thread; afterwards every session has expired, so queued messages no longer run.
+    m_slicer_api->stop();
+    m_slicer_api.reset();
+    SlicerApi::remove_connection_file_if_ours(boost::filesystem::path(data_dir()) / SlicerApi::CONNECTION_FILE, m_slicer_api_token);
+    wipe_slicer_api_token(m_slicer_api_token);
 }
 
 // Delete instance from list

@@ -17,6 +17,8 @@
 #include "slic3r/Utils/TimeoutMap.hpp"
 #include "slic3r/Utils/PrintHost.hpp"
 #include "slic3r/Utils/MQTT.hpp"
+#include "slic3r/Utils/SlicerApiServer.hpp"
+#include <atomic>
 #include "libslic3r/SSWCPProtocol.hpp"
 
 
@@ -695,12 +697,40 @@ private:
     void sw_SlicerSetViewOptions();
 };
 
+// A sw_Slicer* request from the local slicer API: no webview, and the reply goes only to the
+// session that sent the request (never broadcast).
+class SSWCP_ApiSliceProject_Instance : public SSWCP_SliceProject_Instance
+{
+public:
+    SSWCP_ApiSliceProject_Instance(std::string cmd, const json& header, const json& data, SlicerApi::Reply reply)
+        : SSWCP_SliceProject_Instance(cmd, header, data, "", nullptr), m_reply(std::move(reply))
+    {}
+
+    // Same envelope as SSWCP_Instance::send_to_js, sent through m_reply. A request gets one reply only.
+    void send_to_js() override;
+    bool from_slicer_api() const override { return true; }
+    // Called on the TimeoutMap thread while a handler may still run on the GUI thread: the timeout
+    // reply is sent from the GUI thread, and only if no reply was sent yet.
+    void on_timeout() override;
+
+private:
+    SlicerApi::Reply                   m_reply;
+    std::shared_ptr<std::atomic<bool>> m_replied = std::make_shared<std::atomic<bool>>(false);
+};
+
 // Main SSWCP class for managing communication instances
 class SSWCP
 {
 public:
     // Handle incoming web messages
     static void handle_web_message(std::string message, wxWebView* webview);
+
+    // Handle a message from the local slicer API (GUI thread). Only sw_Slicer* commands are served.
+    static void handle_api_message(const std::string& message, SlicerApi::Reply reply, std::weak_ptr<void> alive);
+
+    // Start the slicer API if slicer_api_enabled is set; stop it and remove the connection file.
+    static bool start_slicer_api();
+    static void stop_slicer_api();
 
     // Create new SSWCP instance
     static std::shared_ptr<SSWCP_Instance> create_sswcp_instance(
@@ -758,6 +788,8 @@ private:
     static std::string m_active_gcode_filename; // name of the file which is pretend to be upload and print
     static std::string m_display_gcode_filename; // name for display
 
+    static std::unique_ptr<SlicerApi::Server> m_slicer_api;       // local slicer API, null when off
+    static std::string                        m_slicer_api_token; // bearer token of m_slicer_api
 }; 
 
 class MachineIPType

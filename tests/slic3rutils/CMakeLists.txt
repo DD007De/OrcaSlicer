@@ -56,6 +56,18 @@ if (MSVC)
 endif ()
 set_property(TARGET gateway_tests PROPERTY FOLDER "tests")
 
+add_executable(slicer_api_tests
+    gateway_tests_main.cpp
+    SlicerApiServer_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/slic3r/Utils/SlicerApiServer.cpp
+    )
+target_link_libraries(slicer_api_tests test_common libslic3r boost_libs OpenSSL::SSL OpenSSL::Crypto)
+if (MSVC)
+    target_compile_definitions(slicer_api_tests PRIVATE _WIN32_WINNT=0x0601 NOMINMAX)
+    target_link_libraries(slicer_api_tests Advapi32)
+endif ()
+set_property(TARGET slicer_api_tests PROPERTY FOLDER "tests")
+
 if (WIN32)
     if ("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
         Snapmaker_Orca_copy_dlls(COPY_DLLS "Debug" "d" output_dlls_Debug)
@@ -68,6 +80,7 @@ endif()
 
 catch_discover_tests(${_TEST_NAME}_tests TEST_PREFIX "${_TEST_NAME}: " EXTRA_ARGS ${CATCH_EXTRA_ARGS})
 catch_discover_tests(gateway_tests TEST_PREFIX "gateway: " EXTRA_ARGS ${CATCH_EXTRA_ARGS})
+catch_discover_tests(slicer_api_tests TEST_PREFIX "slicer_api: " EXTRA_ARGS ${CATCH_EXTRA_ARGS})
 # add_test(${_TEST_NAME}_tests ${_TEST_NAME}_tests "${CATCH_EXTRA_ARGS} exclude:[NotWorking]")
 
 set(_FILAMENT_TEST_NAME filament_dropdown_mapping)

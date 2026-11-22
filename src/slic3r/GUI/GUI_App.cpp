@@ -1253,6 +1253,8 @@ void GUI_App::post_init()
            }
         }
     }
+    // Opt-in local API for the sw_Slicer* commands; started once, after the plater is ready.
+    SSWCP::start_slicer_api();
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
 //BBS: remove the single instance currently
 #ifdef _WIN32
@@ -1313,6 +1315,9 @@ void GUI_App::shutdown(bool isRecreate)
 
     if (!m_is_recreating_gui)
         m_is_closing = true;
+    // The slicer API keeps running while the GUI is recreated.
+    if (!isRecreate)
+        SSWCP::stop_slicer_api();
     stop_gateway_service();
 
 	if (m_removable_drive_manager) {
@@ -2417,6 +2422,7 @@ int GUI_App::OnExit()
 
     ::Slic3r::SnapLog::v1::SnapLogClient::instance().shutdown();
 
+    SSWCP::stop_slicer_api();
     stop_gateway_service();
     stop_sync_user_preset();
 
