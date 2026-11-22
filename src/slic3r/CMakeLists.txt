@@ -570,6 +570,7 @@ set(SLIC3R_GUI_SOURCES
     GUI/SMPhysicalPrinterDialog.cpp
     GUI/SSWCP.cpp
     GUI/SSWCP.hpp
+    GUI/SSWCPApiMode.hpp
     GUI/DownloadManager.cpp
     GUI/DownloadManager.hpp
     GUI/GenericDownloadDialog.cpp

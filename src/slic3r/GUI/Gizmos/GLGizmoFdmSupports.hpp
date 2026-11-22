@@ -28,6 +28,10 @@ public:
     //BBS
     bool on_key_down_select_tool_type(int keyCode);
 
+    // Scripting API (SSWCP): tools circle|sphere|fill|gap_fill.
+    bool set_tool(const std::string& tool) override;
+    bool set_tool_option(const std::string& key, double value) override;
+
 protected:
     void on_render_input_window(float x, float y, float bottom_limit) override;
     std::string on_get_name() const override;

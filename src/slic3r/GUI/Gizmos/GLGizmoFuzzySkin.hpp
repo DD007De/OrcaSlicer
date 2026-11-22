@@ -14,6 +14,10 @@ public:
 
     void render_painter_gizmo() override;
 
+    // Scripting API (SSWCP): tools circle|sphere|triangle|fill.
+    bool set_tool(const std::string& tool) override;
+    bool set_tool_option(const std::string& key, double value) override;
+
 protected:
     void        on_render_input_window(float x, float y, float bottom_limit) override;
     std::string on_get_name() const override;

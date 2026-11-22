@@ -15,6 +15,10 @@ public:
     //BBS
     bool on_key_down_select_tool_type(int keyCode);
 
+    // Scripting API (SSWCP): tools circle|sphere.
+    bool set_tool(const std::string& tool) override;
+    bool set_tool_option(const std::string& key, double value) override;
+
 protected:
     // BBS
     void on_set_state() override;

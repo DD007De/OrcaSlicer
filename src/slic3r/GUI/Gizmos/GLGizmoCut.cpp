@@ -747,6 +747,50 @@ std::vector<Vec3i32> GLGizmoCut3D::offset_indices(const std::vector<Vec3i32>& ba
     return offset;
 }
 
+std::vector<Vec3d> GLGizmoCut3D::groove_validity_lines(const Cut::Groove& groove, float radius, int groove_count, float groove_gap)
+{
+    // Same values as its_make_groove_plane() (the base geometry of a single groove).
+    const float flap_taper_width       = is_approx(groove.flaps_angle, 0.f) ? groove.depth : (groove.depth / sin(groove.flaps_angle));
+    const float total_flap_taper_width = 2.f * flap_taper_width * cos(groove.flaps_angle);
+
+    const float slot_neck_half_width  = 0.5f * (groove.width);
+    const float slot_mouth_half_width = 0.5f * (groove.width + total_flap_taper_width);
+
+    const float cut_plane_radius  = 1.5f * radius;
+    const float cut_plane_length  = 1.5f * cut_plane_radius;
+    const float plane_half_height = 0.5f * cut_plane_length; // y
+    const float slot_half_depth   = 0.5f * groove.depth;     // z
+    const float flap_taper_offset = plane_half_height * tan(groove.angle);
+
+    const float slot_mouth_outer_x = slot_neck_half_width + flap_taper_offset;
+    const float slot_neck_outer_x  = slot_mouth_half_width + flap_taper_offset;
+    const float slot_mouth_inner_x = slot_mouth_half_width - flap_taper_offset;
+    const float slot_front_z       = slot_half_depth;
+    const float slot_back_z        = -slot_half_depth;
+
+    const float groove_width = Cut::calculate_groove_width(groove, radius);
+
+    std::vector<Vec3d> vertices;
+    vertices.reserve(8 * groove_count);
+    for (int i = 0; i < groove_count; ++i) {
+        // Calculate the x-axis offset for this dovetail
+        float groove_offset_factor_start = -.5 * ((groove_count - 1));
+        float groove_offset_factor       = groove_offset_factor_start + i;
+        // Recalculate x with offset (only X-axis offset)
+        float offset_x = groove_offset_factor * (groove_gap + groove_width);
+
+        vertices.emplace_back(Vec3f(-slot_neck_outer_x + offset_x, -plane_half_height, slot_front_z).cast<double>());
+        vertices.emplace_back(Vec3f(-slot_mouth_inner_x + offset_x, plane_half_height, slot_front_z).cast<double>());
+        vertices.emplace_back(Vec3f(-slot_mouth_outer_x + offset_x, -plane_half_height, slot_back_z).cast<double>());
+        vertices.emplace_back(Vec3f(-slot_neck_outer_x + offset_x, plane_half_height, slot_back_z).cast<double>());
+        vertices.emplace_back(Vec3f(slot_neck_outer_x + offset_x, -plane_half_height, slot_front_z).cast<double>());
+        vertices.emplace_back(Vec3f(slot_mouth_inner_x + offset_x, plane_half_height, slot_front_z).cast<double>());
+        vertices.emplace_back(Vec3f(slot_mouth_outer_x + offset_x, -plane_half_height, slot_back_z).cast<double>());
+        vertices.emplace_back(Vec3f(slot_neck_outer_x + offset_x, plane_half_height, slot_back_z).cast<double>());
+    }
+    return vertices;
+}
+
 indexed_triangle_set GLGizmoCut3D::its_make_groove_plane()
 {
     // This function generates a dovetail slot in a wall, viewed from above (top-down).
@@ -791,9 +835,10 @@ indexed_triangle_set GLGizmoCut3D::its_make_groove_plane()
 
     indexed_triangle_set mesh;
 
+    // Vertices of the grooves used to detection if a groove is valid (not used in mesh)
+    m_groove_vertices = groove_validity_lines(m_groove, static_cast<float>(m_radius), groove_count, groove_gap);
+
     // handle multiple dovetails/grooves
-    m_groove_vertices.clear();
-    m_groove_vertices.reserve(8 * groove_count);
     for (int i = 0; i < groove_count; ++i) {
         bool   is_first_groove     = i == 0; // when a groove is not the last groove, then limit the extent of the right plane so that it doesnt overlap the next groove
         bool   is_last_groove      = i == groove_count - 1; // do the same in reverse if a groove is not the first groove
@@ -815,18 +860,6 @@ indexed_triangle_set GLGizmoCut3D::its_make_groove_plane()
         float groove_offset_factor       = groove_offset_factor_start + i;
         // Recalculate x with offset (only X-axis offset)
         float offset_x = groove_offset_factor * (groove_gap + groove_width);
-
-        // Vertices of the groove used to detection if groove is valid (not used in mesh)
-        {
-            m_groove_vertices.emplace_back(Vec3f(-slot_neck_outer_x + offset_x, -plane_half_height, slot_front_z).cast<double>());
-            m_groove_vertices.emplace_back(Vec3f(-slot_mouth_inner_x + offset_x, plane_half_height, slot_front_z).cast<double>());
-            m_groove_vertices.emplace_back(Vec3f(-slot_mouth_outer_x + offset_x, -plane_half_height, slot_back_z).cast<double>());
-            m_groove_vertices.emplace_back(Vec3f(-slot_neck_outer_x + offset_x, plane_half_height, slot_back_z).cast<double>());
-            m_groove_vertices.emplace_back(Vec3f(slot_neck_outer_x + offset_x, -plane_half_height, slot_front_z).cast<double>());
-            m_groove_vertices.emplace_back(Vec3f(slot_mouth_inner_x + offset_x, plane_half_height, slot_front_z).cast<double>());
-            m_groove_vertices.emplace_back(Vec3f(slot_mouth_outer_x + offset_x, -plane_half_height, slot_back_z).cast<double>());
-            m_groove_vertices.emplace_back(Vec3f(slot_neck_outer_x + offset_x, plane_half_height, slot_back_z).cast<double>());
-        }
 
         //                                     ___
         // Case: Groove is open (Top&bottom: __\ /__ )

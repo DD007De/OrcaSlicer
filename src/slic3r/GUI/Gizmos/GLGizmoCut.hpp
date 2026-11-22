@@ -270,6 +270,12 @@ public:
     BoundingBoxf3   bounding_box() const;
     BoundingBoxf3   transformed_bounding_box(const Vec3d& plane_center, const Transform3d& rotation_m = Transform3d::Identity()) const;
 
+    /// Points of the lines that has_valid_groove() casts against the solid parts, in cut plane
+    /// coordinates: 8 points (4 lines, point 2k to point 2k + 1) per groove, from the first groove
+    /// to the last. Every groove must hit the object with all of its lines.
+    /// \param radius Radius of the object's bounding box (m_radius); sets the size of the groove plane.
+    static std::vector<Vec3d> groove_validity_lines(const Cut::Groove& groove, float radius, int groove_count, float groove_gap);
+
 protected:
     bool               on_init() override;
     void               on_load(cereal::BinaryInputArchive&ar) override;

@@ -167,6 +167,18 @@ void StyleManager::erase(size_t index) {
     m_styles.erase(m_styles.begin() + index);
 }
 
+void StyleManager::api_erase(size_t index) {
+    if (index >= m_styles.size()) return;
+
+    // fix last used index (erase() fixes only the selected one)
+    if (m_last_style_index < m_styles.size()) {
+        if (index < m_last_style_index) --m_last_style_index;
+        else if (index == m_last_style_index) m_last_style_index = (index > 0) ? index - 1 : 0;
+    }
+
+    erase(index);
+}
+
 void StyleManager::rename(const std::string& name) {
     m_style_cache.style.name = name;
     m_style_cache.truncated_name.clear();

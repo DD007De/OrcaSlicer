@@ -386,6 +386,11 @@ public:
     bool on_mouse(const wxMouseEvent &mouse_event) override;
     void OnMouseCaptureLost() override;
 
+    // Scripting API (SSWCP): select the tool / set a tool option as the gizmo's own
+    // buttons and sliders do. Returns false for an unknown tool or option.
+    virtual bool set_tool(const std::string& tool) { return false; }
+    virtual bool set_tool_option(const std::string& key, double value);
+
 protected:
     virtual void render_triangles(const Selection& selection) const;
     void render_cursor();

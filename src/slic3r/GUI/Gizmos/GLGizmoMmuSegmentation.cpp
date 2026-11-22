@@ -17,6 +17,7 @@
 
 #include <GL/glew.h>
 #include <algorithm>
+#include <cmath>
 #include <boost/log/trivial.hpp>
 
 namespace Slic3r::GUI {
@@ -349,6 +350,122 @@ bool GLGizmoMmuSegmentation::on_key_down_select_tool_type(int keyCode)
         tool_changed(oldTool, m_current_tool);
     }
     return true;
+}
+
+bool GLGizmoMmuSegmentation::set_tool(const std::string& tool)
+{
+    wchar_t new_tool = 0;
+    if (tool == "circle")
+        new_tool = ImGui::CircleButtonIcon;
+    else if (tool == "sphere")
+        new_tool = ImGui::SphereButtonIcon;
+    else if (tool == "triangle")
+        new_tool = ImGui::TriangleButtonIcon;
+    else if (tool == "height_range")
+        new_tool = ImGui::HeightRangeIcon;
+    else if (tool == "fill")
+        new_tool = ImGui::FillButtonIcon;
+    else if (tool == "gap_fill")
+        new_tool = ImGui::GapFillIcon;
+    else
+        return false;
+
+    // Same as a click on the tool button: m_cursor_type / m_tool_type are derived from
+    // m_current_tool on the next frame.
+    const wchar_t old_tool = m_current_tool;
+    if (new_tool != old_tool) {
+        m_current_tool = new_tool;
+        for (auto& triangle_selector : m_triangle_selectors) {
+            triangle_selector->seed_fill_unselect_all_triangles();
+            triangle_selector->request_update_render_data();
+        }
+        this->tool_changed(old_tool, new_tool);
+    }
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return true;
+}
+
+bool GLGizmoMmuSegmentation::set_tool_option(const std::string& key, double value)
+{
+    if (key == "filament") {
+        // value is the filament ID (as shown in the gizmo), not the index into the list.
+        if (!(value >= 1.) || value != std::floor(value))
+            return false;
+        const unsigned int filament_id = static_cast<unsigned int>(value);
+        const size_t       n_extruders = std::min(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT, m_display_filament_ids.size());
+        auto               it          = std::find(m_display_filament_ids.begin(), m_display_filament_ids.begin() + n_extruders, filament_id);
+        if (it == m_display_filament_ids.begin() + n_extruders)
+            return false;
+        m_selected_extruder_idx = size_t(std::distance(m_display_filament_ids.begin(), it));
+    } else if (key == "detect_geometry_edge") {
+        m_detect_geometry_edge = (value != 0.);
+        // The window sets m_smart_fill_angle to -1 while edge detection is off; restore a usable
+        // default angle when it is switched on again (the slider would otherwise show -1).
+        if (m_detect_geometry_edge && m_smart_fill_angle < SmartFillAngleMin)
+            m_smart_fill_angle = 30.f;
+        for (auto& triangle_selector : m_triangle_selectors) {
+            triangle_selector->seed_fill_unselect_all_triangles();
+            triangle_selector->request_update_render_data();
+        }
+    } else if (key == "on_overhangs_only" || key == "highlight_angle") {
+        // Not shown in this gizmo's window.
+        return false;
+    } else if (key == "smart_fill_angle" && !m_detect_geometry_edge) {
+        // With edge detection off the window resets the angle to -1 every frame.
+        return false;
+    } else {
+        return GLGizmoPainterBase::set_tool_option(key, value);
+    }
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return true;
+}
+
+GLGizmoMmuSegmentation::RemapResult GLGizmoMmuSegmentation::set_remap_by_filament_ids(const std::map<int, int>& filament_map)
+{
+    // The editing copies must exist for the object, as when the gizmo is shown.
+    const ModelObject* mo = (m_state == On && m_c->selection_info() != nullptr) ? m_c->selection_info()->model_object() : nullptr;
+    if (mo == nullptr)
+        return RemapResult::NotReady;
+    size_t n_parts = 0;
+    for (const ModelVolume* mv : mo->volumes)
+        if (mv->is_model_part())
+            ++n_parts;
+    if (n_parts != m_triangle_selectors.size())
+        return RemapResult::NotReady;
+
+    // Filament ID -> position in the palette (m_display_filament_ids), the same range the
+    // remap panel offers. All IDs are checked before anything changes.
+    const size_t n_extr = std::min(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT, m_display_filament_ids.size());
+    std::vector<size_t> remap(m_display_filament_ids.size());
+    for (size_t i = 0; i < remap.size(); ++i)
+        remap[i] = i;
+    bool any_change = false;
+    for (const std::pair<const int, int>& entry : filament_map) {
+        if (entry.first < 1 || entry.second < 1)
+            return RemapResult::InvalidFilament;
+        const auto begin = m_display_filament_ids.begin();
+        const auto end   = m_display_filament_ids.begin() + n_extr;
+        const auto src   = std::find(begin, end, static_cast<unsigned int>(entry.first));
+        const auto dst   = std::find(begin, end, static_cast<unsigned int>(entry.second));
+        if (src == end || dst == end)
+            return RemapResult::InvalidFilament;
+        remap[size_t(std::distance(begin, src))] = size_t(std::distance(begin, dst));
+        if (entry.first != entry.second)
+            any_change = true;
+    }
+    if (!any_change)
+        return RemapResult::NothingToRemap;
+
+    // Keep the table of an open remap panel as the user left it.
+    std::vector<size_t> panel_remap = std::move(m_extruder_remap);
+    m_extruder_remap                = std::move(remap);
+    const bool remapped             = remap_filament_assignments("API: Remap filament assignments");
+    m_extruder_remap                = std::move(panel_remap);
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return remapped ? RemapResult::Remapped : RemapResult::NothingToRemap;
 }
 
 static void render_extruders_combo(const std::string& label,
@@ -1384,10 +1501,10 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
         m_show_filament_remap_ui = false;
 }
 
-void GLGizmoMmuSegmentation::remap_filament_assignments()
+bool GLGizmoMmuSegmentation::remap_filament_assignments(const std::string& snapshot_name)
 {
     if (m_extruder_remap.empty())
-        return;
+        return false;
 
     constexpr size_t MAX_EBT = (size_t)EnforcerBlockerType::ExtruderMax;
     EnforcerBlockerStateMap state_map;
@@ -1415,16 +1532,16 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         any_change = true;
     }
     if (!any_change)
-        return;
+        return false;
 
     Plater::TakeSnapshot snapshot(wxGetApp().plater(),
-                                  "Remap filament assignments",
+                                  snapshot_name,
                                   UndoRedo::SnapshotType::GizmoAction);
 
     bool updated = false;
     int idx = -1;
     ModelObject* mo = m_c->selection_info()->model_object();
-    if (!mo) return;
+    if (!mo) return false;
 
     for (ModelVolume* mv : mo->volumes) {
         if (!mv->is_model_part()) continue;
@@ -1442,6 +1559,7 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         update_model_object();
         m_parent.set_as_dirty();
     }
+    return updated;
 }
 
 } // namespace Slic3r

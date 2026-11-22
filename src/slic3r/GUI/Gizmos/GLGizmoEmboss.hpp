@@ -13,6 +13,8 @@
 #include <optional>
 #include <memory>
 #include <atomic>
+#include <string>
+#include <vector>
 
 #include "libslic3r/Emboss.hpp"
 #include "libslic3r/Point.hpp"
@@ -48,6 +50,14 @@ public:
     bool create_volume(ModelVolumeType volume_type);
 
     /// <summary>
+    /// Create new text without given position, with the given text instead of the
+    /// default one (scripting API, SSWCP). An empty text keeps the default text.
+    /// </summary>
+    /// <param name="volume_type">Object part / Negative volume / Modifier</param>
+    /// <param name="text">UTF8 text of the new volume</param>
+    bool create_volume(ModelVolumeType volume_type, const std::string &text);
+
+    /// <summary>
     /// Handle pressing of shortcut
     /// </summary>
     void on_shortcut_key();
@@ -67,6 +77,33 @@ public:
     /// <param name="job_cancel">Way to stop re_emboss job</param>
     /// <returns>True on success otherwise False</returns>
     static bool re_emboss(const ModelVolume &text, std::shared_ptr<std::atomic<bool>> job_cancel = nullptr);
+
+    // --- Scripting API (SSWCP) ---
+    // The Style list, the style buttons and the font list of the gizmo without its UI. They work
+    // on the gizmo's own StyleManager, so the gizmo shows the result when it opens and stores it
+    // again when it closes. Every check comes first: a refusal (false, reason in err) changes nothing.
+
+    // Read access to the styles (Style list) and the active style.
+    const Emboss::StyleManager &api_style_manager() const { return m_style_manager; }
+    // True when the active style is in the list and differs from it (the "*" in the Style list).
+    bool api_is_style_modified() const;
+    // The names of the Font list: the enumerated system fonts without vertical ('@') and bad fonts.
+    std::vector<std::string> api_face_names();
+    // True when the font of the style can be loaded (like load_style, on a separate StyleManager).
+    static bool api_can_load_style(const Emboss::StyleManager::Style &style);
+    // Make stored style 'index' the active style, like choosing it in the Style list, and store
+    // the active index like closing the gizmo does.
+    bool api_select_style(size_t index);
+    // The Save button: store the changes of the active style. no_op when there are none.
+    bool api_save_style(std::string &err, bool &no_op);
+    // "Save as new style": add the active style (with its changes) to the list as 'name'.
+    bool api_save_style_as(const std::string &name, std::string &err);
+    // "Rename style": rename style 'name' (empty: the active style) and the texts that use it.
+    // Another style than the active one is chosen first, like in the Style list.
+    bool api_rename_style(const std::string &name, const std::string &new_name, std::string &err, std::vector<std::string> &notes);
+    // "Remove style" for style 'name'. For the active style the app's own steps: a neighbouring
+    // style becomes active and styles that cannot be loaded are removed on the way.
+    bool api_delete_style(const std::string &name, std::string &err, std::vector<std::string> &notes);
 
 protected:
     bool on_init() override;

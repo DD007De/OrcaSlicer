@@ -65,6 +65,42 @@ GLGizmoFuzzySkin::GLGizmoFuzzySkin(GLCanvas3D& parent, const std::string& icon_f
 {
 }
 
+bool GLGizmoFuzzySkin::set_tool(const std::string& tool)
+{
+    wchar_t new_tool = 0;
+    if (tool == "circle")
+        new_tool = ImGui::CircleButtonIcon;
+    else if (tool == "sphere")
+        new_tool = ImGui::SphereButtonIcon;
+    else if (tool == "triangle")
+        new_tool = ImGui::TriangleButtonIcon;
+    else if (tool == "fill")
+        new_tool = ImGui::FillButtonIcon;
+    else
+        return false;
+
+    // Same as a click on the tool button: m_cursor_type / m_tool_type are derived from
+    // m_current_tool on the next frame.
+    if (new_tool != m_current_tool) {
+        m_current_tool = new_tool;
+        for (auto& triangle_selector : m_triangle_selectors) {
+            triangle_selector->seed_fill_unselect_all_triangles();
+            triangle_selector->request_update_render_data();
+        }
+    }
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return true;
+}
+
+bool GLGizmoFuzzySkin::set_tool_option(const std::string& key, double value)
+{
+    // Only the options this gizmo's window shows.
+    if (key == "cursor_radius" || key == "smart_fill_angle")
+        return GLGizmoPainterBase::set_tool_option(key, value);
+    return false;
+}
+
 void GLGizmoFuzzySkin::render_painter_gizmo()
 {
     const Selection &selection = m_parent.get_selection();

@@ -81,6 +81,18 @@ public:
 
     const float get_cursor_radius_min() const override { return CursorRadiusMin; }
 
+    // Scripting API (SSWCP): tools circle|sphere|triangle|height_range|fill|gap_fill;
+    // extra options "filament" (filament ID) and "detect_geometry_edge".
+    bool set_tool(const std::string& tool) override;
+    bool set_tool_option(const std::string& key, double value) override;
+
+    // Scripting API (SSWCP): "Remap filaments" with filament IDs (as shown in the gizmo, mixed
+    // filaments included) instead of palette positions. Fills m_extruder_remap and runs the same
+    // remap_filament_assignments() as the "Remap" button, with an "API: " undo snapshot (suppressed
+    // when the caller wraps the call in its own snapshot).
+    enum class RemapResult { NotReady, InvalidFilament, NothingToRemap, Remapped };
+    RemapResult set_remap_by_filament_ids(const std::map<int, int>& filament_map);
+
     // BBS
     bool on_number_key_down(int number);
     bool on_key_down_select_tool_type(int keyCode);
@@ -150,7 +162,8 @@ private:
     void init_extruders_data(const std::vector<ColorRGBA> &extruder_colors);
     
     // Filament remapping methods
-    void remap_filament_assignments();
+    // Returns true if the painting of the object was updated.
+    bool remap_filament_assignments(const std::string& snapshot_name = "Remap filament assignments");
     void render_filament_remap_ui(float window_width, float max_tooltip_width);
 
     // This map holds all translated description texts, so they can be easily referenced during layout calculations

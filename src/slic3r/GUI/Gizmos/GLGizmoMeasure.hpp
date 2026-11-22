@@ -251,6 +251,29 @@ public:
     std::string get_gizmo_leaving_text() const override { return _u8L("Leaving Measure gizmo"); }
     //std::string get_action_snapshot_name() const override { return _u8L("Measure gizmo editing"); }
 
+    // Scripting API (SSWCP): read the measurement of the features the user picked, clear the
+    // picked features, and run the face-face assembly actions with the same preconditions as
+    // the gizmo's own buttons. api_check_assembly_action() returns false with a reason in err
+    // when the action is unknown or not possible for the current selection, and sets no_op
+    // when the action would change nothing (the UI skips those too). api_run_assembly_action()
+    // runs a checked action; the set_* functions take GizmoAction snapshots, so a caller that
+    // wants one named undo step wraps it in Plater::TakeSnapshot.
+    const Measure::MeasurementResult &get_measurement_result() const { return m_measurement_result; }
+    const Measure::AssemblyAction    &get_assembly_action() const { return m_assembly_action; }
+    int  api_selected_feature_count() const;
+    void api_reset_features();
+    bool api_check_assembly_action(const std::string &action, double value, std::string &err, bool &no_op);
+    void api_run_assembly_action(const std::string &action, double value);
+    // "Edit to scale" in the distance label (render_dimensioning) and the Distance X/Y/Z input
+    // fields (show_distance_xyz_ui), with the same conditions under which the app offers and
+    // enables them. Same check/run split as the assembly actions; values in mm (the app's inch
+    // display does not apply). api_scale_to_distance() returns the scale ratio.
+    Vec3d  api_distance_xyz() const;
+    bool   api_check_scale_to_distance(double value_mm, std::string &err, bool &no_op);
+    double api_scale_to_distance(double value_mm);
+    bool   api_check_set_distance(int axis, double value_mm, std::string &err, bool &no_op);
+    void   api_set_distance(int axis, double value_mm);
+
 protected:
     bool on_init() override;
     std::string on_get_name() const override;

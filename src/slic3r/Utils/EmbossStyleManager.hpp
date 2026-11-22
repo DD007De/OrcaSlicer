@@ -79,6 +79,14 @@ public:
     void erase(size_t index);
 
     /// <summary>
+    /// Scripting API (SSWCP): erase() that also keeps the last used index pointing at the same
+    /// style (or a neighbour when that style is removed), so a temporary active style stores
+    /// and restores the right index. Not used by the GUI.
+    /// </summary>
+    /// <param name="index">Index of style to be removed</param>
+    void api_erase(size_t index);
+
+    /// <summary>
     /// Rename actual selected font item
     /// </summary>
     /// <param name="name">New name</param>

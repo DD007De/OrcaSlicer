@@ -336,8 +336,17 @@ bool GLGizmoEmboss::create_volume(ModelVolumeType volume_type, const Vec2d& mous
 // Designed for create volume without information of mouse in scene
 bool GLGizmoEmboss::create_volume(ModelVolumeType volume_type)
 {
+    return create_volume(volume_type, std::string());
+}
+
+// Same as create_volume(volume_type), but with the given text; an empty text keeps the
+// default text (scripting API, SSWCP)
+bool GLGizmoEmboss::create_volume(ModelVolumeType volume_type, const std::string &text)
+{
     if (!init_create(volume_type))
         return false;
+    if (!text.empty())
+        m_text = text;
 
     // NOTE: change style manager - be carefull with order changes
     DataBasePtr base = create_emboss_data_base(m_text, m_style_manager, m_text_lines, m_parent.get_selection(), volume_type, m_job_cancel);
@@ -385,6 +394,233 @@ bool GLGizmoEmboss::re_emboss(const ModelVolume &text_volume, std::shared_ptr<st
 
     RaycastManager raycast_manager; // Nothing is cached now, so It need to create raycasters
     return start_update_volume(std::move(data), text_volume, selection, raycast_manager);
+}
+
+// --- Scripting API (SSWCP) ----------------------------------------------------------------
+// The same StyleManager calls as the style buttons (draw_style_list and the draw_*_button
+// functions), without dialogs: the API call itself is the confirmation.
+
+bool GLGizmoEmboss::api_is_style_modified() const
+{
+    // Like draw_style_list: is_modified = is_stored && is_changed.
+    const StyleManager::Style *stored_style = m_style_manager.get_stored_style();
+    return stored_style != nullptr && !(*stored_style == m_style_manager.get_style());
+}
+
+std::vector<std::string> GLGizmoEmboss::api_face_names()
+{
+    // Like get_installed_face_name: enumerate (or reuse the cached list) without leaving the
+    // combo state "initialized"; an open combo keeps its own state.
+    const bool was_init = m_face_names->is_init;
+    init_face_names(*m_face_names);
+    if (!was_init)
+        m_face_names->is_init = false;
+    std::vector<std::string> names;
+    names.reserve(m_face_names->faces.size());
+    for (const FaceName &face : m_face_names->faces)
+        names.push_back(face.wx_name.utf8_string());
+    return names;
+}
+
+bool GLGizmoEmboss::api_can_load_style(const StyleManager::Style &style)
+{
+    // Same check as re_emboss: a separate StyleManager, so the active style stays as it is.
+    StyleManager style_manager(ImGui::GetIO().Fonts->GetGlyphRangesDefault(), create_default_styles);
+    return style_manager.load_style(style);
+}
+
+bool GLGizmoEmboss::api_select_style(size_t index)
+{
+    if (index >= m_style_manager.get_styles().size())
+        return false;
+    if (!m_style_manager.load_style(index)) {
+        // load_style may fail after it copied the style: back to the previous (loadable) one.
+        m_style_manager.discard_style_changes();
+        return false;
+    }
+    // Like on_set_state when the gizmo closes: store the order and the active index.
+    m_style_manager.store_styles_to_app_config(false);
+    return true;
+}
+
+bool GLGizmoEmboss::api_save_style(std::string &err, bool &no_op)
+{
+    no_op = false;
+    if (!m_style_manager.exist_stored_style()) {
+        err = "the current style '" + m_style_manager.get_style().name + "' is a temporary style (not in the list); use save_as";
+        return false;
+    }
+    if (!api_is_style_modified()) {
+        no_op = true;
+        return true;
+    }
+    // Like draw_style_save_button.
+    m_style_manager.store_styles_to_app_config();
+    return true;
+}
+
+bool GLGizmoEmboss::api_save_style_as(const std::string &name, std::string &err)
+{
+    // The checks of draw_style_save_as_popup and draw_style_add_button.
+    if (name.empty()) {
+        err = "the name of the style must not be empty";
+        return false;
+    }
+    if (!m_style_manager.is_unique_style_name(name)) {
+        err = "a style named '" + name + "' already exists";
+        return false;
+    }
+    if (!m_style_manager.is_active_font()) {
+        err = "the current style has no loaded font";
+        return false;
+    }
+    if (!m_style_manager.exist_stored_style() && m_style_manager.get_style().type != WxFontUtils::get_current_type()) {
+        err = "only a valid font can be added as a style";
+        return false;
+    }
+    m_style_manager.add_style(name);
+    m_style_manager.store_styles_to_app_config();
+    return true;
+}
+
+bool GLGizmoEmboss::api_rename_style(const std::string &name, const std::string &new_name, std::string &err, std::vector<std::string> &notes)
+{
+    const StyleManager::Styles &styles = m_style_manager.get_styles();
+    size_t index = m_style_manager.get_style_index();
+    if (!name.empty()) {
+        index = styles.size();
+        for (size_t i = 0; i < styles.size(); ++i)
+            if (styles[i].name == name) {
+                index = i;
+                break;
+            }
+        if (index == styles.size()) {
+            err = (!m_style_manager.exist_stored_style() && m_style_manager.get_style().name == name) ?
+                      "cannot rename the temporary style '" + name + "'" :
+                      "text style '" + name + "' not found";
+            return false;
+        }
+    } else if (!m_style_manager.exist_stored_style()) {
+        // Like draw_style_rename_button: "Can't rename temporary style."
+        err = "cannot rename the temporary style '" + m_style_manager.get_style().name + "'";
+        return false;
+    }
+    const std::string old_name = styles[index].name; // copy
+    // The checks of draw_style_rename_popup.
+    if (new_name.empty()) {
+        err = "the new name of the style must not be empty";
+        return false;
+    }
+    if (new_name == old_name) {
+        notes.push_back("the style already has this name; nothing changed");
+        return true;
+    }
+    if (!m_style_manager.is_unique_style_name(new_name)) {
+        err = "a style named '" + new_name + "' already exists";
+        return false;
+    }
+    const bool other_style = index != m_style_manager.get_style_index();
+    if (other_style) {
+        // Choosing another style in the Style list discards the changes of the active one
+        // (draw_style_list asks first); the API does not discard silently.
+        if (api_is_style_modified()) {
+            err = "the current style '" + m_style_manager.get_style().name +
+                  "' has unsaved changes and renaming '" + old_name + "' chooses that style first; save the changes first";
+            return false;
+        }
+        if (!api_can_load_style(styles[index])) {
+            err = "text style '" + old_name + "' cannot be used: its font cannot be loaded";
+            return false;
+        }
+        if (!api_select_style(index)) {
+            err = "text style '" + old_name + "' could not be chosen";
+            return false;
+        }
+        notes.push_back("'" + new_name + "' is now the active style (chosen for the rename, like in the app)");
+    } else if (api_is_style_modified()) {
+        notes.push_back("the changes of the style were saved as well (like Rename in the app)");
+    }
+
+    // Like draw_style_rename_popup: rename the style in all objects and volumes.
+    size_t count = 0;
+    for (const ModelObject *mo : wxGetApp().plater()->model().objects)
+        for (ModelVolume *mv : mo->volumes) {
+            if (!mv->text_configuration.has_value() || mv->text_configuration->style.name != old_name)
+                continue;
+            mv->text_configuration->style.name = new_name;
+            ++count;
+        }
+    m_style_manager.rename(new_name);
+    m_style_manager.store_styles_to_app_config();
+    if (count > 0)
+        notes.push_back(std::to_string(count) + " text part(s) with this style now use the new name");
+    return true;
+}
+
+bool GLGizmoEmboss::api_delete_style(const std::string &name, std::string &err, std::vector<std::string> &notes)
+{
+    const StyleManager::Styles &styles = m_style_manager.get_styles();
+    size_t index = styles.size();
+    for (size_t i = 0; i < styles.size(); ++i)
+        if (styles[i].name == name) {
+            index = i;
+            break;
+        }
+    if (index == styles.size()) {
+        err = (!m_style_manager.exist_stored_style() && m_style_manager.get_style().name == name) ?
+                  "cannot delete the temporary style '" + name + "'" :
+                  "text style '" + name + "' not found";
+        return false;
+    }
+    // Like draw_delete_style_button: the last style stays.
+    if (styles.size() == 1) {
+        err = "cannot remove the last existing style";
+        return false;
+    }
+    if (index != m_style_manager.get_style_index()) {
+        // Not the active style: only remove it from the list; the active style stays. api_erase
+        // also shifts the last used index, which a temporary active style stores.
+        m_style_manager.api_erase(index);
+        m_style_manager.store_styles_to_app_config(false);
+        return true;
+    }
+
+    // The active style: the steps of draw_delete_style_button. Its loop ends on a loadable
+    // neighbouring style; make sure one exists before anything changes.
+    bool exist_other = false;
+    for (size_t i = 0; i < styles.size() && !exist_other; ++i)
+        exist_other = i != index && api_can_load_style(styles[i]);
+    if (!exist_other) {
+        err = "cannot remove style '" + name + "': no other style can be loaded";
+        return false;
+    }
+    size_t removed = 0;
+    bool   deleted = false;
+    while (true) {
+        // NOTE: can't use previous loaded activ index -> erase could change index
+        const size_t active_index     = m_style_manager.get_style_index();
+        const size_t next_style_index = (active_index > 0) ? active_index - 1 : active_index + 1;
+        if (next_style_index >= m_style_manager.get_styles().size())
+            break; // not expected: a loadable style exists
+        // clean unactivable styles
+        if (!m_style_manager.load_style(next_style_index)) {
+            m_style_manager.api_erase(next_style_index);
+            ++removed;
+            continue;
+        }
+        m_style_manager.api_erase(active_index);
+        deleted = true;
+        break;
+    }
+    m_style_manager.store_styles_to_app_config();
+    if (removed > 0)
+        notes.push_back(std::to_string(removed) + " style(s) whose font cannot be loaded were removed (like in the app)");
+    if (!deleted) {
+        err = "cannot remove style '" + name + "': no other style can be loaded";
+        return false;
+    }
+    notes.push_back("'" + m_style_manager.get_style().name + "' is now the active style (like in the app)");
+    return true;
 }
 
 namespace{
