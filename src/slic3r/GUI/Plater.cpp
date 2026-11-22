@@ -9051,6 +9051,18 @@ void Sidebar::on_bed_type_change(BedType bed_type)
 {
     // btDefault option is not included in global bed type setting
     int sel_idx = (int)bed_type - 1;
+    // The list of some printers holds fewer bed types: find the entry whose name maps to bed_type.
+    const ConfigOptionDef* def = print_config_def.get("curr_bed_type");
+    if (def != nullptr && def->enum_keys_map != nullptr) {
+        const t_config_enum_values& keys_map = *def->enum_keys_map;
+        for (size_t i = 0; i < m_bed_type_combo_enum_values.size(); ++i) {
+            const auto it = keys_map.find(m_bed_type_combo_enum_values[i]);
+            if (it != keys_map.end() && it->second == (int)bed_type) {
+                sel_idx = (int)i;
+                break;
+            }
+        }
+    }
     if (m_bed_type_list != nullptr)
         m_bed_type_list->SetSelection(sel_idx);
 }
