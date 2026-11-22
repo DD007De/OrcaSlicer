@@ -140,6 +140,9 @@ public:
     wxWebView* get_web_view() const;
     void       set_web_view(wxWebView* view);
 
+    // True for a request that came in through the local slicer API instead of a webview.
+    virtual bool from_slicer_api() const { return false; }
+
 public:
     // Handle timeout event
     virtual void on_timeout();
@@ -502,6 +505,194 @@ private:
     void sw_DeleteRecentFiles();
 
     void sw_SubscribeRecentFiles();
+
+    // sw_Slicer*: live control of the slicer (implemented in SSWCPSlicer.cpp).
+    // Probe and preset config.
+    void sw_SlicerPing();
+    void sw_SlicerGetConfig();
+    void sw_SlicerSetConfig();
+
+    // Slicing, status polling, print time and material usage, notifications after slicing.
+    void sw_SlicerSlice();
+    void sw_SlicerCancelSlice();
+    void sw_SlicerGetStatus();
+    void sw_SlicerGetStats();
+    void sw_SlicerGetLegend();
+    void sw_SlicerGetSliceIssues();
+
+    // View switching and layer navigation in the preview.
+    void sw_SlicerShowView();
+    void sw_SlicerGoToLayer();
+    void sw_SlicerGetLayerCodes();
+    void sw_SlicerAddLayerCode();
+    void sw_SlicerEditLayerCode();
+    void sw_SlicerDeleteLayerCode();
+
+    // Color change from layer N (or height z) via MMU segmentation painting; an alias of
+    // sw_SlicerPaint {type:"color", action:"height_band"}.
+    void sw_SlicerSetColorFromLayer();
+
+    // 3D toolbar: objects, selection, job status, undo/redo, open/close gizmo.
+    void sw_SlicerListObjects();
+    void sw_SlicerSelect();
+    void sw_SlicerGetSelection();
+    void sw_SlicerJobStatus();
+    void sw_SlicerUndo();
+    void sw_SlicerRedo();
+    void sw_SlicerOpenGizmo();
+    void sw_SlicerCloseGizmo();
+
+    // Add model and plate (API mode without dialogs).
+    void sw_SlicerAddModel();
+    void sw_SlicerAddPlate();
+
+    // Orient and arrange (asynchronous through the job worker).
+    void sw_SlicerOrient();
+    void sw_SlicerArrange();
+
+    // Move, rotate, scale.
+    void sw_SlicerMove();
+    void sw_SlicerRotate();
+    void sw_SlicerScale();
+
+    // Split, lay on face, cut (plane + groove).
+    void sw_SlicerSplitObjects();
+    void sw_SlicerSplitParts();
+    void sw_SlicerLayOnFace();
+    void sw_SlicerCut();
+
+    // Variable layer height and brim ears.
+    void sw_SlicerLayerHeight();
+    void sw_SlicerBrimEars();
+
+    // Parametric painting (support / seam / fuzzy skin / color) and "Remap filaments" (color).
+    void sw_SlicerPaint();
+
+    // Text (Emboss), mesh boolean, measure and assemble.
+    void sw_SlicerAddText();
+    void sw_SlicerEditText();
+    void sw_SlicerMeshBoolean();
+    void sw_SlicerGetMeasurement();
+    void sw_SlicerAssemble();
+    void sw_SlicerResetMeasurement();
+
+    // Project lifecycle: state, project info, delete, new/open/save project.
+    void sw_SlicerGetProjectState();
+    void sw_SlicerSetProjectInfo();
+    void sw_SlicerDelete();
+    void sw_SlicerDeletePlate();
+    void sw_SlicerReorder();
+    void sw_SlicerNewProject();
+    void sw_SlicerOpenProject();
+    void sw_SlicerSaveProject();
+    void sw_SlicerQuit();
+
+    // Slice all plates and export.
+    void sw_SlicerSliceAll();
+    void sw_SlicerExportGcode();
+    void sw_SlicerExportSliced();
+
+    // Object settings and filament, presets, filament slots, plate settings.
+    void sw_SlicerGetObjectConfig();
+    void sw_SlicerSetObjectConfig();
+    void sw_SlicerSetFilament();
+    void sw_SlicerListPresets();
+    void sw_SlicerSelectPreset();
+    void sw_SlicerSetFilamentCount();
+    void sw_SlicerSetFilamentColor();
+    void sw_SlicerGetPlateSettings();
+    void sw_SlicerSetPlateSettings();
+    void sw_SlicerSetBedType();
+    void sw_SlicerGetNozzleSetup();
+    void sw_SlicerSetNozzleDiameter();
+    void sw_SlicerSetFilamentsVisible();
+    void sw_SlicerSetNozzleFlow();
+    void sw_SlicerGetFilamentGrouping();
+    void sw_SlicerSetFilamentGrouping();
+    void sw_SlicerGetFlushVolumes();
+    void sw_SlicerSetFlushVolumes();
+    void sw_SlicerGetWipeTower();
+    void sw_SlicerSetWipeTower();
+    void sw_SlicerListColorMixes();
+    void sw_SlicerSuggestColorMix();
+    void sw_SlicerAddColorMix();
+    void sw_SlicerEditColorMix();
+    void sw_SlicerDeleteColorMix();
+
+    // Parts, object actions and plates.
+    void sw_SlicerAddVolume();
+    void sw_SlicerChangeVolumeType();
+    void sw_SlicerRename();
+    void sw_SlicerClone();
+    void sw_SlicerMirror();
+    void sw_SlicerReloadFromDisk();
+    void sw_SlicerReplaceWithStl();
+    void sw_SlicerSubdivisionMesh();
+    void sw_SlicerConvertUnits();
+    void sw_SlicerDrop();
+    void sw_SlicerCenter();
+    void sw_SlicerSetPrintable();
+    void sw_SlicerScaleToFit();
+    void sw_SlicerListPlates();
+    void sw_SlicerSelectPlate();
+    void sw_SlicerDuplicatePlate();
+    void sw_SlicerSetPlate();
+
+    // Preview controls and canvas screenshot.
+    void sw_SlicerGetPreviewState();
+    void sw_SlicerSetPreview();
+    void sw_SlicerSetLayerRange();
+    void sw_SlicerSetMove();
+    void sw_SlicerGetToolState();
+    void sw_SlicerGetGcodeLines();
+    void sw_SlicerSetCamera();
+    void sw_SlicerScreenshot();
+
+    // Object clipboard, visibility, instances, plates and model export.
+    void sw_SlicerCopy();
+    void sw_SlicerPaste();
+    void sw_SlicerSetVisible();
+    void sw_SlicerSetInstanceCount();
+    void sw_SlicerInstanceToObject();
+    void sw_SlicerMoveToPlate();
+    void sw_SlicerExportStl();
+    void sw_SlicerExport3mf();
+
+    // Preset management: changes, compare, save, delete, discard, Import Configs, Export Preset Bundle.
+    void sw_SlicerGetPresetChanges();
+    void sw_SlicerComparePresets();
+    void sw_SlicerSavePreset();
+    void sw_SlicerDeletePreset();
+    void sw_SlicerDiscardPresetChanges();
+    void sw_SlicerImportConfigs();
+    void sw_SlicerExportPresets();
+
+    // Calibration: list tests, create a test project, read the value mapping, apply a result.
+    void sw_SlicerListCalibrations();
+    void sw_SlicerCalibrate();
+    void sw_SlicerGetCalibration();
+    void sw_SlicerApplyCalibration();
+
+    // Toolbar extras: text info, cut section, merge, simplify, layer ranges, SVG, repair.
+    void sw_SlicerGetText();
+    // Text styles (Style list of the text tool): list, save, save_as, rename, delete.
+    void sw_SlicerTextStyle();
+    void sw_SlicerCutSection();
+    void sw_SlicerMergeObjects();
+    void sw_SlicerSimplify();
+    void sw_SlicerGetLayerRanges();
+    void sw_SlicerAddLayerRange();
+    void sw_SlicerEditLayerRange();
+    void sw_SlicerDeleteLayerRange();
+    void sw_SlicerAddSvg();
+    // Edit an SVG part afterwards with the fields of the SVG tool.
+    void sw_SlicerEditSvg();
+    void sw_SlicerRepair();
+    // Context: preferences, view preferences and view options.
+    void sw_SlicerGetPreferences();
+    void sw_SlicerSetViewPreferences();
+    void sw_SlicerSetPreferences();
+    void sw_SlicerSetViewOptions();
 };
 
 // Main SSWCP class for managing communication instances
@@ -549,6 +740,9 @@ public:
 
 
     static std::unordered_map<std::string, int> m_tab_map; // for switching tab
+
+    // Sorted list of all registered sw_Slicer* commands (reported by sw_SlicerPing).
+    static std::vector<std::string> slicer_commands();
 
 private:
     static std::unordered_set<std::string> m_machine_find_cmd_list;     // Machine find commands

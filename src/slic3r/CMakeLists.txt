@@ -571,6 +571,7 @@ set(SLIC3R_GUI_SOURCES
     GUI/SSWCP.cpp
     GUI/SSWCP.hpp
     GUI/SSWCPApiMode.hpp
+    GUI/SSWCPSlicer.cpp
     GUI/DownloadManager.cpp
     GUI/DownloadManager.hpp
     GUI/GenericDownloadDialog.cpp

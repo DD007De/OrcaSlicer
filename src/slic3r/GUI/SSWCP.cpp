@@ -22,6 +22,7 @@
 #include <thread>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/format.hpp>
@@ -3926,6 +3927,158 @@ void SSWCP_SliceProject_Instance::process()
         m_header["event_id"] = m_event_id;
     }
 
+    // A table instead of an else-if chain: MSVC limits the nesting depth (C1061).
+    using SliceHandler = void (SSWCP_SliceProject_Instance::*)();
+    static const std::unordered_map<std::string, SliceHandler> slicer_handlers = {
+        {"sw_SlicerPing", &SSWCP_SliceProject_Instance::sw_SlicerPing},
+        {"sw_SlicerGetConfig", &SSWCP_SliceProject_Instance::sw_SlicerGetConfig},
+        {"sw_SlicerSetConfig", &SSWCP_SliceProject_Instance::sw_SlicerSetConfig},
+        {"sw_SlicerSlice", &SSWCP_SliceProject_Instance::sw_SlicerSlice},
+        {"sw_SlicerCancelSlice", &SSWCP_SliceProject_Instance::sw_SlicerCancelSlice},
+        {"sw_SlicerGetStatus", &SSWCP_SliceProject_Instance::sw_SlicerGetStatus},
+        {"sw_SlicerGetSliceIssues", &SSWCP_SliceProject_Instance::sw_SlicerGetSliceIssues},
+        {"sw_SlicerGetStats", &SSWCP_SliceProject_Instance::sw_SlicerGetStats},
+        {"sw_SlicerGetLegend", &SSWCP_SliceProject_Instance::sw_SlicerGetLegend},
+        {"sw_SlicerShowView", &SSWCP_SliceProject_Instance::sw_SlicerShowView},
+        {"sw_SlicerGoToLayer", &SSWCP_SliceProject_Instance::sw_SlicerGoToLayer},
+        {"sw_SlicerGetLayerCodes", &SSWCP_SliceProject_Instance::sw_SlicerGetLayerCodes},
+        {"sw_SlicerAddLayerCode", &SSWCP_SliceProject_Instance::sw_SlicerAddLayerCode},
+        {"sw_SlicerEditLayerCode", &SSWCP_SliceProject_Instance::sw_SlicerEditLayerCode},
+        {"sw_SlicerDeleteLayerCode", &SSWCP_SliceProject_Instance::sw_SlicerDeleteLayerCode},
+        {"sw_SlicerSetColorFromLayer", &SSWCP_SliceProject_Instance::sw_SlicerSetColorFromLayer},
+        {"sw_SlicerListObjects", &SSWCP_SliceProject_Instance::sw_SlicerListObjects},
+        {"sw_SlicerSelect", &SSWCP_SliceProject_Instance::sw_SlicerSelect},
+        {"sw_SlicerGetSelection", &SSWCP_SliceProject_Instance::sw_SlicerGetSelection},
+        {"sw_SlicerJobStatus", &SSWCP_SliceProject_Instance::sw_SlicerJobStatus},
+        {"sw_SlicerUndo", &SSWCP_SliceProject_Instance::sw_SlicerUndo},
+        {"sw_SlicerRedo", &SSWCP_SliceProject_Instance::sw_SlicerRedo},
+        {"sw_SlicerOpenGizmo", &SSWCP_SliceProject_Instance::sw_SlicerOpenGizmo},
+        {"sw_SlicerCloseGizmo", &SSWCP_SliceProject_Instance::sw_SlicerCloseGizmo},
+        {"sw_SlicerAddModel", &SSWCP_SliceProject_Instance::sw_SlicerAddModel},
+        {"sw_SlicerAddPlate", &SSWCP_SliceProject_Instance::sw_SlicerAddPlate},
+        {"sw_SlicerOrient", &SSWCP_SliceProject_Instance::sw_SlicerOrient},
+        {"sw_SlicerArrange", &SSWCP_SliceProject_Instance::sw_SlicerArrange},
+        {"sw_SlicerMove", &SSWCP_SliceProject_Instance::sw_SlicerMove},
+        {"sw_SlicerRotate", &SSWCP_SliceProject_Instance::sw_SlicerRotate},
+        {"sw_SlicerScale", &SSWCP_SliceProject_Instance::sw_SlicerScale},
+        {"sw_SlicerSplitObjects", &SSWCP_SliceProject_Instance::sw_SlicerSplitObjects},
+        {"sw_SlicerSplitParts", &SSWCP_SliceProject_Instance::sw_SlicerSplitParts},
+        {"sw_SlicerLayOnFace", &SSWCP_SliceProject_Instance::sw_SlicerLayOnFace},
+        {"sw_SlicerCut", &SSWCP_SliceProject_Instance::sw_SlicerCut},
+        {"sw_SlicerLayerHeight", &SSWCP_SliceProject_Instance::sw_SlicerLayerHeight},
+        {"sw_SlicerBrimEars", &SSWCP_SliceProject_Instance::sw_SlicerBrimEars},
+        {"sw_SlicerPaint", &SSWCP_SliceProject_Instance::sw_SlicerPaint},
+        {"sw_SlicerAddText", &SSWCP_SliceProject_Instance::sw_SlicerAddText},
+        {"sw_SlicerEditText", &SSWCP_SliceProject_Instance::sw_SlicerEditText},
+        {"sw_SlicerMeshBoolean", &SSWCP_SliceProject_Instance::sw_SlicerMeshBoolean},
+        {"sw_SlicerGetMeasurement", &SSWCP_SliceProject_Instance::sw_SlicerGetMeasurement},
+        {"sw_SlicerAssemble", &SSWCP_SliceProject_Instance::sw_SlicerAssemble},
+        {"sw_SlicerResetMeasurement", &SSWCP_SliceProject_Instance::sw_SlicerResetMeasurement},
+        {"sw_SlicerGetProjectState", &SSWCP_SliceProject_Instance::sw_SlicerGetProjectState},
+        {"sw_SlicerSetProjectInfo", &SSWCP_SliceProject_Instance::sw_SlicerSetProjectInfo},
+        {"sw_SlicerDelete", &SSWCP_SliceProject_Instance::sw_SlicerDelete},
+        {"sw_SlicerDeletePlate", &SSWCP_SliceProject_Instance::sw_SlicerDeletePlate},
+        {"sw_SlicerReorder", &SSWCP_SliceProject_Instance::sw_SlicerReorder},
+        {"sw_SlicerNewProject", &SSWCP_SliceProject_Instance::sw_SlicerNewProject},
+        {"sw_SlicerOpenProject", &SSWCP_SliceProject_Instance::sw_SlicerOpenProject},
+        {"sw_SlicerSaveProject", &SSWCP_SliceProject_Instance::sw_SlicerSaveProject},
+        {"sw_SlicerQuit", &SSWCP_SliceProject_Instance::sw_SlicerQuit},
+        {"sw_SlicerSliceAll", &SSWCP_SliceProject_Instance::sw_SlicerSliceAll},
+        {"sw_SlicerExportGcode", &SSWCP_SliceProject_Instance::sw_SlicerExportGcode},
+        {"sw_SlicerExportSliced", &SSWCP_SliceProject_Instance::sw_SlicerExportSliced},
+        {"sw_SlicerGetObjectConfig", &SSWCP_SliceProject_Instance::sw_SlicerGetObjectConfig},
+        {"sw_SlicerSetObjectConfig", &SSWCP_SliceProject_Instance::sw_SlicerSetObjectConfig},
+        {"sw_SlicerSetFilament", &SSWCP_SliceProject_Instance::sw_SlicerSetFilament},
+        {"sw_SlicerListPresets", &SSWCP_SliceProject_Instance::sw_SlicerListPresets},
+        {"sw_SlicerSelectPreset", &SSWCP_SliceProject_Instance::sw_SlicerSelectPreset},
+        {"sw_SlicerSetFilamentCount", &SSWCP_SliceProject_Instance::sw_SlicerSetFilamentCount},
+        {"sw_SlicerSetFilamentColor", &SSWCP_SliceProject_Instance::sw_SlicerSetFilamentColor},
+        {"sw_SlicerGetPlateSettings", &SSWCP_SliceProject_Instance::sw_SlicerGetPlateSettings},
+        {"sw_SlicerSetPlateSettings", &SSWCP_SliceProject_Instance::sw_SlicerSetPlateSettings},
+        {"sw_SlicerSetBedType", &SSWCP_SliceProject_Instance::sw_SlicerSetBedType},
+        {"sw_SlicerGetNozzleSetup", &SSWCP_SliceProject_Instance::sw_SlicerGetNozzleSetup},
+        {"sw_SlicerSetNozzleDiameter", &SSWCP_SliceProject_Instance::sw_SlicerSetNozzleDiameter},
+        {"sw_SlicerSetFilamentsVisible", &SSWCP_SliceProject_Instance::sw_SlicerSetFilamentsVisible},
+        {"sw_SlicerSetNozzleFlow", &SSWCP_SliceProject_Instance::sw_SlicerSetNozzleFlow},
+        {"sw_SlicerGetFilamentGrouping", &SSWCP_SliceProject_Instance::sw_SlicerGetFilamentGrouping},
+        {"sw_SlicerSetFilamentGrouping", &SSWCP_SliceProject_Instance::sw_SlicerSetFilamentGrouping},
+        {"sw_SlicerGetFlushVolumes", &SSWCP_SliceProject_Instance::sw_SlicerGetFlushVolumes},
+        {"sw_SlicerSetFlushVolumes", &SSWCP_SliceProject_Instance::sw_SlicerSetFlushVolumes},
+        {"sw_SlicerGetWipeTower", &SSWCP_SliceProject_Instance::sw_SlicerGetWipeTower},
+        {"sw_SlicerSetWipeTower", &SSWCP_SliceProject_Instance::sw_SlicerSetWipeTower},
+        {"sw_SlicerListColorMixes", &SSWCP_SliceProject_Instance::sw_SlicerListColorMixes},
+        {"sw_SlicerSuggestColorMix", &SSWCP_SliceProject_Instance::sw_SlicerSuggestColorMix},
+        {"sw_SlicerAddColorMix", &SSWCP_SliceProject_Instance::sw_SlicerAddColorMix},
+        {"sw_SlicerEditColorMix", &SSWCP_SliceProject_Instance::sw_SlicerEditColorMix},
+        {"sw_SlicerDeleteColorMix", &SSWCP_SliceProject_Instance::sw_SlicerDeleteColorMix},
+        {"sw_SlicerAddVolume", &SSWCP_SliceProject_Instance::sw_SlicerAddVolume},
+        {"sw_SlicerChangeVolumeType", &SSWCP_SliceProject_Instance::sw_SlicerChangeVolumeType},
+        {"sw_SlicerRename", &SSWCP_SliceProject_Instance::sw_SlicerRename},
+        {"sw_SlicerClone", &SSWCP_SliceProject_Instance::sw_SlicerClone},
+        {"sw_SlicerMirror", &SSWCP_SliceProject_Instance::sw_SlicerMirror},
+        {"sw_SlicerReloadFromDisk", &SSWCP_SliceProject_Instance::sw_SlicerReloadFromDisk},
+        {"sw_SlicerReplaceWithStl", &SSWCP_SliceProject_Instance::sw_SlicerReplaceWithStl},
+        {"sw_SlicerSubdivisionMesh", &SSWCP_SliceProject_Instance::sw_SlicerSubdivisionMesh},
+        {"sw_SlicerConvertUnits", &SSWCP_SliceProject_Instance::sw_SlicerConvertUnits},
+        {"sw_SlicerDrop", &SSWCP_SliceProject_Instance::sw_SlicerDrop},
+        {"sw_SlicerCenter", &SSWCP_SliceProject_Instance::sw_SlicerCenter},
+        {"sw_SlicerSetPrintable", &SSWCP_SliceProject_Instance::sw_SlicerSetPrintable},
+        {"sw_SlicerScaleToFit", &SSWCP_SliceProject_Instance::sw_SlicerScaleToFit},
+        {"sw_SlicerListPlates", &SSWCP_SliceProject_Instance::sw_SlicerListPlates},
+        {"sw_SlicerSelectPlate", &SSWCP_SliceProject_Instance::sw_SlicerSelectPlate},
+        {"sw_SlicerDuplicatePlate", &SSWCP_SliceProject_Instance::sw_SlicerDuplicatePlate},
+        {"sw_SlicerSetPlate", &SSWCP_SliceProject_Instance::sw_SlicerSetPlate},
+        {"sw_SlicerGetPreviewState", &SSWCP_SliceProject_Instance::sw_SlicerGetPreviewState},
+        {"sw_SlicerSetPreview", &SSWCP_SliceProject_Instance::sw_SlicerSetPreview},
+        {"sw_SlicerSetLayerRange", &SSWCP_SliceProject_Instance::sw_SlicerSetLayerRange},
+        {"sw_SlicerSetMove", &SSWCP_SliceProject_Instance::sw_SlicerSetMove},
+        {"sw_SlicerGetToolState", &SSWCP_SliceProject_Instance::sw_SlicerGetToolState},
+        {"sw_SlicerGetGcodeLines", &SSWCP_SliceProject_Instance::sw_SlicerGetGcodeLines},
+        {"sw_SlicerSetCamera", &SSWCP_SliceProject_Instance::sw_SlicerSetCamera},
+        {"sw_SlicerScreenshot", &SSWCP_SliceProject_Instance::sw_SlicerScreenshot},
+        {"sw_SlicerCopy", &SSWCP_SliceProject_Instance::sw_SlicerCopy},
+        {"sw_SlicerPaste", &SSWCP_SliceProject_Instance::sw_SlicerPaste},
+        {"sw_SlicerSetVisible", &SSWCP_SliceProject_Instance::sw_SlicerSetVisible},
+        {"sw_SlicerSetInstanceCount", &SSWCP_SliceProject_Instance::sw_SlicerSetInstanceCount},
+        {"sw_SlicerInstanceToObject", &SSWCP_SliceProject_Instance::sw_SlicerInstanceToObject},
+        {"sw_SlicerMoveToPlate", &SSWCP_SliceProject_Instance::sw_SlicerMoveToPlate},
+        {"sw_SlicerExportStl", &SSWCP_SliceProject_Instance::sw_SlicerExportStl},
+        {"sw_SlicerExport3mf", &SSWCP_SliceProject_Instance::sw_SlicerExport3mf},
+        {"sw_SlicerGetPresetChanges", &SSWCP_SliceProject_Instance::sw_SlicerGetPresetChanges},
+        {"sw_SlicerComparePresets", &SSWCP_SliceProject_Instance::sw_SlicerComparePresets},
+        {"sw_SlicerSavePreset", &SSWCP_SliceProject_Instance::sw_SlicerSavePreset},
+        {"sw_SlicerDeletePreset", &SSWCP_SliceProject_Instance::sw_SlicerDeletePreset},
+        {"sw_SlicerDiscardPresetChanges", &SSWCP_SliceProject_Instance::sw_SlicerDiscardPresetChanges},
+        {"sw_SlicerImportConfigs", &SSWCP_SliceProject_Instance::sw_SlicerImportConfigs},
+        {"sw_SlicerExportPresets", &SSWCP_SliceProject_Instance::sw_SlicerExportPresets},
+        {"sw_SlicerListCalibrations", &SSWCP_SliceProject_Instance::sw_SlicerListCalibrations},
+        {"sw_SlicerCalibrate", &SSWCP_SliceProject_Instance::sw_SlicerCalibrate},
+        {"sw_SlicerGetCalibration", &SSWCP_SliceProject_Instance::sw_SlicerGetCalibration},
+        {"sw_SlicerApplyCalibration", &SSWCP_SliceProject_Instance::sw_SlicerApplyCalibration},
+        {"sw_SlicerGetText", &SSWCP_SliceProject_Instance::sw_SlicerGetText},
+        {"sw_SlicerTextStyle", &SSWCP_SliceProject_Instance::sw_SlicerTextStyle},
+        {"sw_SlicerCutSection", &SSWCP_SliceProject_Instance::sw_SlicerCutSection},
+        {"sw_SlicerMergeObjects", &SSWCP_SliceProject_Instance::sw_SlicerMergeObjects},
+        {"sw_SlicerSimplify", &SSWCP_SliceProject_Instance::sw_SlicerSimplify},
+        {"sw_SlicerGetLayerRanges", &SSWCP_SliceProject_Instance::sw_SlicerGetLayerRanges},
+        {"sw_SlicerAddLayerRange", &SSWCP_SliceProject_Instance::sw_SlicerAddLayerRange},
+        {"sw_SlicerEditLayerRange", &SSWCP_SliceProject_Instance::sw_SlicerEditLayerRange},
+        {"sw_SlicerDeleteLayerRange", &SSWCP_SliceProject_Instance::sw_SlicerDeleteLayerRange},
+        {"sw_SlicerAddSvg", &SSWCP_SliceProject_Instance::sw_SlicerAddSvg},
+        {"sw_SlicerEditSvg", &SSWCP_SliceProject_Instance::sw_SlicerEditSvg},
+        {"sw_SlicerRepair", &SSWCP_SliceProject_Instance::sw_SlicerRepair},
+        {"sw_SlicerGetPreferences", &SSWCP_SliceProject_Instance::sw_SlicerGetPreferences},
+        {"sw_SlicerSetViewPreferences", &SSWCP_SliceProject_Instance::sw_SlicerSetViewPreferences},
+        {"sw_SlicerSetPreferences", &SSWCP_SliceProject_Instance::sw_SlicerSetPreferences},
+        {"sw_SlicerSetViewOptions", &SSWCP_SliceProject_Instance::sw_SlicerSetViewOptions},
+    };
+
+    auto slicer_it = slicer_handlers.find(m_cmd);
+    if (slicer_it != slicer_handlers.end()) {
+        (this->*(slicer_it->second))();
+        return;
+    }
+
     if (m_cmd == "sw_NewProject") {
         sw_NewProject();
     } else if (m_cmd == "sw_OpenProject") {
@@ -5621,7 +5774,70 @@ std::unordered_set<std::string> SSWCP::m_machine_connect_cmd_list = {
 
 std::unordered_set<std::string> SSWCP::m_project_cmd_list = {
     "sw_NewProject", "sw_OpenProject", "sw_GetRecentProjects", "sw_OpenRecentFile", "sw_DeleteRecentFiles", "sw_SubscribeRecentFiles",
+    "sw_SlicerPing", "sw_SlicerGetConfig", "sw_SlicerSetConfig",
+    "sw_SlicerSlice", "sw_SlicerCancelSlice", "sw_SlicerGetStatus", "sw_SlicerGetStats", "sw_SlicerGetLegend", "sw_SlicerGetSliceIssues",
+    "sw_SlicerShowView", "sw_SlicerGoToLayer", "sw_SlicerSetColorFromLayer",
+    "sw_SlicerGetLayerCodes", "sw_SlicerAddLayerCode", "sw_SlicerEditLayerCode", "sw_SlicerDeleteLayerCode",
+    // 3D toolbar
+    "sw_SlicerListObjects", "sw_SlicerSelect", "sw_SlicerGetSelection",
+    "sw_SlicerJobStatus", "sw_SlicerUndo", "sw_SlicerRedo",
+    "sw_SlicerOpenGizmo", "sw_SlicerCloseGizmo",
+    "sw_SlicerAddModel", "sw_SlicerAddPlate",
+    "sw_SlicerOrient", "sw_SlicerArrange",
+    "sw_SlicerMove", "sw_SlicerRotate", "sw_SlicerScale",
+    "sw_SlicerSplitObjects", "sw_SlicerSplitParts",
+    "sw_SlicerLayOnFace", "sw_SlicerCut",
+    "sw_SlicerLayerHeight", "sw_SlicerBrimEars",
+    "sw_SlicerPaint",
+    "sw_SlicerAddText", "sw_SlicerEditText", "sw_SlicerMeshBoolean",
+    "sw_SlicerGetMeasurement", "sw_SlicerAssemble", "sw_SlicerResetMeasurement",
+    // Project lifecycle
+    "sw_SlicerGetProjectState", "sw_SlicerSetProjectInfo", "sw_SlicerDelete", "sw_SlicerDeletePlate", "sw_SlicerReorder",
+    "sw_SlicerNewProject", "sw_SlicerOpenProject", "sw_SlicerSaveProject", "sw_SlicerQuit",
+    // Slice all, export
+    "sw_SlicerSliceAll", "sw_SlicerExportGcode", "sw_SlicerExportSliced",
+    // Object settings, filament, presets, plate settings
+    "sw_SlicerGetObjectConfig", "sw_SlicerSetObjectConfig", "sw_SlicerSetFilament",
+    "sw_SlicerListPresets", "sw_SlicerSelectPreset", "sw_SlicerSetFilamentCount", "sw_SlicerSetFilamentColor",
+    "sw_SlicerGetPlateSettings", "sw_SlicerSetPlateSettings", "sw_SlicerSetBedType", "sw_SlicerGetNozzleSetup", "sw_SlicerSetNozzleDiameter", "sw_SlicerSetFilamentsVisible", "sw_SlicerSetNozzleFlow", "sw_SlicerGetFilamentGrouping", "sw_SlicerSetFilamentGrouping", "sw_SlicerGetFlushVolumes", "sw_SlicerSetFlushVolumes", "sw_SlicerGetWipeTower", "sw_SlicerSetWipeTower",
+    // Parts, object actions and plates
+    "sw_SlicerAddVolume", "sw_SlicerChangeVolumeType", "sw_SlicerRename",
+    "sw_SlicerClone", "sw_SlicerMirror", "sw_SlicerDrop", "sw_SlicerCenter",
+    "sw_SlicerSetPrintable", "sw_SlicerScaleToFit",
+    "sw_SlicerReloadFromDisk", "sw_SlicerReplaceWithStl", "sw_SlicerSubdivisionMesh", "sw_SlicerConvertUnits",
+    "sw_SlicerListPlates", "sw_SlicerSelectPlate", "sw_SlicerDuplicatePlate", "sw_SlicerSetPlate",
+    // Preview controls and screenshot
+    "sw_SlicerGetPreviewState", "sw_SlicerSetPreview", "sw_SlicerSetLayerRange", "sw_SlicerSetMove",
+    "sw_SlicerGetToolState", "sw_SlicerGetGcodeLines",
+    "sw_SlicerSetCamera", "sw_SlicerScreenshot",
+    // Object management and model export
+    "sw_SlicerCopy", "sw_SlicerPaste", "sw_SlicerSetVisible", "sw_SlicerSetInstanceCount",
+    "sw_SlicerInstanceToObject", "sw_SlicerMoveToPlate", "sw_SlicerExportStl", "sw_SlicerExport3mf",
+    // Preset management
+    "sw_SlicerGetPresetChanges", "sw_SlicerComparePresets", "sw_SlicerSavePreset", "sw_SlicerDeletePreset",
+    "sw_SlicerDiscardPresetChanges", "sw_SlicerImportConfigs", "sw_SlicerExportPresets",
+    // Calibration
+    "sw_SlicerListCalibrations", "sw_SlicerCalibrate", "sw_SlicerGetCalibration", "sw_SlicerApplyCalibration",
+    // Toolbar extras
+    "sw_SlicerGetText", "sw_SlicerCutSection", "sw_SlicerMergeObjects", "sw_SlicerSimplify",
+    "sw_SlicerGetLayerRanges", "sw_SlicerAddLayerRange", "sw_SlicerEditLayerRange", "sw_SlicerDeleteLayerRange",
+    "sw_SlicerAddSvg", "sw_SlicerRepair", "sw_SlicerTextStyle", "sw_SlicerEditSvg",
+    // Context
+    "sw_SlicerGetPreferences", "sw_SlicerSetViewPreferences", "sw_SlicerSetPreferences", "sw_SlicerSetViewOptions",
+    // Color mixing
+    "sw_SlicerListColorMixes", "sw_SlicerSuggestColorMix", "sw_SlicerAddColorMix", "sw_SlicerEditColorMix", "sw_SlicerDeleteColorMix",
 };
+
+// All sw_Slicer* commands (sorted), reported by sw_SlicerPing.
+std::vector<std::string> SSWCP::slicer_commands()
+{
+    std::vector<std::string> out;
+    for (const std::string& cmd : m_project_cmd_list)
+        if (cmd.rfind("sw_Slicer", 0) == 0)
+            out.push_back(cmd);
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 std::unordered_set<std::string> SSWCP::m_login_cmd_list = {UPDATE_PRIVACY_STATUS,  GET_PRIVACY_STATUS,
                                                            FILE_VIEW, OPEN_TIMELAPSE_FOLDER, CANCEL_DOWNLOAD, DOWNLOAD_FILE_AND_OPEN, DOWN_LOAD_FILE, SUBSCRIBE_DOWNLOAD_STATE, UNSUBSCRIBE_DOWNLOAD_STATE, NOTIFY_UPLOAD_TIMELASPE, GET_FILES_FROM_DIR};
@@ -5634,13 +5850,18 @@ std::shared_ptr<SSWCP_Instance> SSWCP::create_sswcp_instance(std::string cmd, co
 {
     std::shared_ptr<SSWCP_Instance> instance;
 
+    // The sw_Slicer* commands are meant for a local client and are not served to web pages: a webview
+    // can show remote content (printer pages, links). They fall through to the generic instance below,
+    // which answers like for any unknown command.
+    const bool slicer_cmd = cmd.rfind("sw_Slicer", 0) == 0;
+
     if (m_machine_find_cmd_list.find(cmd) != m_machine_find_cmd_list.end()) {
         instance = std::make_shared<SSWCP_MachineFind_Instance>(cmd, header, data, event_id, webview);
     } else if (m_machine_connect_cmd_list.find(cmd) != m_machine_connect_cmd_list.end()) {
         instance = std::make_shared<SSWCP_MachineConnect_Instance>(cmd, header, data, event_id, webview);
     } else if (m_machine_option_cmd_list.find(cmd) != m_machine_option_cmd_list.end()) {
         instance = std::make_shared<SSWCP_MachineOption_Instance>(cmd, header, data, event_id, webview);
-    } else if (m_project_cmd_list.find(cmd) != m_project_cmd_list.end()) {
+    } else if (!slicer_cmd && m_project_cmd_list.find(cmd) != m_project_cmd_list.end()) {
         instance = std::make_shared<SSWCP_SliceProject_Instance>(cmd, header, data, event_id, webview);
     } else if (m_login_cmd_list.find(cmd) != m_login_cmd_list.end()) {
         instance = std::make_shared<SSWCP_UserLogin_Instance>(cmd, header, data, event_id, webview);
