@@ -2291,8 +2291,6 @@ void MixedFilamentDialog::set_error(const wxString& msg)
 
 wxString MixedFilamentDialog::get_ratio_warning_msg()
 {
-    static constexpr double HIGH_RATIO_THRESHOLD = 0.667;
-
     if (m_filament_rows.empty() || m_filament_colours.empty())
         return wxEmptyString;
 
@@ -2360,22 +2358,8 @@ wxString MixedFilamentDialog::get_ratio_warning_msg()
         return wxEmptyString;
     }
 
-    if (total <= 0.0)
-        return wxEmptyString;
-
-    double max_ratio = 0.0;
-    int    max_idx   = -1;
-    for (int i = 0; i < num_physical; ++i) {
-        double ratio = ratios[i] / total;
-        if (ratio > max_ratio) {
-            max_ratio = ratio;
-            max_idx   = i;
-        }
-    }
-    if (max_idx >= 0 && max_ratio > HIGH_RATIO_THRESHOLD) {
-        return wxString::Format(_L("Filament %d ratio is too high. Mix may be affected."), max_idx + 1);
-
-    }
+    if (auto filament = mixed_filament_ratio_warning_filament(ratios, total))
+        return wxString::Format(_L("Filament %d ratio is too high. Mix may be affected."), (int)*filament);
 
     return wxEmptyString;
 }
@@ -3188,53 +3172,25 @@ void MixedFilamentDialog::validate_cycle_pattern()
 
     const std::string raw = into_u8(m_pattern_ctrl->GetValue());
 
-    bool has_invalid_chars = false;
+    int invalid_id = 0;
+    const std::string error_msgid =
+        mixed_filament_cycle_pattern_error(raw, (int)m_filament_colours.size(), &invalid_id);
+    if (!error_msgid.empty()) {
+        if (invalid_id != 0)
+            set_error(wxString::Format(_L(error_msgid), invalid_id));
+        else
+            set_error(_L(error_msgid));
+        return;
+    }
+
     std::string filtered;
     filtered.reserve(raw.size());
     for (char c : raw) {
         if (c == ',' || c == '[' || c == ']' ||
-            (c >= '0' && c <= '9')) {
+            (c >= '0' && c <= '9'))
             filtered.push_back(c);
-        } else {
-            has_invalid_chars = true;
-        }
     }
-
-    const bool has_leading_trailing_comma = !raw.empty() && (raw.front() == ',' || raw.back() == ',');
-
     const std::string normalized = MixedFilamentManager::normalize_manual_pattern(filtered);
-    const bool is_malformed = !filtered.empty() && normalized.empty();
-
-    if (has_leading_trailing_comma) {
-        set_error(_L("Leading or trailing commas are not allowed."));
-        return;
-    }
-
-    if (has_invalid_chars) {
-        set_error(_L("Invalid characters found. Only digits, square brackets ([ and ]), and commas (,) are allowed."));
-        return;
-    }
-
-    if (is_malformed) {
-        set_error(_L("Unrecognized pattern format. Please check the pattern syntax."));
-        return;
-    }
-
-    // Validate that all directly-referenced physical filament IDs exist.
-    // H4: only validate when there are at least 2 physical filaments and a non-empty pattern.
-    const int num_physical = (int)m_filament_colours.size();
-    if (num_physical >= 2 && !normalized.empty()) {
-        auto parsed = parse_cycle_pattern(normalized, num_physical);
-        if (parsed.invalid_id != 0) {
-            set_error(
-                wxString::Format(_L("Filament %d not recognized. Please re-enter."), (int)parsed.invalid_id));
-            return;
-        }
-        if (!parsed.invalid_token.empty()) {
-            set_error(_L("Unrecognized pattern format. Please check the pattern syntax."));
-            return;
-        }
-    }
 
     update_compatibility_warning();
 
@@ -3275,172 +3231,59 @@ void MixedFilamentDialog::update_preview()
 
 void MixedFilamentDialog::collect_result()
 {
-    sync_rows_to_result();
-    m_result.ui_mode = m_current_mode;
-    int val = m_gradient_selector ? m_gradient_selector->value() : 50;
-    m_result.mix_b_percent = val;
-    // Default: drop Z-gradient state. Only MODE_GRADIENT re-enables it below.
-    m_result.gradient_enabled = false;
+    MixedFilamentUiInput in;
+    in.mode                 = m_current_mode;
+    in.ratio_selector_value = m_gradient_selector ? m_gradient_selector->value() : 50;
+    in.gradient_direction   = m_gradient_direction;
     switch (m_current_mode) {
     case MODE_RATIO:
-        m_result.gradient_component_weights.clear();
-        if ((int)m_filament_rows.size() == 3) {
-            m_result.distribution_mode = int(MixedFilament::LayerCycle);
-            m_result.manual_pattern.clear();
-            // Store all 3 filament ids (1-based) so gradient_component_ids has 3 entries,
-            // which lets resolve() enter the weighted gradient branch.
-            {
-                std::vector<unsigned int> all_ids;
-                for (int i = 0; i < 3; ++i) {
-                    int s = get_filament_index(i);
-                    if (s >= 0)
-                        all_ids.push_back((unsigned int)(s + 1));
-                }
-                m_result.gradient_component_ids = MixedFilamentManager::encode_gradient_component_ids(all_ids);
-            }
-            int r0 = (int)(m_tri_wx * 100 + 0.5);
-            int r1 = (int)(m_tri_wy * 100 + 0.5);
-            int r2 = 100 - r0 - r1;
-            m_result.gradient_component_weights =
-                std::to_string(r0) + "/" + std::to_string(r1) + "/" + std::to_string(r2);
-        } else {
-            m_result.distribution_mode = int(MixedFilament::Simple);
-            m_result.gradient_component_ids.clear();
-            m_result.manual_pattern.clear();
-            const int pct_b = std::clamp(val, 0, 100);
-            int ratio_a = 1, ratio_b = 0;
-            if (pct_b >= 100) {
-                ratio_a = 0; ratio_b = 1;
-            } else if (pct_b > 0) {
-                const int pct_a      = 100 - pct_b;
-                const bool b_is_major = pct_b >= pct_a;
-                const int major_pct   = b_is_major ? pct_b : pct_a;
-                const int minor_pct   = b_is_major ? pct_a : pct_b;
-                const int g = std::gcd(major_pct, minor_pct);
-                ratio_a = b_is_major ? (minor_pct / g) : (major_pct / g);
-                ratio_b = b_is_major ? (major_pct / g) : (minor_pct / g);
-            }
-            m_result.ratio_a = std::max(0, ratio_a);
-            m_result.ratio_b = std::max(0, ratio_b);
+        for (int i = 0; i < (int)m_filament_rows.size(); ++i)
+            if (const int s = get_filament_index(i); s >= 0)
+                in.ids.push_back((unsigned int)(s + 1));
+        in.weights = { (int)(m_tri_wx * 100 + 0.5), (int)(m_tri_wy * 100 + 0.5) };
+        break;
+    case MODE_CYCLE:
+        for (int i = 0; i < (int)m_filament_rows.size(); ++i)
+            if (const int s = get_filament_index(i); s >= 0)
+                in.ids.push_back((unsigned int)(s + 1));
+        in.pattern = m_pattern_ctrl ? into_u8(m_pattern_ctrl->GetValue()) : std::string();
+        break;
+    case MODE_MATCH:
+        for (int idx : m_match_tri_indices)
+            in.ids.push_back((unsigned int)(idx + 1));
+        if (m_match_tri_indices.size() >= 3)
+            in.weights = { (int)(m_match_tri_wx * 100 + 0.5), (int)(m_match_tri_wy * 100 + 0.5) };
+        else if (m_match_gradient_selector) {
+            const int v = m_match_gradient_selector->value();
+            in.weights = { 100 - v, v };
         }
         break;
-    case MODE_CYCLE: {
-        const std::string raw = m_pattern_ctrl ? into_u8(m_pattern_ctrl->GetValue()) : std::string();
-        const std::string norm = MixedFilamentManager::normalize_manual_pattern(raw);
-        m_result.distribution_mode = int(MixedFilament::Simple);
-        m_result.manual_pattern = norm.empty() ? "12" : norm;
-        m_result.gradient_component_ids.clear();
-        m_result.gradient_component_weights.clear();
-        // In cycle mode, tokens "1"/"2" map directly to physical filaments 1/2.
-        m_result.component_a = 1;
-        m_result.component_b = 2;
-        break;
-    }
-    case MODE_MATCH: {
-        // Always save current tri/gradient state — reflects what user actually set
-        m_result.distribution_mode = int(MixedFilament::Simple);
-        m_result.manual_pattern.clear();
-        m_result.ratio_a = 1;
-        m_result.ratio_b = 1;
-        if (!m_match_tri_indices.empty()) {
-            m_result.component_a = (unsigned)(m_match_tri_indices[0] + 1);
-            m_result.component_b = (unsigned)(m_match_tri_indices.size() >= 2 ? m_match_tri_indices[1] + 1 : 1);
-            if (m_match_tri_indices.size() >= 3) {
-                int w0 = (int)(m_match_tri_wx * 100 + 0.5);
-                int w1 = (int)(m_match_tri_wy * 100 + 0.5);
-                int w2 = std::max(0, 100 - w0 - w1);
-                m_result.gradient_component_ids.clear();
-                std::string weights_str;
-                std::vector<unsigned int> match_ids;
-                // Only include filaments with actual weight > 0
-                if (w0 > 0) { match_ids.push_back((unsigned int)(m_match_tri_indices[0] + 1)); weights_str += std::to_string(w0); }
-                if (w1 > 0) { match_ids.push_back((unsigned int)(m_match_tri_indices[1] + 1)); if (!weights_str.empty()) weights_str += "/"; weights_str += std::to_string(w1); }
-                if (w2 > 0) { match_ids.push_back((unsigned int)(m_match_tri_indices[2] + 1)); if (!weights_str.empty()) weights_str += "/"; weights_str += std::to_string(w2); }
-                m_result.gradient_component_ids = MixedFilamentManager::encode_gradient_component_ids(match_ids);
-                m_result.gradient_component_weights = weights_str;
-                if (match_ids.size() >= 3) {
-                    m_result.distribution_mode = int(MixedFilament::LayerCycle);
-                    m_result.mix_b_percent = 50;
-                } else if (match_ids.size() == 2) {
-                    m_result.distribution_mode = int(MixedFilament::Simple);
-                    int total_w = 0;
-                    if (w0 > 0) total_w += w0;
-                    if (w1 > 0) total_w += w1;
-                    if (w2 > 0) total_w += w2;
-                    m_result.mix_b_percent = (total_w > 0) ? (100 * (w1 > 0 ? w1 : w2) / total_w) : 50;
-                }
-            } else {
-                m_result.mix_b_percent = m_match_gradient_selector ? m_match_gradient_selector->value() : 50;
-                m_result.gradient_component_ids.clear();
-                // Store for constructor detection (Plater skips display for Simple mode)
-                m_result.gradient_component_ids = MixedFilamentManager::encode_gradient_component_ids({m_result.component_a, m_result.component_b});
-                m_result.gradient_component_weights.clear();
-            }
-        } else {
-            m_result.component_a = 1;
-            m_result.component_b = 2;
-            m_result.mix_b_percent = 50;
-            m_result.gradient_component_ids.clear();
-            m_result.gradient_component_weights.clear();
-        }
-        // Compute display_color from all filaments (not just component_a/b)
-        {
-            int nf = (int)m_match_tri_indices.size();
-            if (nf == 2 && m_match_gradient_selector) {
-                int ia = std::clamp(m_match_tri_indices[0], 0, (int)m_filament_colours.size() - 1);
-                int ib = std::clamp(m_match_tri_indices[1], 0, (int)m_filament_colours.size() - 1);
-                int val = m_match_gradient_selector->value();
-                m_result.display_color = MixedFilamentManager::blend_color(m_filament_colours[ia], m_filament_colours[ib], 100 - val, val);
-            } else if (nf >= 3) {
-                wxColour c0 = parse_mixed_color(m_filament_colours[std::clamp(m_match_tri_indices[0], 0, (int)m_filament_colours.size() - 1)]);
-                wxColour c1 = parse_mixed_color(m_filament_colours[std::clamp(m_match_tri_indices[1], 0, (int)m_filament_colours.size() - 1)]);
-                wxColour c2 = parse_mixed_color(m_filament_colours[std::clamp(m_match_tri_indices[2], 0, (int)m_filament_colours.size() - 1)]);
-                int r = (int)(c0.Red()*m_match_tri_wx + c1.Red()*m_match_tri_wy + c2.Red()*m_match_tri_wz + 0.5);
-                int g = (int)(c0.Green()*m_match_tri_wx + c1.Green()*m_match_tri_wy + c2.Green()*m_match_tri_wz + 0.5);
-                int b = (int)(c0.Blue()*m_match_tri_wx + c1.Blue()*m_match_tri_wy + c2.Blue()*m_match_tri_wz + 0.5);
-                m_result.display_color = wxString::Format("#%02X%02X%02X", std::clamp(r,0,255), std::clamp(g,0,255), std::clamp(b,0,255)).ToStdString();
-            }
-        }
-        break;
-    }
     case MODE_GRADIENT:
-        m_result.distribution_mode = int(MixedFilament::LayerCycle);
-        // 2-filament Z gradient does not need extra component IDs/weights.
-        m_result.gradient_component_ids.clear();
-        m_result.gradient_component_weights.clear();
-        m_result.manual_pattern.clear();
-        m_result.gradient_enabled = true;
-        
-        // Gradient direction mapping:
-        // Direction 0: A→B (component_a starts dominant at 80%, ends at 20%)
-        //              gradient_start=0.8, gradient_end=0.2 (start > end)
-        // Direction 1: B→A (component_a starts at 20%, ends dominant at 80%)
-        //              gradient_start=0.2, gradient_end=0.8 (start < end)
-        // 
-        // The gradient_start/end values represent the ratio of component_a.
-        // Component_b ratio is always (1 - component_a_ratio).
-        
-        if (m_gradient_direction == 0) {
-            // A→B: component_a goes from dominant to minority
-            m_result.gradient_start = MixedFilament::k_default_gradient_dominant;
-            m_result.gradient_end   = MixedFilament::k_default_gradient_minority;
-        } else {
-            // B→A: component_a goes from minority to dominant
-            m_result.gradient_start = MixedFilament::k_default_gradient_minority;
-            m_result.gradient_end   = MixedFilament::k_default_gradient_dominant;
-        }
-        
-        // Mid-blend layer ratio (50%) keeps non-gradient consumers consistent.
-        m_result.mix_b_percent = 50;
-        m_result.ratio_a = 1;
-        m_result.ratio_b = 1;
-        // Force at least 2 sublayers per layer so the LocalZ planner emits the
-        // two sub-layers needed to realize the per-layer gradient ratio.
-        if (m_result.local_z_max_sublayers < 2)
-            m_result.local_z_max_sublayers = 2;
+        for (int i = 0; i < (int)m_filament_rows.size(); ++i)
+            if (const int s = get_filament_index(i); s >= 0)
+                in.ids.push_back((unsigned int)(s + 1));
         break;
     }
-    m_result.custom = true;
+    apply_mixed_filament_ui_input(m_result, in);
+
+    if (m_current_mode == MODE_MATCH) {
+        // Compute display_color from all filaments (not just component_a/b)
+        int nf = (int)m_match_tri_indices.size();
+        if (nf == 2 && m_match_gradient_selector) {
+            int ia = std::clamp(m_match_tri_indices[0], 0, (int)m_filament_colours.size() - 1);
+            int ib = std::clamp(m_match_tri_indices[1], 0, (int)m_filament_colours.size() - 1);
+            int val = m_match_gradient_selector->value();
+            m_result.display_color = MixedFilamentManager::blend_color(m_filament_colours[ia], m_filament_colours[ib], 100 - val, val);
+        } else if (nf >= 3) {
+            wxColour c0 = parse_mixed_color(m_filament_colours[std::clamp(m_match_tri_indices[0], 0, (int)m_filament_colours.size() - 1)]);
+            wxColour c1 = parse_mixed_color(m_filament_colours[std::clamp(m_match_tri_indices[1], 0, (int)m_filament_colours.size() - 1)]);
+            wxColour c2 = parse_mixed_color(m_filament_colours[std::clamp(m_match_tri_indices[2], 0, (int)m_filament_colours.size() - 1)]);
+            int r = (int)(c0.Red()*m_match_tri_wx + c1.Red()*m_match_tri_wy + c2.Red()*m_match_tri_wz + 0.5);
+            int g = (int)(c0.Green()*m_match_tri_wx + c1.Green()*m_match_tri_wy + c2.Green()*m_match_tri_wz + 0.5);
+            int b = (int)(c0.Blue()*m_match_tri_wx + c1.Blue()*m_match_tri_wy + c2.Blue()*m_match_tri_wz + 0.5);
+            m_result.display_color = wxString::Format("#%02X%02X%02X", std::clamp(r,0,255), std::clamp(g,0,255), std::clamp(b,0,255)).ToStdString();
+        }
+    }
 }
 
 void MixedFilamentDialog::on_dpi_changed(const wxRect& /*suggested_rect*/)

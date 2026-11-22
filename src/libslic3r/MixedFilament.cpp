@@ -3044,4 +3044,160 @@ void MixedFilamentManager::set_display_context(const MixedFilamentDisplayContext
         refresh_display_colors(m_display_context.physical_colors);
 }
 
+
+// Logic of MixedFilamentDialog::collect_result(), per mode. Keep the quirks:
+//  - Cycle fixes component_a = 1 and component_b = 2;
+//  - Match with a zero second weight keeps component_b as the second selected filament;
+//  - Gradient raises local_z_max_sublayers to at least 2.
+void apply_mixed_filament_ui_input(MixedFilament &r, const MixedFilamentUiInput &in)
+{
+    constexpr int MODE_RATIO    = 0;
+    constexpr int MODE_CYCLE    = 1;
+    constexpr int MODE_MATCH    = 2;
+    constexpr int MODE_GRADIENT = 3;
+
+    const auto weight_at = [&in](size_t i) { return i < in.weights.size() ? in.weights[i] : 0; };
+
+    // Rows -> components (what the dialog's sync_rows_to_result() does).
+    if (!in.ids.empty()) {
+        const unsigned int a = in.ids[0];
+        const unsigned int b = in.ids.size() > 1 ? in.ids[1] : a;
+        r.component_a = a;
+        r.component_b = b;
+        std::vector<unsigned int> extra_ids;
+        for (size_t i = 2; i < in.ids.size(); ++i)
+            extra_ids.push_back(in.ids[i]);
+        r.gradient_component_ids = MixedFilamentManager::encode_gradient_component_ids(extra_ids);
+    }
+
+    r.ui_mode = in.mode;
+    const int val = in.ratio_selector_value;
+    r.mix_b_percent = val;
+    // Default: drop Z-gradient state. Only MODE_GRADIENT re-enables it below.
+    r.gradient_enabled = false;
+    switch (in.mode) {
+    case MODE_RATIO:
+        r.gradient_component_weights.clear();
+        if (in.ids.size() == 3) {
+            r.distribution_mode = int(MixedFilament::LayerCycle);
+            r.manual_pattern.clear();
+            // Store all 3 filament ids (1-based) so gradient_component_ids has 3 entries,
+            // which lets resolve() enter the weighted gradient branch.
+            r.gradient_component_ids = MixedFilamentManager::encode_gradient_component_ids(in.ids);
+            const int r0 = weight_at(0);
+            const int r1 = weight_at(1);
+            const int r2 = 100 - r0 - r1;
+            r.gradient_component_weights = std::to_string(r0) + "/" + std::to_string(r1) + "/" + std::to_string(r2);
+        } else {
+            r.distribution_mode = int(MixedFilament::Simple);
+            r.gradient_component_ids.clear();
+            r.manual_pattern.clear();
+            const int pct_b = std::clamp(val, 0, 100);
+            int ratio_a = 1, ratio_b = 0;
+            if (pct_b >= 100) {
+                ratio_a = 0; ratio_b = 1;
+            } else if (pct_b > 0) {
+                const int pct_a       = 100 - pct_b;
+                const bool b_is_major = pct_b >= pct_a;
+                const int major_pct   = b_is_major ? pct_b : pct_a;
+                const int minor_pct   = b_is_major ? pct_a : pct_b;
+                const int g = std::gcd(major_pct, minor_pct);
+                ratio_a = b_is_major ? (minor_pct / g) : (major_pct / g);
+                ratio_b = b_is_major ? (major_pct / g) : (minor_pct / g);
+            }
+            r.ratio_a = std::max(0, ratio_a);
+            r.ratio_b = std::max(0, ratio_b);
+        }
+        break;
+    case MODE_CYCLE: {
+        const std::string norm = MixedFilamentManager::normalize_manual_pattern(in.pattern);
+        r.distribution_mode = int(MixedFilament::Simple);
+        r.manual_pattern = norm.empty() ? "12" : norm;
+        r.gradient_component_ids.clear();
+        r.gradient_component_weights.clear();
+        // In cycle mode, tokens "1"/"2" map directly to physical filaments 1/2.
+        r.component_a = 1;
+        r.component_b = 2;
+        break;
+    }
+    case MODE_MATCH: {
+        // Always save the current selection and weights: they reflect what the user actually set.
+        r.distribution_mode = int(MixedFilament::Simple);
+        r.manual_pattern.clear();
+        r.ratio_a = 1;
+        r.ratio_b = 1;
+        if (!in.ids.empty()) {
+            r.component_a = in.ids[0];
+            r.component_b = in.ids.size() >= 2 ? in.ids[1] : 1u;
+            if (in.ids.size() >= 3) {
+                const int w0 = weight_at(0);
+                const int w1 = weight_at(1);
+                const int w2 = std::max(0, 100 - w0 - w1);
+                r.gradient_component_ids.clear();
+                std::string weights_str;
+                std::vector<unsigned int> match_ids;
+                // Only include filaments with actual weight > 0
+                if (w0 > 0) { match_ids.push_back(in.ids[0]); weights_str += std::to_string(w0); }
+                if (w1 > 0) { match_ids.push_back(in.ids[1]); if (!weights_str.empty()) weights_str += "/"; weights_str += std::to_string(w1); }
+                if (w2 > 0) { match_ids.push_back(in.ids[2]); if (!weights_str.empty()) weights_str += "/"; weights_str += std::to_string(w2); }
+                r.gradient_component_ids = MixedFilamentManager::encode_gradient_component_ids(match_ids);
+                r.gradient_component_weights = weights_str;
+                if (match_ids.size() >= 3) {
+                    r.distribution_mode = int(MixedFilament::LayerCycle);
+                    r.mix_b_percent = 50;
+                } else if (match_ids.size() == 2) {
+                    r.distribution_mode = int(MixedFilament::Simple);
+                    int total_w = 0;
+                    if (w0 > 0) total_w += w0;
+                    if (w1 > 0) total_w += w1;
+                    if (w2 > 0) total_w += w2;
+                    r.mix_b_percent = (total_w > 0) ? (100 * (w1 > 0 ? w1 : w2) / total_w) : 50;
+                }
+            } else {
+                r.mix_b_percent = in.weights.size() >= 2 ? in.weights[1] : 50;
+                // Store for constructor detection (Plater skips display for Simple mode)
+                r.gradient_component_ids = MixedFilamentManager::encode_gradient_component_ids({r.component_a, r.component_b});
+                r.gradient_component_weights.clear();
+            }
+        } else {
+            r.component_a = 1;
+            r.component_b = 2;
+            r.mix_b_percent = 50;
+            r.gradient_component_ids.clear();
+            r.gradient_component_weights.clear();
+        }
+        break;
+    }
+    case MODE_GRADIENT:
+        r.distribution_mode = int(MixedFilament::LayerCycle);
+        // 2-filament Z gradient does not need extra component IDs/weights.
+        r.gradient_component_ids.clear();
+        r.gradient_component_weights.clear();
+        r.manual_pattern.clear();
+        r.gradient_enabled = true;
+
+        // Direction 0: A->B (component_a starts dominant, ends minority; gradient_start > gradient_end)
+        // Direction 1: B->A (component_a starts minority, ends dominant; gradient_start < gradient_end)
+        // gradient_start/end are the ratio of component_a; component_b is always (1 - that).
+        if (in.gradient_direction == 0) {
+            r.gradient_start = MixedFilament::k_default_gradient_dominant;
+            r.gradient_end   = MixedFilament::k_default_gradient_minority;
+        } else {
+            r.gradient_start = MixedFilament::k_default_gradient_minority;
+            r.gradient_end   = MixedFilament::k_default_gradient_dominant;
+        }
+
+        // Mid-blend layer ratio (50%) keeps non-gradient consumers consistent.
+        r.mix_b_percent = 50;
+        r.ratio_a = 1;
+        r.ratio_b = 1;
+        // Force at least 2 sublayers per layer so the LocalZ planner emits the
+        // two sub-layers needed to realize the per-layer gradient ratio.
+        if (r.local_z_max_sublayers < 2)
+            r.local_z_max_sublayers = 2;
+        break;
+    }
+    r.custom = true;
+}
+
 } // namespace Slic3r

@@ -168,6 +168,22 @@ std::pair<int, int> mixed_filament_apparent_pair_percentages(const MixedFilament
                                                              bool                                bias_mode_enabled);
 std::string compute_mixed_filament_display_color(const MixedFilament &entry, const MixedFilamentDisplayContext &context);
 
+// Input of the "Color Mixing" dialog, as plain data. apply_mixed_filament_ui_input() turns it
+// into MixedFilament fields; the dialog and the SSWCP API both use it.
+struct MixedFilamentUiInput
+{
+    int                       mode = 0;                  // 0 Ratio, 1 Cycle, 2 Match, 3 Gradient
+    std::vector<unsigned int> ids;                       // physical filaments, 1-based, in row order
+    std::vector<int>          weights;                   // percentages (Ratio-3 / Match-3), or {100-b, b} for 2
+    std::string               pattern;                   // Cycle pattern, raw
+    int                       gradient_direction = 0;    // Gradient: 0 A->B, 1 B->A
+    int                       ratio_selector_value = 50; // value of the (hidden) Ratio slider
+};
+
+// Sets the mode-specific fields of `r` the way the dialog does when it is confirmed.
+// Sets r.custom = true. Does not touch display_color.
+void apply_mixed_filament_ui_input(MixedFilament &r, const MixedFilamentUiInput &in);
+
 // ---------------------------------------------------------------------------
 // MixedFilamentManager
 //

@@ -24,9 +24,11 @@
 #include "Widgets/ProgressDialog.hpp"
 #include "SingleChoiceDialog.hpp"
 #include "StepMeshDialog.hpp"
+#include "SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
 
 #include <boost/algorithm/string.hpp>
 #include <optional>
+#include <functional>
 #include <thread>
 #include <wx/progdlg.h>
 #include <wx/listbook.h>
@@ -1873,51 +1875,72 @@ void ObjectList::OnBeginDrag(wxDataViewEvent &event)
     event.SetDragFlags(wxDrag_DefaultMove); // allows both copy and move;
 }
 
-bool ObjectList::can_drop(const wxDataViewItem& item, int& src_obj_id, int& src_plate, int& dest_obj_id, int& dest_plate) const
+ObjectList::ItemForDrop ObjectList::item_for_drop(const wxDataViewItem& item) const
 {
-    if (!item.IsOk()
-        || (m_objects_model->GetItemType(item) != m_dragged_data.type())
-        || !(m_dragged_data.type() & (itVolume|itObject)))
-        return false;
+    ItemForDrop res;
+    if (!item.IsOk())
+        return res;
+    res.type = m_objects_model->GetItemType(item);
+    if (res.type & itObject)
+        res.obj_idx = m_objects_model->GetIdByItem(item);
+    else if (res.type & itVolume) {
+        res.obj_idx = m_objects_model->GetObjectIdByItem(item);
+        res.vol_idx = m_objects_model->GetVolumeIdByItem(item);
+    }
+    return res;
+}
 
-    if (m_dragged_data.type() & itObject){
-        int from_obj_id = m_dragged_data.obj_idx();
-        int to_obj_id   = m_objects_model->GetIdByItem(item);
+bool ObjectList::can_move_in_list(const ItemForDrop& src, const ItemForDrop& dst, std::string* why) const
+{
+    auto fail = [why](const char* reason) {
+        if (why)
+            *why = reason;
+        return false;
+    };
+
+    if (src.type != dst.type)
+        return fail("source and destination must be of the same item type");
+    if (!(src.type & (itVolume | itObject)))
+        return fail("only objects and parts can be moved in the list");
+
+    if (src.type & itObject) {
+        int from_obj_id = src.obj_idx;
+        int to_obj_id   = dst.obj_idx;
+        if (m_objects == nullptr || from_obj_id < 0 || to_obj_id < 0 ||
+            from_obj_id >= int(m_objects->size()) || to_obj_id >= int(m_objects->size()))
+            return fail("object index out of range");
         PartPlateList& partplate_list = wxGetApp().plater()->get_partplate_list();
 
         int from_plate = partplate_list.find_instance(from_obj_id, 0);
         if (from_plate == -1)
-            return false;
+            return fail("the object is not on a plate");
         int to_plate = partplate_list.find_instance(to_obj_id, 0);
-        if ((to_plate == -1) || (from_plate != to_plate))
-            return false;
-
-        src_obj_id = from_obj_id;
-        dest_obj_id = to_obj_id;
-        src_plate = from_plate;
-        dest_plate = to_plate;
-
-        // move instance(s) or object on "empty place" of ObjectList
-        // if ( (m_dragged_data.type() & (itInstance | itObject)) && !item.IsOk() )
-        //    return true;
+        if (to_plate == -1)
+            return fail("the destination object is not on a plate");
+        if (from_plate != to_plate)
+            return fail("objects can only be moved within the same plate");
     }
-    else if (m_dragged_data.type() & itVolume) {  // move volumes inside one object only
-        if (m_dragged_data.obj_idx() != m_objects_model->GetObjectIdByItem(item))
-            return false;
-        wxDataViewItem dragged_item = m_objects_model->GetItemByVolumeId(m_dragged_data.obj_idx(), m_dragged_data.sub_obj_idx());
+    else if (src.type & itVolume) {  // move volumes inside one object only
+        if (src.obj_idx != dst.obj_idx)
+            return fail("parts can only be moved within the same object");
+        wxDataViewItem dragged_item = m_objects_model->GetItemByVolumeId(src.obj_idx, src.vol_idx);
         if (!dragged_item)
-            return false;
+            return fail("part not found");
+        wxDataViewItem item = m_objects_model->GetItemByVolumeId(dst.obj_idx, dst.vol_idx);
+        if (!item)
+            return fail("destination part not found");
         ModelVolumeType item_v_type = m_objects_model->GetVolumeType(item);
         ModelVolumeType dragged_item_v_type = m_objects_model->GetVolumeType(dragged_item);
 
         if (dragged_item_v_type == item_v_type && dragged_item_v_type != ModelVolumeType::MODEL_PART)
             return true;
-        if ((dragged_item_v_type != item_v_type) ||   // we can't reorder volumes outside of types
-            item_v_type >= ModelVolumeType::SUPPORT_BLOCKER)        // support blockers/enforcers can't change its place
-            return false;
+        if (dragged_item_v_type != item_v_type)   // we can't reorder volumes outside of types
+            return fail("parts can only be moved among parts of the same type");
+        if (item_v_type >= ModelVolumeType::SUPPORT_BLOCKER)        // support blockers/enforcers can't change its place
+            return fail("support blockers and enforcers cannot change their place");
 
         bool only_one_solid_part = true;
-        auto& volumes = (*m_objects)[m_dragged_data.obj_idx()]->volumes;
+        auto& volumes = (*m_objects)[src.obj_idx]->volumes;
         for (size_t cnt, id = cnt = 0; id < volumes.size() && cnt < 2; id ++)
             if (volumes[id]->type() == ModelVolumeType::MODEL_PART) {
                 if (++cnt > 1)
@@ -1926,66 +1949,33 @@ bool ObjectList::can_drop(const wxDataViewItem& item, int& src_obj_id, int& src_
 
         if (dragged_item_v_type == ModelVolumeType::MODEL_PART) {
             if (only_one_solid_part)
-                return false;
-            return (m_objects_model->GetVolumeIdByItem(item) == 0 ||
-                    (m_dragged_data.sub_obj_idx()==0 && volumes[1]->type() == ModelVolumeType::MODEL_PART) ||
-                    (m_dragged_data.sub_obj_idx()!=0 && volumes[0]->type() == ModelVolumeType::MODEL_PART));
+                return fail("the object has only one solid part");
+            if (dst.vol_idx == 0 ||
+                (src.vol_idx == 0 && volumes[1]->type() == ModelVolumeType::MODEL_PART) ||
+                (src.vol_idx != 0 && volumes[0]->type() == ModelVolumeType::MODEL_PART))
+                return true;
+            return fail("the first part of the object must remain a solid part");
         }
         if ((dragged_item_v_type == ModelVolumeType::NEGATIVE_VOLUME || dragged_item_v_type == ModelVolumeType::PARAMETER_MODIFIER)) {
             if (only_one_solid_part)
-                return false;
-            return m_objects_model->GetVolumeIdByItem(item) != 0;
+                return fail("the object has only one solid part");
+            if (dst.vol_idx != 0)
+                return true;
+            return fail("the first part of the object must remain a solid part");
         }
-        return false;
+        return fail("this part cannot be moved");
     }
     return true;
 }
 
-void ObjectList::OnDropPossible(wxDataViewEvent &event)
+void ObjectList::move_in_list(const ItemForDrop& src, const ItemForDrop& dst)
 {
-    const wxDataViewItem& item = event.GetItem();
-
-    int src_obj_id, src_plate, dest_obj_id, dest_plate;
-    if (!can_drop(item, src_obj_id, src_plate, dest_obj_id, dest_plate)) {
-        event.Veto();
-        m_prevent_list_events = false;
-    }
-}
-
-void ObjectList::OnDrop(wxDataViewEvent &event)
-{
-    const wxDataViewItem& item = event.GetItem();
-
-    int src_obj_id, src_plate, dest_obj_id, dest_plate;
-    if (!can_drop(item, src_obj_id, src_plate, dest_obj_id, dest_plate))
-    {
-        event.Veto();
-        m_dragged_data.clear();
-        return;
-    }
-
-//#if 1
-    take_snapshot("Object order changed");
-
-    if(m_dragged_data.type() & itObject){
+    if (src.type & itObject) {
+        int src_obj_id = src.obj_idx;
+        int dest_obj_id = dst.obj_idx;
         int delta = dest_obj_id < src_obj_id ? -1 : 1;
         PartPlateList& partplate_list = wxGetApp().plater()->get_partplate_list();
-        /*int cnt = 0, cur_id = src_obj_id, next_id, total = abs(src_obj_id - dest_obj_id);
-        //for (cur_id = src_obj_id; cnt < total; id += delta, cnt++)
-        next_id = src_obj_id + delta;
-        while (cnt < total)
-        {
-            int cur_plate = partplate_list.find_instance(next_id, 0);
-            if (cur_plate != src_plate) {
-                cnt ++;
-                next_id += delta;
-                continue;
-            }
-            std::swap((*m_objects)[cur_id], (*m_objects)[next_id]);
-            cur_id = next_id;
-            cnt ++;
-            next_id += delta;
-        }*/
+        int src_plate = partplate_list.find_instance(src_obj_id, 0);
 
         int cnt = 0;
         for (int id = src_obj_id; cnt < abs(src_obj_id - dest_obj_id); id += delta, cnt++)
@@ -1996,20 +1986,50 @@ void ObjectList::OnDrop(wxDataViewEvent &event)
         partplate_list.reload_all_objects(false, src_plate);
         changed_object(src_obj_id);
     }
-    else if (m_dragged_data.type() & itVolume) {
-        int from_volume_id = m_dragged_data.sub_obj_idx();
-        int to_volume_id   = m_objects_model->GetVolumeIdByItem(item);
+    else if (src.type & itVolume) {
+        int from_volume_id = src.vol_idx;
+        int to_volume_id   = dst.vol_idx;
         int delta          = to_volume_id < from_volume_id ? -1 : 1;
 
-        auto &volumes = (*m_objects)[m_dragged_data.obj_idx()]->volumes;
+        auto &volumes = (*m_objects)[src.obj_idx]->volumes;
 
         int cnt = 0;
         for (int id = from_volume_id; cnt < abs(from_volume_id - to_volume_id); id += delta, cnt++) std::swap(volumes[id], volumes[id + delta]);
 
-        select_item(m_objects_model->ReorganizeChildren(from_volume_id, to_volume_id, m_objects_model->GetParent(item)));
+        wxDataViewItem dst_item = m_objects_model->GetItemByVolumeId(dst.obj_idx, dst.vol_idx);
+        select_item(m_objects_model->ReorganizeChildren(from_volume_id, to_volume_id, m_objects_model->GetParent(dst_item)));
 
-        changed_object(m_dragged_data.obj_idx());
+        changed_object(src.obj_idx);
     }
+}
+
+void ObjectList::OnDropPossible(wxDataViewEvent &event)
+{
+    const wxDataViewItem& item = event.GetItem();
+
+    ItemForDrop src { m_dragged_data.type(), m_dragged_data.obj_idx(), m_dragged_data.sub_obj_idx() };
+    if (!item.IsOk() || !can_move_in_list(src, item_for_drop(item))) {
+        event.Veto();
+        m_prevent_list_events = false;
+    }
+}
+
+void ObjectList::OnDrop(wxDataViewEvent &event)
+{
+    const wxDataViewItem& item = event.GetItem();
+
+    ItemForDrop src { m_dragged_data.type(), m_dragged_data.obj_idx(), m_dragged_data.sub_obj_idx() };
+    if (!item.IsOk() || !can_move_in_list(src, item_for_drop(item)))
+    {
+        event.Veto();
+        m_dragged_data.clear();
+        return;
+    }
+
+//#if 1
+    take_snapshot("Object order changed");
+
+    move_in_list(src, item_for_drop(item));
 
     m_dragged_data.clear();
 
@@ -2140,18 +2160,52 @@ void ObjectList::load_subobject(ModelVolumeType type, bool from_galery/* = false
     if (input_files.IsEmpty())
         return;
 
-    take_snapshot((type == ModelVolumeType::MODEL_PART) ? "Load Part" : "Load Modifier");
+    load_subobject_files(input_files, obj_idx, type, from_galery, nullptr, nullptr, {});
+}
 
+bool ObjectList::load_modifier_from_path(const std::string& path, ModelVolumeType type, const StepMeshChoice* step, std::string* error,
+                                         const std::string& snapshot_name)
+{
+    if (error)
+        error->clear();
+    wxDataViewItem item = GetSelection();
+    // we can add volumes for Object or Instance
+    if (!item || !(m_objects_model->GetItemType(item) & (itObject | itInstance))) {
+        if (error)
+            *error = "no object is selected";
+        return false;
+    }
+    const int obj_idx = m_objects_model->GetObjectIdByItem(item);
+    if (obj_idx < 0) {
+        if (error)
+            *error = "no object is selected";
+        return false;
+    }
+
+    wxArrayString input_files;
+    input_files.Add(wxString::FromUTF8(path.c_str()));
+    return load_subobject_files(input_files, obj_idx, type, false, step, error, snapshot_name);
+}
+
+bool ObjectList::load_subobject_files(const wxArrayString& input_files, int obj_idx, ModelVolumeType type, bool from_galery,
+                                      const StepMeshChoice* step, std::string* error, const std::string& snapshot_name)
+{
+    // The snapshot is taken in load_modifier(), after the file has been read and before the model changes.
     std::vector<ModelVolume*> volumes;
     // ! ysFIXME - delete commented code after testing and rename "load_modifier" to something common
     /*
     if (type == ModelVolumeType::MODEL_PART)
         load_part(*(*m_objects)[obj_idx], volumes, type, from_galery);
     else*/
-        load_modifier(input_files, *(*m_objects)[obj_idx], volumes, type, from_galery);
+        load_modifier(input_files, *(*m_objects)[obj_idx], volumes, type, from_galery, step, error, snapshot_name);
 
-    if (volumes.empty())
-        return;
+    // 'error' is only filled in API mode: a file that failed to load. Volumes of earlier files stay (and are shown below).
+    const bool load_failed = error && !error->empty();
+    if (volumes.empty()) {
+        if (error && error->empty())
+            *error = "no volume was loaded";
+        return false;
+    }
 
     wxDataViewItemArray items = reorder_volumes_and_get_selection(obj_idx, [volumes](const ModelVolume* volume) {
         return std::find(volumes.begin(), volumes.end(), volume) != volumes.end(); });
@@ -2170,6 +2224,7 @@ void ObjectList::load_subobject(ModelVolumeType type, bool from_galery/* = false
 
     //BBS: notify partplate the modify
     notify_instance_updated(obj_idx);
+    return !load_failed;
 }
 /*
 void ObjectList::load_part(ModelObject& model_object, std::vector<ModelVolume*>& added_volumes, ModelVolumeType type, bool from_galery = false)
@@ -2232,8 +2287,10 @@ void ObjectList::load_part(ModelObject& model_object, std::vector<ModelVolume*>&
     }
 }
 */
-void ObjectList::load_modifier(const wxArrayString& input_files, ModelObject& model_object, std::vector<ModelVolume*>& added_volumes, ModelVolumeType type, bool from_galery)
+void ObjectList::load_modifier(const wxArrayString& input_files, ModelObject& model_object, std::vector<ModelVolume*>& added_volumes, ModelVolumeType type, bool from_galery,
+                              const StepMeshChoice* step, std::string* error, const std::string& snapshot_name)
 {
+    bool snapshot_taken = false;
     // ! ysFIXME - delete commented code after testing and rename "load_modifier" to something common
     //if (type == ModelVolumeType::MODEL_PART)
     //    return;
@@ -2287,8 +2344,23 @@ void ObjectList::load_modifier(const wxArrayString& input_files, ModelObject& mo
                 bool split_compound = wxGetApp().app_config->get_bool("is_split_compound");
                 model = Model::read_from_step(
                     input_file, LoadStrategy::LoadModel, nullptr, nullptr,
-                    [this, &is_user_cancel, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value,
+                    [this, &is_user_cancel, &linear, &angle, &split_compound, step](Slic3r::Step& file, double& linear_value,
                                                                                      double& angle_value, bool& is_split) -> int {
+                        if (step) {
+                            // The API passes its own answer to the STEP mesh dialog.
+                            linear_value = step->linear_deflection;
+                            angle_value  = step->angle_deflection;
+                            is_split     = step->split_compound;
+                            return 1;
+                        }
+                        if (sswcp_api::active() && wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
+                            // API mode: no StepMeshDialog; the values from the preferences are used.
+                            sswcp_api::note("STEP mesh settings: default values used (dialog skipped)");
+                            linear_value = linear;
+                            angle_value  = angle;
+                            is_split     = split_compound;
+                            return 1;
+                        }
                         if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
                             StepMeshDialog mesh_dlg(nullptr, file, linear, angle);
                             if (mesh_dlg.ShowModal() == wxID_OK) {
@@ -2311,11 +2383,16 @@ void ObjectList::load_modifier(const wxArrayString& input_files, ModelObject& mo
                 model = Model::read_from_file(input_file, nullptr, nullptr, LoadStrategy::LoadModel);
             }
         }
-        catch (std::exception&) {
+        catch (std::exception& e) {
             if (!is_user_cancel) {
                 // auto msg = _L("Error!") + " " + input_file + " : " + e.what() + ".";
                 auto msg = _L("Error!") + " " + _L("Failed to get the model data in the current file.");
-                show_error(parent, msg);
+                if (sswcp_api::active()) {
+                    // API mode: no error dialog; the reason goes back to the handler.
+                    if (error)
+                        *error = std::string("failed to get the model data from '") + input_file + "': " + e.what();
+                } else
+                    show_error(parent, msg);
             }
             return;
         }
@@ -2337,6 +2414,12 @@ void ObjectList::load_modifier(const wxArrayString& input_files, ModelObject& mo
         model.add_default_instances();
         TriangleMesh mesh = model.mesh();
         // Mesh will be centered when loading.
+        // The first model change: take the undo snapshot now, so that a refused load leaves none behind.
+        if (!snapshot_taken) {
+            take_snapshot(!snapshot_name.empty() ? snapshot_name :
+                          std::string((type == ModelVolumeType::MODEL_PART) ? "Load Part" : "Load Modifier"));
+            snapshot_taken = true;
+        }
         ModelVolume* new_volume = model_object.add_volume(std::move(mesh), type);
         new_volume->name = boost::filesystem::path(input_file).filename().string();
 
@@ -2490,8 +2573,8 @@ void ObjectList::load_generic_subobject(const std::string& type_name, const Mode
     //BBS Switch to Objects List after add a modifier
     wxGetApp().params_panel()->switch_to_object(true);
 
-    //Show Dialog
-    if (wxGetApp().app_config->get("do_not_show_modifer_tips").empty()) {
+    // Show Dialog (not in API mode: the tip is purely informational).
+    if (!sswcp_api::active() && wxGetApp().app_config->get("do_not_show_modifer_tips").empty()) {
         TipsDialog dlg(wxGetApp().mainframe, _L("Add Modifier"), _L("Switch to per-object setting mode to edit modifier settings."), "do_not_show_modifer_tips");
         dlg.ShowModal();
     }
@@ -2856,7 +2939,11 @@ void ObjectList::split()
     const ConfigOptionStrings* filament_colors = config.option<ConfigOptionStrings>("filament_colour", false);
     const auto filament_cnt = (filament_colors == nullptr) ? size_t(1) : filament_colors->size();
     if (!volume->is_splittable()) {
-        wxMessageBox(_(L("The target object contains only one part and can not be split.")));
+        if (sswcp_api::active()) {
+            sswcp_api::note("the part consists of a single piece and could not be split (message skipped)");
+        } else {
+            wxMessageBox(_(L("The target object contains only one part and can not be split.")));
+        }
         return;
     }
 
@@ -5785,62 +5872,30 @@ void ObjectList::simplify()
     gizmos_mgr.open_gizmo(GLGizmosManager::EType::Simplify);
 }
 
-void GUI::ObjectList::smooth_mesh()
+namespace {
+// One volume to subdivide.
+struct SmoothJob {
+    ObjectID                           object_id; // stable identity: list indexes shift on deletion
+    ModelVolume                       *volume;
+    std::shared_ptr<const TriangleMesh> origin; // identity of the mesh copied into input
+    TriangleMesh                       input;
+};
+struct SmoothResult {
+    ObjectID                           object_id;
+    ModelVolume                       *volume;
+    std::shared_ptr<const TriangleMesh> origin;
+    std::optional<TriangleMesh>        smoothed;
+};
+
+// Asked for every object/part whose subdivided face count exceeds 1 million; true = abort the whole job.
+using SmoothConfirm = std::function<bool(size_t cur_face_count, const std::string &name, bool is_part)>;
+
+// Collect one job per volume to smooth: for a volume selection, the selected parts of the first object;
+// otherwise all volumes of every selected object. Returns false (and the caller does nothing) when a
+// confirmation was declined, an index is invalid or there is nothing to smooth.
+bool collect_smooth_jobs(const Model &model, const std::vector<int> &obj_idxs, const std::vector<int> &vol_idxs,
+                         const SmoothConfirm &confirm_over_limit, std::vector<SmoothJob> &inputs)
 {
-    auto plater = wxGetApp().plater();
-    if (!plater) {
-        return;
-    }
-    std::vector<int> obj_idxs, vol_idxs;
-    get_selection_indexes(obj_idxs, vol_idxs);
-    if (obj_idxs.empty()) {
-        return;
-    }
-    // A previous smoothing job is still running in the background.
-    if (m_smooth_mesh_thread.joinable()) {
-        return;
-    }
-
-    auto show_warning_dlg = [](size_t cur_face_count, std::string name, bool is_part) {
-        size_t limit_face_count = 1000000;
-        if (cur_face_count > limit_face_count) {
-            auto name_str = wxString::FromUTF8(name);
-            auto content  = wxString::Format(
-                _L("\"%s\" will exceed 1 million faces after this subdivision, which may increase slicing time. Do you want to continue?"),
-                name_str);
-            WarningDialog dlg(static_cast<wxWindow*>(wxGetApp().mainframe), (is_part ? _L("Part") : _L("Object")) + " " + content,
-                                  wxEmptyString, wxYES_NO);
-            if (dlg.ShowModal() == wxID_NO) {
-                return true;
-            }
-            return false;
-        }
-        return false;
-    };
-    auto show_smooth_mesh_error_dlg = [](std::string name) {
-        auto          name_str = wxString::FromUTF8(name);
-        auto          content  = wxString::Format(_L("\"%s\" part's mesh contains errors. Please repair it first."), name_str);
-        WarningDialog dlg(static_cast<wxWindow*>(wxGetApp().mainframe), content, wxEmptyString, wxOK);
-        dlg.ShowModal();
-    };
-
-    // Collect one job per volume to smooth: for a volume selection, the selected parts of
-    // the first object; otherwise all volumes of every selected object.
-    struct SmoothJob {
-        ObjectID                           object_id; // stable identity: list indexes shift on deletion
-        ModelVolume                       *volume;
-        std::shared_ptr<const TriangleMesh> origin; // identity of the mesh copied into input
-        TriangleMesh                       input;
-    };
-    struct SmoothResult {
-        ObjectID                           object_id;
-        ModelVolume                       *volume;
-        std::shared_ptr<const TriangleMesh> origin;
-        std::optional<TriangleMesh>        smoothed;
-    };
-
-    const Model &model = plater->model();
-    auto inputs        = std::make_shared<std::vector<SmoothJob>>();
     if (vol_idxs.empty()) {
         for (int obj_idx : obj_idxs) {
             if (obj_idx < 0 || obj_idx >= (int) model.objects.size()) {
@@ -5868,34 +5923,170 @@ void GUI::ObjectList::smooth_mesh()
                 continue;
             }
             // Declining a confirmation aborts the whole job before anything is dispatched.
-            if (show_warning_dlg(model_face_count * 4, obj->name, false)) {
-                return;
+            if (confirm_over_limit(model_face_count * 4, obj->name, false)) {
+                return false;
             }
             for (ModelVolume *mv : model_volumes) {
-                inputs->push_back({obj->id(), mv, mv->mesh_ptr(), mv->mesh()});
+                inputs.push_back({obj->id(), mv, mv->mesh_ptr(), mv->mesh()});
             }
         }
     } else {
         const int object_idx = obj_idxs.front();
         if (object_idx < 0 || object_idx >= (int) model.objects.size()) {
-            return;
+            return false;
         }
         ModelObject *obj = model.objects[object_idx];
         if (!obj || obj->volumes.empty()) {
-            return;
+            return false;
         }
         for (int vol_idx : vol_idxs) {
             if (vol_idx < 0 || vol_idx >= (int) obj->volumes.size()) {
-                return;
+                return false;
             }
             ModelVolume *mv = obj->volumes[vol_idx];
-            if (show_warning_dlg(mv->mesh().facets_count() * 4, mv->name, true)) {
-                return;
+            if (confirm_over_limit(mv->mesh().facets_count() * 4, mv->name, true)) {
+                return false;
             }
-            inputs->push_back({obj->id(), mv, mv->mesh_ptr(), mv->mesh()});
+            inputs.push_back({obj->id(), mv, mv->mesh_ptr(), mv->mesh()});
         }
     }
-    if (inputs->empty()) {
+    return !inputs.empty();
+}
+
+// Smooth every input mesh (blocking; this runs on the worker thread of smooth_mesh() or, for the API,
+// on the UI thread). A nullopt result marks a volume whose mesh could not be smoothed.
+void run_smooth_jobs(const std::vector<SmoothJob> &inputs, std::vector<SmoothResult> &results)
+{
+    for (const SmoothJob &job : inputs) {
+        bool        ok = false;
+        TriangleMesh smoothed = TriangleMeshDeal::smooth_triangle_mesh(job.input, ok);
+        results.push_back({job.object_id, job.volume, job.origin, ok ? std::make_optional(std::move(smoothed)) : std::nullopt});
+    }
+}
+
+// Pick the results that can be applied to the model as it is now (UI thread): the apply list, the
+// indexes of the changed objects and the name of the first volume that could not be smoothed.
+void select_smooth_results(Model &model, std::vector<SmoothResult> &results, std::vector<SmoothResult *> &apply_list,
+                           std::vector<int> &changed_objs, std::string &failed_name)
+{
+    for (SmoothResult &result : results) {
+        // Locate the object by its stable id: deleting another object shifts
+        // list indexes while the job runs, so the dispatch-time index must
+        // not be used for lookup.
+        int cur_obj_idx = -1;
+        for (size_t i = 0; i < model.objects.size(); ++i) {
+            if (model.objects[i]->id() == result.object_id) {
+                cur_obj_idx = (int) i;
+                break;
+            }
+        }
+        if (cur_obj_idx < 0) {
+            continue;
+        }
+        ModelObject *obj = model.objects[cur_obj_idx];
+        // Skip volumes that were removed from the object while the job was running.
+        if (std::find(obj->volumes.begin(), obj->volumes.end(), result.volume) == obj->volumes.end()) {
+            continue;
+        }
+        // The job smoothed a copy of one specific mesh object. Every mesh
+        // replacement allocates a fresh TriangleMesh, so if the volume's mesh was
+        // swapped while the job was running (e.g. a simplify finished first), this
+        // result is stale and would overwrite the newer mesh - skip it.
+        if (result.volume->mesh_ptr() != result.origin) {
+            continue;
+        }
+        if (result.smoothed) {
+            apply_list.push_back(&result);
+            if (std::find(changed_objs.begin(), changed_objs.end(), cur_obj_idx) == changed_objs.end()) {
+                changed_objs.push_back(cur_obj_idx);
+            }
+        } else if (failed_name.empty()) {
+            failed_name = result.volume->name;
+        }
+    }
+}
+
+// Apply the selected results to the model (UI thread), with one undo step.
+void apply_smooth_results(Plater *plater, const std::vector<SmoothResult *> &apply_list, const std::vector<int> &changed_objs,
+                          const std::string &snapshot_name = {})
+{
+    Model &model = plater->model();
+    // take_snapshot() stores the CURRENT model state, so it must run before
+    // the meshes are replaced - otherwise Ctrl+Z would restore the already
+    // subdivided meshes. One snapshot covers the whole multi-object operation.
+    plater->take_snapshot(snapshot_name.empty() ? std::string("smooth_mesh") : snapshot_name);
+    for (SmoothResult *result : apply_list) {
+        result->volume->set_mesh(std::move(*result->smoothed));
+        result->volume->calculate_convex_hull();
+        result->volume->invalidate_convex_hull_2d();
+        result->volume->set_new_unique_id();
+        // The four FacetsAnnotation stores (supports, seams, MMU segmentation,
+        // fuzzy skin) are indexed by face number; subdivision replaced every
+        // face with four new ones, so the stale markers would land on wrong
+        // faces. set_mesh()/set_new_unique_id() do not touch them - drop them
+        // explicitly (the "(Lost color)" menu note assumes exactly this).
+        result->volume->reset_extra_facets();
+    }
+    for (int obj_idx : changed_objs) {
+        model.objects[obj_idx]->invalidate_bounding_box();
+        model.objects[obj_idx]->ensure_on_bed();
+        plater->changed_mesh(obj_idx);
+    }
+}
+} // namespace
+
+void GUI::ObjectList::smooth_mesh()
+{
+    auto plater = wxGetApp().plater();
+    if (!plater) {
+        return;
+    }
+    std::vector<int> obj_idxs, vol_idxs;
+    get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.empty()) {
+        return;
+    }
+    // A previous smoothing job is still running in the background.
+    if (m_smooth_mesh_thread.joinable()) {
+        return;
+    }
+
+    auto show_warning_dlg = [](size_t cur_face_count, const std::string &name, bool is_part) {
+        size_t limit_face_count = 1000000;
+        if (cur_face_count > limit_face_count) {
+            if (sswcp_api::active()) {
+                // API mode: no confirmation dialog; the job is cancelled (like answering "No").
+                sswcp_api::note("subdivision cancelled: \"" + name + "\" would exceed 1 million faces (confirmation skipped)");
+                return true;
+            }
+            auto name_str = wxString::FromUTF8(name);
+            auto content  = wxString::Format(
+                _L("\"%s\" will exceed 1 million faces after this subdivision, which may increase slicing time. Do you want to continue?"),
+                name_str);
+            WarningDialog dlg(static_cast<wxWindow*>(wxGetApp().mainframe), (is_part ? _L("Part") : _L("Object")) + " " + content,
+                                  wxEmptyString, wxYES_NO);
+            if (dlg.ShowModal() == wxID_NO) {
+                return true;
+            }
+            return false;
+        }
+        return false;
+    };
+    // Decided on the UI thread now: the callback below runs later, when API mode may be over.
+    const bool api_mode = sswcp_api::active();
+    auto show_smooth_mesh_error_dlg = [api_mode](std::string name) {
+        if (api_mode) {
+            // API mode: no error dialog (the API uses smooth_mesh_now(), which reports the error itself).
+            return;
+        }
+        auto          name_str = wxString::FromUTF8(name);
+        auto          content  = wxString::Format(_L("\"%s\" part's mesh contains errors. Please repair it first."), name_str);
+        WarningDialog dlg(static_cast<wxWindow*>(wxGetApp().mainframe), content, wxEmptyString, wxOK);
+        dlg.ShowModal();
+    };
+
+    auto inputs = std::make_shared<std::vector<SmoothJob>>();
+    if (!collect_smooth_jobs(plater->model(), obj_idxs, vol_idxs, show_warning_dlg, *inputs)) {
         return;
     }
 
@@ -5907,11 +6098,7 @@ void GUI::ObjectList::smooth_mesh()
     results->reserve(inputs->size());
 
     m_smooth_mesh_thread = std::thread([this, plater, inputs, results, show_smooth_mesh_error_dlg]() {
-        for (const SmoothJob &job : *inputs) {
-            bool        ok = false;
-            TriangleMesh smoothed = TriangleMeshDeal::smooth_triangle_mesh(job.input, ok);
-            results->push_back({job.object_id, job.volume, job.origin, ok ? std::make_optional(std::move(smoothed)) : std::nullopt});
-        }
+        run_smooth_jobs(*inputs, *results);
 
         // Back to the UI thread to apply the smoothed meshes and refresh the scene.
         // Queue the callback on this ObjectList, not on the app: events pending on a
@@ -5923,73 +6110,96 @@ void GUI::ObjectList::smooth_mesh()
                 m_smooth_mesh_thread.join();
             }
 
-            Model                   &model = plater->model();
             std::vector<SmoothResult *> apply_list;
-            std::vector<int>        changed_objs;
-            std::string             failed_name;
-            for (SmoothResult &result : *results) {
-                // Locate the object by its stable id: deleting another object shifts
-                // list indexes while the job runs, so the dispatch-time index must
-                // not be used for lookup.
-                int cur_obj_idx = -1;
-                for (size_t i = 0; i < model.objects.size(); ++i) {
-                    if (model.objects[i]->id() == result.object_id) {
-                        cur_obj_idx = (int) i;
-                        break;
-                    }
-                }
-                if (cur_obj_idx < 0) {
-                    continue;
-                }
-                ModelObject *obj = model.objects[cur_obj_idx];
-                // Skip volumes that were removed from the object while the job was running.
-                if (std::find(obj->volumes.begin(), obj->volumes.end(), result.volume) == obj->volumes.end()) {
-                    continue;
-                }
-                // The job smoothed a copy of one specific mesh object. Every mesh
-                // replacement allocates a fresh TriangleMesh, so if the volume's mesh was
-                // swapped while the job was running (e.g. a simplify finished first), this
-                // result is stale and would overwrite the newer mesh - skip it.
-                if (result.volume->mesh_ptr() != result.origin) {
-                    continue;
-                }
-                if (result.smoothed) {
-                    apply_list.push_back(&result);
-                    if (std::find(changed_objs.begin(), changed_objs.end(), cur_obj_idx) == changed_objs.end()) {
-                        changed_objs.push_back(cur_obj_idx);
-                    }
-                } else if (failed_name.empty()) {
-                    failed_name = result.volume->name;
-                }
-            }
+            std::vector<int>            changed_objs;
+            std::string                 failed_name;
+            select_smooth_results(plater->model(), *results, apply_list, changed_objs, failed_name);
             if (!failed_name.empty()) {
                 show_smooth_mesh_error_dlg(failed_name);
             }
             if (!apply_list.empty()) {
-                // take_snapshot() stores the CURRENT model state, so it must run before
-                // the meshes are replaced - otherwise Ctrl+Z would restore the already
-                // subdivided meshes. One snapshot covers the whole multi-object operation.
-                plater->take_snapshot("smooth_mesh");
-                for (SmoothResult *result : apply_list) {
-                    result->volume->set_mesh(std::move(*result->smoothed));
-                    result->volume->calculate_convex_hull();
-                    result->volume->invalidate_convex_hull_2d();
-                    result->volume->set_new_unique_id();
-                    // The four FacetsAnnotation stores (supports, seams, MMU segmentation,
-                    // fuzzy skin) are indexed by face number; subdivision replaced every
-                    // face with four new ones, so the stale markers would land on wrong
-                    // faces. set_mesh()/set_new_unique_id() do not touch them - drop them
-                    // explicitly (the "(Lost color)" menu note assumes exactly this).
-                    result->volume->reset_extra_facets();
-                }
-                for (int obj_idx : changed_objs) {
-                    model.objects[obj_idx]->invalidate_bounding_box();
-                    model.objects[obj_idx]->ensure_on_bed();
-                    plater->changed_mesh(obj_idx);
-                }
+                apply_smooth_results(plater, apply_list, changed_objs);
             }
         });
     });
+}
+
+bool GUI::ObjectList::smooth_mesh_now(int obj_idx, int vol_idx, bool allow_over_1m_faces, std::string& error, const std::string& snapshot_name)
+{
+    auto plater = wxGetApp().plater();
+    if (!plater) {
+        error = "no plater";
+        return false;
+    }
+    // A smoothing job of the GUI is still running in the background.
+    if (m_smooth_mesh_thread.joinable()) {
+        error = "a subdivision is still running in the background";
+        return false;
+    }
+    Model &model = plater->model();
+    if (obj_idx < 0 || obj_idx >= (int) model.objects.size() || !model.objects[obj_idx]) {
+        error = "object index out of range";
+        return false;
+    }
+    const ModelObject *obj = model.objects[obj_idx];
+    // The same availability rule as can_smooth_mesh(): no open edges.
+    if (vol_idx < 0) {
+        if (obj->get_object_stl_stats().open_edges > 0) {
+            error = "the mesh has open edges; repair it first";
+            return false;
+        }
+    } else {
+        if (vol_idx >= (int) obj->volumes.size()) {
+            error = "volume index out of range";
+            return false;
+        }
+        if (obj->volumes[vol_idx]->mesh().stats().open_edges > 0) {
+            error = "the mesh has open edges; repair it first";
+            return false;
+        }
+    }
+
+    std::vector<int> obj_idxs{obj_idx}, vol_idxs;
+    if (vol_idx >= 0)
+        vol_idxs.push_back(vol_idx);
+
+    bool over_limit_error = false;
+    auto confirm = [&over_limit_error, allow_over_1m_faces](size_t cur_face_count, const std::string &name, bool) {
+        if (cur_face_count <= 1000000)
+            return false;
+        if (allow_over_1m_faces) {
+            sswcp_api::note("\"" + name + "\" exceeds 1 million faces after the subdivision (confirmed by the API)");
+            return false;
+        }
+        over_limit_error = true;
+        return true;
+    };
+    std::vector<SmoothJob> inputs;
+    if (!collect_smooth_jobs(model, obj_idxs, vol_idxs, confirm, inputs)) {
+        error = over_limit_error ? "the result would have more than 1 million faces; pass allow_over_1m_faces" :
+                                   "there is nothing to subdivide";
+        return false;
+    }
+
+    std::vector<SmoothResult> results;
+    results.reserve(inputs.size());
+    run_smooth_jobs(inputs, results);
+
+    std::vector<SmoothResult *> apply_list;
+    std::vector<int>            changed_objs;
+    std::string                 failed_name;
+    select_smooth_results(model, results, apply_list, changed_objs, failed_name);
+    if (!failed_name.empty()) {
+        // Nothing is applied when a mesh could not be subdivided.
+        error = "\"" + failed_name + "\" part's mesh contains errors; repair it first";
+        return false;
+    }
+    if (apply_list.empty()) {
+        error = "there is nothing to subdivide";
+        return false;
+    }
+    apply_smooth_results(plater, apply_list, changed_objs, snapshot_name);
+    return true;
 }
 
 void ObjectList::update_item_error_icon(const int obj_idx, const int vol_idx) const

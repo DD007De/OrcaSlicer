@@ -179,6 +179,23 @@ std::string summarize_cycle_pattern_text(const std::string& normalized_pattern,
                                          const MixedFilament& entry,
                                          int num_physical);
 
+// Validates a raw cycle-mode pattern (as typed in the dialog). Returns the English msgid of the
+// first error, or an empty string when the pattern is acceptable. For the "Filament %d not
+// recognized" error the msgid contains %d; the number goes to *invalid_id when it is given.
+// The msgids are plain English: translate them in GUI code only (_L / _u8L).
+std::string mixed_filament_cycle_pattern_error(const std::string& raw, int num_physical,
+                                               int* invalid_id = nullptr);
+
+// "Ratio too high" check of the dialog. `shares` holds one non-negative weight per physical
+// filament (index = 0-based filament, any scale). `total` is the denominator: the sum of all
+// weights the caller added up (also those of a filament that appears twice). Returns the
+// 1-based filament number whose share of `total` is above 0.667, or std::nullopt (also when
+// the total is not positive).
+std::optional<unsigned> mixed_filament_ratio_warning_filament(const std::vector<double>& shares, double total);
+
+// Label of a mix in the "Color Mixing" panel, for example "F1 60%+F2 40%" or "F1->F2".
+std::string mixed_filament_panel_label(const MixedFilament& mf, size_t num_physical);
+
 // ---- Batch Match Mapping ----
 
 /// Represents one color extracted from a multi-color model.

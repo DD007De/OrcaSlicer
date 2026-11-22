@@ -83,6 +83,15 @@ struct MeshErrorsInfo
     std::string warning_icon_name;
 };
 
+// The answer to the STEP mesh dialog (StepMeshDialog): the same three values the dialog returns.
+// Used by the API handlers, which pass it instead of showing the dialog.
+struct StepMeshChoice
+{
+    double linear_deflection = 0.003;
+    double angle_deflection  = 0.5;
+    bool   split_compound    = false;
+};
+
 class ObjectList : public wxDataViewCtrl
 {
 public:
@@ -210,6 +219,19 @@ private:
     }
 
 public:
+    // One end of a reordering in the list: an object (vol_idx is ignored) or a volume of object obj_idx.
+    // Used by drag&drop and by the API.
+    struct ItemForDrop
+    {
+        ItemType type    { itUndef }; // itObject or itVolume
+        int      obj_idx { -1 };
+        int      vol_idx { -1 };
+    };
+    // True when src may be moved to the place of dst; otherwise the reason (short English sentence) goes to *why when given.
+    bool can_move_in_list(const ItemForDrop& src, const ItemForDrop& dst, std::string* why = nullptr) const;
+    // Moves src to the place of dst (swap loop + model update). The caller has checked can_move_in_list() and takes the snapshot.
+    void move_in_list(const ItemForDrop& src, const ItemForDrop& dst);
+
     ObjectList(wxWindow* parent);
     ~ObjectList() override;
 
@@ -287,9 +309,23 @@ public:
     bool                is_instance_or_object_selected();
 
     void                load_subobject(ModelVolumeType type, bool from_galery = false);
+    // Shared by load_subobject() and load_modifier_from_path(): the loading, reordering and selecting.
+    bool                load_subobject_files(const wxArrayString& input_files, int obj_idx, ModelVolumeType type, bool from_galery,
+                                             const StepMeshChoice* step, std::string* error, const std::string& snapshot_name);
+    // The part of load_subobject() after the file dialog: loads 'path' (UTF-8) as a volume of the selected
+    // object (an instance or the object must be selected), like the menu entry "Load...". Returns false when
+    // nothing was loaded or a file failed; 'error' (optional) then holds the reason. 'step' answers the STEP
+    // mesh dialog. 'snapshot_name' (empty = "Load Part" / "Load Modifier") is taken after the file has been
+    // read, so a refused load leaves no undo step. The caller must first select the object in the ObjectList
+    // and on the canvas (selection and the list selection must agree, as after a click in the GUI).
+    bool                load_modifier_from_path(const std::string& path, ModelVolumeType type, const StepMeshChoice* step = nullptr, std::string* error = nullptr,
+                                                const std::string& snapshot_name = {});
     // ! ysFIXME - delete commented code after testing and rename "load_modifier" to something common
     //void                load_part(ModelObject& model_object, std::vector<ModelVolume*>& added_volumes, ModelVolumeType type, bool from_galery = false);
-    void                load_modifier(const wxArrayString& input_files, ModelObject& model_object, std::vector<ModelVolume*>& added_volumes, ModelVolumeType type, bool from_galery = false);
+    // 'step' (optional) answers the STEP mesh dialog; 'error' (optional) receives the reason of a failure
+    // (and is only filled in API mode, where the error message is skipped).
+    void                load_modifier(const wxArrayString& input_files, ModelObject& model_object, std::vector<ModelVolume*>& added_volumes, ModelVolumeType type, bool from_galery = false,
+                                      const StepMeshChoice* step = nullptr, std::string* error = nullptr, const std::string& snapshot_name = {});
     void                load_generic_subobject(const std::string& type_name, const ModelVolumeType type);
     void                load_shape_object(const std::string &type_name);
     void                load_mesh_object(const TriangleMesh &mesh, const wxString &name, bool center = true);
@@ -431,6 +467,12 @@ public:
     void fix_through_netfabb();
     void simplify();
     void smooth_mesh();
+    // Synchronous variant of smooth_mesh() for the API: subdivides the model parts of object 'obj_idx' (or,
+    // when vol_idx >= 0, only that volume) on this thread and applies the result, with one undo step. Returns
+    // false with the reason in 'error' and changes nothing when the mesh has open edges, when the result would
+    // exceed 1 million faces and 'allow_over_1m_faces' is false, or when smoothing fails.
+    // 'snapshot_name' (empty = "smooth_mesh") is taken only after all checks, right before the change.
+    bool smooth_mesh_now(int obj_idx, int vol_idx, bool allow_over_1m_faces, std::string& error, const std::string& snapshot_name = {});
     void update_item_error_icon(const int obj_idx, int vol_idx) const ;
 
     void copy_layers_to_clipboard();
@@ -481,7 +523,7 @@ private:
     void OnBeginDrag(wxDataViewEvent &event);
     void OnDropPossible(wxDataViewEvent &event);
     void OnDrop(wxDataViewEvent &event);
-    bool can_drop(const wxDataViewItem& item, int& src_obj_id, int& src_plate, int& dest_obj_id, int& dest_plate) const ;
+    ItemForDrop item_for_drop(const wxDataViewItem& item) const;
 
     void ItemValueChanged(wxDataViewEvent &event);
     // Workaround for entering the column editing mode on Windows. Simulate keyboard enter when another column of the active line is selected.

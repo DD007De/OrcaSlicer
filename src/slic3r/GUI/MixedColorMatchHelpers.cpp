@@ -1,5 +1,6 @@
 #include "MixedColorMatchHelpers.hpp"
 #include "MixedGradientSelector.hpp"
+#include "I18N.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <ColorSpaceConvert.hpp>
@@ -9,6 +10,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <queue>
@@ -2087,6 +2090,121 @@ void apply_batch_match_to_model(const BatchMatchResult& result)
     BOOST_LOG_TRIVIAL(info)
         << "apply_batch_match: remapped " << extruder_remap.size()
         << " extruder IDs across all volumes (total_filaments=" << total_filaments << ")";
+}
+
+
+std::string mixed_filament_cycle_pattern_error(const std::string& raw, int num_physical, int* invalid_id)
+{
+    bool has_invalid_chars = false;
+    std::string filtered;
+    filtered.reserve(raw.size());
+    for (char c : raw) {
+        if (c == ',' || c == '[' || c == ']' ||
+            (c >= '0' && c <= '9')) {
+            filtered.push_back(c);
+        } else {
+            has_invalid_chars = true;
+        }
+    }
+
+    const bool has_leading_trailing_comma = !raw.empty() && (raw.front() == ',' || raw.back() == ',');
+
+    const std::string normalized = MixedFilamentManager::normalize_manual_pattern(filtered);
+    const bool is_malformed = !filtered.empty() && normalized.empty();
+
+    if (has_leading_trailing_comma)
+        return L("Leading or trailing commas are not allowed.");
+
+    if (has_invalid_chars)
+        return L("Invalid characters found. Only digits, square brackets ([ and ]), and commas (,) are allowed.");
+
+    if (is_malformed)
+        return L("Unrecognized pattern format. Please check the pattern syntax.");
+
+    // Validate that all directly-referenced physical filament IDs exist.
+    // H4: only validate when there are at least 2 physical filaments and a non-empty pattern.
+    if (num_physical >= 2 && !normalized.empty()) {
+        auto parsed = parse_cycle_pattern(normalized, num_physical);
+        if (parsed.invalid_id != 0) {
+            if (invalid_id)
+                *invalid_id = (int)parsed.invalid_id;
+            return L("Filament %d not recognized. Please re-enter.");
+        }
+        if (!parsed.invalid_token.empty())
+            return L("Unrecognized pattern format. Please check the pattern syntax.");
+    }
+
+    return {};
+}
+
+std::optional<unsigned> mixed_filament_ratio_warning_filament(const std::vector<double>& shares, double total)
+{
+    static constexpr double HIGH_RATIO_THRESHOLD = 0.667;
+
+    if (total <= 0.0)
+        return std::nullopt;
+
+    double max_ratio = 0.0;
+    int    max_idx   = -1;
+    for (int i = 0; i < (int)shares.size(); ++i) {
+        const double ratio = shares[i] / total;
+        if (ratio > max_ratio) {
+            max_ratio = ratio;
+            max_idx   = i;
+        }
+    }
+    if (max_idx >= 0 && max_ratio > HIGH_RATIO_THRESHOLD)
+        return (unsigned)(max_idx + 1);
+    return std::nullopt;
+}
+
+std::string mixed_filament_panel_label(const MixedFilament& mf, size_t num_physical)
+{
+    const std::string normalized_pattern = MixedFilamentManager::normalize_manual_pattern(mf.manual_pattern);
+    std::vector<unsigned int> gradient_ids = MixedFilamentManager::decode_gradient_component_ids(mf.gradient_component_ids, 0);
+    const bool z_gradient_tile = mf.gradient_enabled && mf.component_a != mf.component_b
+                              && normalized_pattern.empty() && gradient_ids.size() < 3;
+    std::string lbl;
+    if (!normalized_pattern.empty())
+        lbl = summarize_cycle_pattern_text(normalized_pattern, mf, int(num_physical));
+    else if (gradient_ids.size() >= 3) {
+        // parse weights
+        const size_t n = gradient_ids.size();
+        std::vector<int> weights;
+        {
+            std::string token;
+            for (const char c : mf.gradient_component_weights) {
+                if (c >= '0' && c <= '9') { token.push_back(c); continue; }
+                if (!token.empty()) { weights.emplace_back(std::max(0, std::atoi(token.c_str()))); token.clear(); }
+            }
+            if (!token.empty()) weights.emplace_back(std::max(0, std::atoi(token.c_str())));
+            if (weights.size() != n) weights.assign(n, int(100 / n));
+        }
+        // normalize to 100
+        int sum = 0; for (int v : weights) sum += v;
+        if (sum <= 0) { weights.assign(n, 0); weights[0] = 100; sum = 100; }
+        for (size_t k = 0; k < n; ++k) {
+            const unsigned int fid = gradient_ids[k];
+            const int pct = int(std::round(100.0 * weights[k] / sum));
+            if (k > 0) lbl += "+";
+            lbl += "F" + std::to_string(fid) + " " + std::to_string(pct) + "%";
+        }
+    } else if (z_gradient_tile) {
+        const unsigned from_id =
+            mf.gradient_start >= mf.gradient_end ? mf.component_a : mf.component_b;
+        const unsigned to_id =
+            mf.gradient_start >= mf.gradient_end ? mf.component_b : mf.component_a;
+        lbl = "F" + std::to_string(from_id) + "->F" + std::to_string(to_id);
+    } else {
+        const int pct_b = std::clamp(mf.mix_b_percent, 0, 100);
+        const int pct_a = 100 - pct_b;
+        lbl = "F" + std::to_string(mf.component_a) + " " + std::to_string(pct_a) + "%+F" +
+              std::to_string(mf.component_b) + " " + std::to_string(pct_b) + "%";
+        if (mf.distribution_mode != int(MixedFilament::Simple))
+            for (unsigned int fid : gradient_ids)
+                lbl += "+F" + std::to_string(fid);
+    }
+    return lbl;
 }
 
 }} // namespace Slic3r::GUI

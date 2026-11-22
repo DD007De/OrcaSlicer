@@ -51,6 +51,7 @@ class ModelObject;
 class ModelInstance;
 class Print;
 class SLAPrint;
+struct MixedFilamentDisplayContext;
 //BBS: add partplatelist and SlicingStatusEvent
 class PartPlateList;
 class SlicingStatusEvent;
@@ -103,6 +104,8 @@ wxDECLARE_EVENT(EVT_INSTALL_PLUGIN_HINT,        wxCommandEvent);
 wxDECLARE_EVENT(EVT_UPDATE_PLUGINS_WHEN_LAUNCH,        wxCommandEvent);
 wxDECLARE_EVENT(EVT_PREVIEW_ONLY_MODE_HINT,        wxCommandEvent);
 wxDECLARE_EVENT(EVT_GLCANVAS_COLOR_MODE_CHANGED,   SimpleEvent);
+// Posted to the plater to schedule the background process (the "Flushing volumes" button and the API).
+wxDECLARE_EVENT(EVT_SCHEDULE_BACKGROUND_PROCESS,   SimpleEvent);
 wxDECLARE_EVENT(EVT_PRINT_FROM_SDCARD_VIEW,   SimpleEvent);
 wxDECLARE_EVENT(EVT_CREATE_FILAMENT, SimpleEvent);
 wxDECLARE_EVENT(EVT_MODIFY_FILAMENT, SimpleEvent);
@@ -175,10 +178,21 @@ public:
     void on_filaments_delete(size_t filament_id);
     void init_color_mix_panel(wxWindow* parent, wxSizer* sizer);
     void update_color_mix_panel();
+    // Deletes the mix row (index in the mixed filament rows) like the Delete item of its menu: remap,
+    // renumbering of the assignments, then the refresh. Returns false when there is no such row.
+    // The caller refreshes the panel (update_color_mix_panel).
+    bool delete_color_mix_row(size_t row_index);
+    // Context (physical colours, nozzle diameters, preview settings) the "Color Mixing" panel uses
+    // to compute display colours; also usable without the panel being shown.
+    MixedFilamentDisplayContext color_mix_display_context() const;
     void update_mixed_filament_panel(bool sync_manager = true);
     std::vector<unsigned int> get_ui_ordered_filament_ids() const;
     // BBS
     void on_bed_type_change(BedType bed_type);
+    // True when the sidebar list of bed types can be used (not for printers without a choice of bed types).
+    bool is_bed_type_list_enabled() const;
+    // The texts of the list entries as the user sees them, parallel to get_bed_type_combo_enum_values().
+    std::vector<std::string> get_bed_type_combo_labels() const;
     void load_ams_list(std::string const & device, MachineObject* obj);
     std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj);
     void sync_ams_list();
@@ -216,6 +230,9 @@ public:
     void                    update_ui_from_settings();
 	bool                    show_object_list(bool show) const;
     void                    finish_param_edit();
+    // The filament slot (0-based, -1: none) that the filament settings tab edits, as edit_filament()
+    // sets it: a preset selected in that tab then goes to this slot (update_presets()).
+    void                    set_editing_filament(int filament_idx);
     void                    auto_calc_flushing_volumes(const int modify_id);
     void                    jump_to_object(ObjectDataViewModelNode* item);
     void                    can_search();
@@ -243,6 +260,8 @@ private:
 
     wxBoxSizer* m_scrolled_sizer = nullptr;
     ComboBox* m_bed_type_list = nullptr;
+    // Whether update_all_preset_comboboxes() last enabled m_bed_type_list (see is_bed_type_list_enabled()).
+    bool m_bed_type_list_selectable = false;
     std::vector<std::string> m_bed_type_combo_enum_values;
     ScalableButton* connection_btn = nullptr;
     ScalableButton* machine_connecting_btn = nullptr;
@@ -317,6 +336,12 @@ public:
     bool is_presets_dirty() const;
     void set_plater_dirty(bool is_dirty);
     void update_project_dirty_from_presets();
+    // Select a preset by name, like picking it in the sidebar combo box. For filaments,
+    // 'filament_idx' is the 0-based slot. Returns false if the tab refused the switch.
+    // If the bed moved, the indices of the objects that were re-centred on their plate
+    // are added to 'moved_objects' (when given).
+    bool select_preset_by_name(Preset::Type type, const std::string& name, int filament_idx = 0,
+                               std::vector<int>* moved_objects = nullptr);
     int  save_project_if_dirty(const wxString& reason);
     void reset_project_dirty_after_save();
     void reset_project_dirty_initial_presets();
@@ -504,10 +529,40 @@ public:
     void send_to_printer(bool isall = false);
     void export_gcode(bool prefer_removable);
     void export_gcode_3mf(bool export_all = false);
+    // Slice all plates, like the "Slice all" button (without switching to the preview when 'silent').
+    // Returns false if slicing all plates could not be started.
+    bool slice_all_plates(bool silent);
+    // True while a "slice all" run is still working through the plates.
+    bool is_slicing_all() const;
+    // Stop the slicing that is running, as the cancel button of the slicing progress notification does
+    // (also for "slice all", whose run ends here). Only while slicing (is_background_process_slicing()):
+    // returns false and does nothing if no slicing is running, if a G-code export is scheduled or running
+    // (it is not cancelled), or while the memory warning of the slicing process is open or about to open
+    // (is_memory_warning_open()). stop() waits until the background thread has stopped; only
+    // is_background_process_slicing() turns false later, when the completed event is handled.
+    bool cancel_background_slicing();
+    // True while the memory warning of the slicing process is open or about to open: the background
+    // thread then waits for its answer, so the slicing cannot be stopped until it is answered.
+    bool is_memory_warning_open() const;
+    // SSWCP API: mark the slice (or "slice all" run) that is being started as started through the API,
+    // or clear the mark. For such a slice the memory warning becomes a notification instead of a
+    // modal dialog. The mark is cleared when the slice is over and by a slice started outside API mode.
+    void set_slice_started_by_api(bool by_api);
+    // The text of that notification; the API recognizes it by this text.
+    static std::string api_memory_warning_text();
+    // Export the G-code of the current plate to 'path' without a file dialog. The export runs
+    // asynchronously in the background process (poll is_export_gcode_scheduled()). Returns false
+    // if no export was scheduled.
+    bool export_gcode_to(const boost::filesystem::path& path);
     void send_gcode_finish(wxString name);
     void export_core_3mf();
     static TriangleMesh combine_mesh_fff(const ModelObject& mo, int instance_id, std::function<void(const std::string&)> notify_func = {});
     void export_stl(bool extended = false, bool selection_only = false, bool multi_stls = false);
+    // Export meshes as STL without a file dialog: the work of export_stl() after its dialog. With
+    // multi_stls, path_u8 is a folder ending in a separator and every object gets its own file (an
+    // existing name gets "(n)" appended). Returns false if there was nothing to export. Note:
+    // store_stl() does not report write errors; callers that need certainty should check the file.
+    bool export_stl_to(const std::string& path_u8, bool extended, bool selection_only, bool multi_stls = false);
     //BBS: remove amf
     //void export_amf();
     //BBS add extra param for exporting 3mf silence
@@ -517,9 +572,29 @@ public:
     //BBS
     void publish_project();
 
-    void reload_from_disk();
+    // Reload from disk of the selected volumes / of all objects. In API mode there is no file dialog: a
+    // missing source file gives false with "source file not found: <list>" in 'error' and changes nothing.
+    // 'snapshot_name' (empty = "Reload from disk" / "Reload all") is taken only when the model is about to
+    // change, so a refusal leaves no undo step. A file that fails to load after another one was already
+    // replaced gives false, with a note in 'error' about the partial replacement.
+    bool reload_from_disk(std::string* error = nullptr, const std::string& snapshot_name = {});
     void replace_with_stl();
-    void reload_all_from_disk();
+    // Replace with STL without the file dialog: replaces volume 'volume_idx' of object 'object_idx' with
+    // the single volume in 'path' (one undo step, 'snapshot_name'; empty = "Replace with STL", taken after the
+    // file has been read and checked). False with the reason in 'error' when the file cannot be loaded or does
+    // not hold exactly one object with one volume.
+    bool replace_with_stl(int object_idx, int volume_idx, const boost::filesystem::path& path, std::string* error = nullptr,
+                          const std::string& snapshot_name = {});
+    bool reload_all_from_disk(std::string* error = nullptr, const std::string& snapshot_name = {});
+    // The menu "Add Handy models": loads the handy model with the menu name 'name' ("Orca Cube", "Orca Tolerance
+    // Test", "3DBenchy", "Autodesk FDM Test", "Voron Cube", "Stanford Bunny", "Orca String Hell") from the
+    // resources folder and initializes the assembly positions. For "Orca String Hell" the GUI suggests to set
+    // min_width_top_surface to 0; in API mode there is no dialog: the setting is changed only when
+    // 'apply_suggested_settings' is true, and a note says what happened. 'loaded_object_indexes' (optional)
+    // receives the indexes of the new objects.
+    bool add_handy_model(const std::string& name, bool apply_suggested_settings, std::string* error = nullptr, std::vector<size_t>* loaded_object_indexes = nullptr);
+    // The file of the handy model with the menu name 'name' in the resources folder; empty for an unknown name.
+    static boost::filesystem::path handy_model_path(const std::string& name);
     bool has_toolpaths_to_export() const;
     void export_toolpaths_to_obj() const;
     bool reslice();
@@ -583,6 +658,10 @@ public:
     void set_auto_generated_gradient_decision(size_t num_physical, bool create_auto_gradients);
     // BBS
     void on_bed_type_change(BedType bed_type);
+    // Set the global bed type exactly like picking it in the sidebar list (project config, app config,
+    // slice results, dirty state) and move the list to it. The caller checks that the type is in the list.
+    // Returns false when nothing needed to change.
+    bool set_global_bed_type(BedType bed_type);
     bool update_filament_colors_in_full_config();
     void on_config_change(const DynamicPrintConfig &config);
     /// @brief Check whether high-temperature and low-temperature filaments are mixed on the current plate.
@@ -806,6 +885,7 @@ public:
     void apply_background_progress();
     //BBS: select the plate by hover_id
     int select_plate_by_hover_id(int hover_id, bool right_click = false, bool isModidyPlateName = false);
+    int move_plate_to_front(int plate_index);
     //BBS: delete the plate, index= -1 means the current plate
     int delete_plate(int plate_index = -1);
     int duplicate_plate(int plate_index = -1);
@@ -847,6 +927,8 @@ public:
 #endif
 
     void reset_gcode_toolpaths();
+    // Called after the layer slider ticks changed (event handler and API).
+    void on_layer_ticks_changed(CustomGCode::Type tick_event_type);
     void post_slice_state_change_update();
     void reset_last_loaded_gcode() { m_last_loaded_gcode = ""; }
 
