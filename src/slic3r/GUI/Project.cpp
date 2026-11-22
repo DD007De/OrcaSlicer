@@ -101,7 +101,15 @@ void ProjectPanel::onWebNavigating(wxWebViewEvent& evt)
 
 void ProjectPanel::on_reload(wxCommandEvent& evt)
 {
-    boost::thread reload = boost::thread([this] {
+    // Take the snapshot on the main thread: the model can change while the thread runs (another tab, a load).
+    // Only copy what the thread reads, not the whole model.
+    Model&                                  current      = wxGetApp().plater()->model();
+    const std::shared_ptr<ModelInfo>        model_info   = current.model_info != nullptr ? std::make_shared<ModelInfo>(*current.model_info) : nullptr;
+    const std::shared_ptr<ModelDesignInfo>  design_info  = current.design_info != nullptr ? std::make_shared<ModelDesignInfo>(*current.design_info) : nullptr;
+    const std::shared_ptr<ModelProfileInfo> profile_info = current.profile_info != nullptr ? std::make_shared<ModelProfileInfo>(*current.profile_info) : nullptr;
+    const std::string                       file_path    = encode_path(current.get_auxiliary_file_temp_path().c_str());
+
+    boost::thread reload = boost::thread([this, model_info, design_info, profile_info, file_path] {
         std::string update_type;
         std::string license;
         std::string model_name;
@@ -115,9 +123,6 @@ void ProjectPanel::on_reload(wxCommandEvent& evt)
 
         std::map<std::string, std::vector<json>> files;
 
-        Model model = wxGetApp().plater()->model();
-
-        auto model_info = model.model_info;
         if (model_info != nullptr) {
             license     = model_info->license;
             model_name  = model_info->model_name;
@@ -142,18 +147,17 @@ void ProjectPanel::on_reload(wxCommandEvent& evt)
             }
         }
 
-        if (model_author.empty() && model.design_info != nullptr)
-            model_author = model.design_info->Designer;
+        if (model_author.empty() && design_info != nullptr)
+            model_author = design_info->Designer;
 
-        if (model.profile_info != nullptr) {
-            p_name = model.profile_info->ProfileTile;
-            p_description = model.profile_info->ProfileDescription;
-            p_cover_file = model.profile_info->ProfileCover;
-            p_author = model.profile_info->ProfileUserName;
+        if (profile_info != nullptr) {
+            p_name = profile_info->ProfileTile;
+            p_description = profile_info->ProfileDescription;
+            p_cover_file = profile_info->ProfileCover;
+            p_author = profile_info->ProfileUserName;
         }
 
         // file info
-        std::string file_path = encode_path(wxGetApp().plater()->model().get_auxiliary_file_temp_path().c_str());
         if (!file_path.empty()) {
             files = Reload(file_path);
             wxGetApp().CallAfter([this, file_path, files] { m_auxiliary->Reload(file_path, files); });
