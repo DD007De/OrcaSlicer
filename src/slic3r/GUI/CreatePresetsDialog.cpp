@@ -3328,6 +3328,11 @@ ExportConfigsDialog::ExportConfigsDialog(wxWindow *parent)
 
 ExportConfigsDialog::~ExportConfigsDialog()
 {
+    // m_core deletes the preset copies and the Temp folder.
+}
+
+ExportPresetsCore::~ExportPresetsCore()
+{
     for (std::pair<std::string, Preset *> printer_preset : m_printer_presets) {
         Preset *preset = printer_preset.second;
         if (preset) {
@@ -3360,6 +3365,8 @@ ExportConfigsDialog::~ExportConfigsDialog()
             }
         }
     }
+
+    --live_count();
 
     // Delete the Temp folder
     boost::filesystem::path temp_folder(data_dir() + "/" + PRESET_USER_DIR + "/" + "Temp");
@@ -3413,8 +3420,8 @@ bool ExportConfigsDialog::has_check_box_selected()
     return false;
 }
 
-bool ExportConfigsDialog::earse_preset_fields_for_safe(Preset *preset)
-{ 
+bool ExportPresetsCore::earse_preset_fields_for_safe(Preset *preset)
+{
     if (preset->type != Preset::Type::TYPE_PRINTER) return true;
     
     boost::filesystem::path file_path(data_dir() + "/" + PRESET_USER_DIR + "/" + "Temp" + "/" + (preset->name + ".json"));
@@ -3550,7 +3557,7 @@ wxBoxSizer *ExportConfigsDialog::create_radio_item(wxString title, wxWindow *par
     return horizontal_sizer;
 }
 
-mz_bool ExportConfigsDialog::initial_zip_archive(mz_zip_archive &zip_archive, const std::string &file_path)
+mz_bool ExportPresetsCore::initial_zip_archive(mz_zip_archive &zip_archive, const std::string &file_path)
 {
     mz_zip_zero_struct(&zip_archive);
     mz_bool status;
@@ -3562,7 +3569,7 @@ mz_bool ExportConfigsDialog::initial_zip_archive(mz_zip_archive &zip_archive, co
     return status;
 }
 
-ExportConfigsDialog::ExportCase ExportConfigsDialog::save_zip_archive_to_file(mz_zip_archive &zip_archive)
+ExportPresetsCore::ExportCase ExportPresetsCore::save_zip_archive_to_file(mz_zip_archive &zip_archive)
 {
     // Complete writing of ZIP file
     mz_bool status = mz_zip_writer_finalize_archive(&zip_archive);
@@ -3578,7 +3585,7 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::save_zip_archive_to_file(mz
     return ExportCase::CASE_COUNT;
 }
 
-ExportConfigsDialog::ExportCase ExportConfigsDialog::save_presets_to_zip(const std::string &export_file, const std::vector<std::pair<std::string, std::string>> &config_paths)
+ExportPresetsCore::ExportCase ExportPresetsCore::save_presets_to_zip(const std::string &export_file, const std::vector<std::pair<std::string, std::string>> &config_paths)
 {
     mz_zip_archive zip_archive;
     mz_bool        status = initial_zip_archive(zip_archive, export_file);
@@ -3604,6 +3611,69 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::save_presets_to_zip(const s
     return save_zip_archive_to_file(zip_archive);
 }
 
+std::vector<std::string> ExportPresetsCore::offered_names(Kind kind) const
+{
+    std::vector<std::string> names;
+    switch (kind) {
+    case Kind::PrinterBundle:
+        for (const std::pair<const std::string, Preset *> &preset : m_printer_presets) {
+            const std::string &preset_name = preset.first;
+            //printer preset mast have user's filament or process preset or printer preset is user preset
+            if (m_filament_presets.find(preset_name) == m_filament_presets.end() && m_process_presets.find(preset_name) == m_process_presets.end() && preset.second->is_system) continue;
+            names.push_back(preset_name);
+        }
+        break;
+    case Kind::FilamentBundle:
+    case Kind::FilamentPresets:
+        for (const std::pair<const std::string, std::vector<std::pair<std::string, Preset *>>> &filament_name_to_preset : m_filament_name_to_presets) {
+            if (filament_name_to_preset.second.empty()) continue;
+            names.push_back(filament_name_to_preset.first);
+        }
+        break;
+    case Kind::PrinterPresets:
+        for (const std::pair<const std::string, Preset *> &preset : m_printer_presets) {
+            if (preset.second->is_system) continue;
+            names.push_back(preset.first);
+        }
+        break;
+    case Kind::ProcessPresets: {
+        PresetBundle *preset_bundle = wxGetApp().preset_bundle;
+        for (const std::pair<const std::string, std::vector<Preset *>> &presets : m_process_presets) {
+            Preset *      printer_preset = preset_bundle->printers.find_preset(presets.first, false);
+            if (!printer_preset) continue;
+            if (!printer_preset->is_system) continue;
+            if (preset_bundle->printers.get_preset_base(*printer_preset) != printer_preset) continue;
+            for (Preset *preset : presets.second) {
+                if (!preset->is_system) {
+                    names.push_back(presets.first);
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    }
+    return names;
+}
+
+Preset *ExportPresetsCore::printer_preset(const std::string &printer_name) const
+{
+    auto it = m_printer_presets.find(printer_name);
+    return it == m_printer_presets.end() ? nullptr : it->second;
+}
+
+std::string ExportPresetsCore::file_name(Kind kind, const std::string &name)
+{
+    switch (kind) {
+    case Kind::PrinterBundle: return name + ".orca_printer";
+    case Kind::FilamentBundle: return name + ".orca_filament";
+    case Kind::PrinterPresets: return "Printer presets.zip";
+    case Kind::FilamentPresets: return "Filament presets.zip";
+    case Kind::ProcessPresets: return "Process presets.zip";
+    }
+    return std::string();
+}
+
 void ExportConfigsDialog::select_curr_radiobox(std::vector<std::pair<RadioBox *, wxString>> &radiobox_list, int btn_idx)
 {
     int len = radiobox_list.size();
@@ -3614,53 +3684,37 @@ void ExportConfigsDialog::select_curr_radiobox(std::vector<std::pair<RadioBox *,
             m_preset_sizer->Clear(true);
             m_printer_name.clear();
             m_preset.clear();
-            PresetBundle *preset_bundle = wxGetApp().preset_bundle;
             this->Freeze();
+            // The names per type come from m_core (ExportPresetsCore::offered_names), so the API offers the same.
             if (export_type == m_exprot_type.preset_bundle) {
-                for (std::pair<std::string, Preset *> preset : m_printer_presets) {
-                    std::string preset_name = preset.first;
-                    //printer preset mast have user's filament or process preset or printer preset is user preset
-                    if (m_filament_presets.find(preset_name) == m_filament_presets.end() && m_process_presets.find(preset_name) == m_process_presets.end() && preset.second->is_system) continue;
+                for (const std::string &preset_name : m_core.offered_names(ExportPresetsCore::Kind::PrinterBundle)) {
                     wxString printer_name = wxString::FromUTF8(preset_name);
-                    m_preset_sizer->Add(create_checkbox(m_presets_window, preset.second, printer_name, m_preset), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(5));
+                    m_preset_sizer->Add(create_checkbox(m_presets_window, m_core.printer_preset(preset_name), printer_name, m_preset), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(5));
                 }
                 m_serial_text->SetLabel(_L("Only display printer names with changes to printer, filament, and process presets."));
             }else if (export_type == m_exprot_type.filament_bundle) {
-                for (std::pair<std::string, std::vector<std::pair<std::string, Preset*>>> filament_name_to_preset : m_filament_name_to_presets) {
-                    if (filament_name_to_preset.second.empty()) continue;
-                    wxString filament_name = wxString::FromUTF8(filament_name_to_preset.first);
+                for (const std::string &name : m_core.offered_names(ExportPresetsCore::Kind::FilamentBundle)) {
+                    wxString filament_name = wxString::FromUTF8(name);
                     m_preset_sizer->Add(create_checkbox(m_presets_window, filament_name, m_printer_name), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(5));
                 }
                 m_serial_text->SetLabel(_L("Only display the filament names with changes to filament presets."));
             } else if (export_type == m_exprot_type.printer_preset) {
-                for (std::pair<std::string, Preset *> preset : m_printer_presets) {
-                    if (preset.second->is_system) continue;
-                    wxString printer_name = wxString::FromUTF8(preset.first);
-                    m_preset_sizer->Add(create_checkbox(m_presets_window, preset.second, printer_name, m_preset), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT,
+                for (const std::string &name : m_core.offered_names(ExportPresetsCore::Kind::PrinterPresets)) {
+                    wxString printer_name = wxString::FromUTF8(name);
+                    m_preset_sizer->Add(create_checkbox(m_presets_window, m_core.printer_preset(name), printer_name, m_preset), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT,
                                         FromDIP(5));
                 }
                 m_serial_text->SetLabel(_L("Only printer names with user printer presets will be displayed, and each preset you choose will be exported as a zip."));
             } else if (export_type == m_exprot_type.filament_preset) {
-                for (std::pair<std::string, std::vector<std::pair<std::string, Preset *>>> filament_name_to_preset : m_filament_name_to_presets) {
-                    if (filament_name_to_preset.second.empty()) continue;
-                    wxString filament_name = wxString::FromUTF8(filament_name_to_preset.first);
+                for (const std::string &name : m_core.offered_names(ExportPresetsCore::Kind::FilamentPresets)) {
+                    wxString filament_name = wxString::FromUTF8(name);
                     m_preset_sizer->Add(create_checkbox(m_presets_window, filament_name, m_printer_name), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(5));
                 }
                 m_serial_text->SetLabel(_L("Only the filament names with user filament presets will be displayed, \nand all user filament presets in each filament name you select will be exported as a zip."));
             } else if (export_type == m_exprot_type.process_preset) {
-                for (std::pair<std::string, std::vector<Preset *>> presets : m_process_presets) {
-                    Preset *      printer_preset = preset_bundle->printers.find_preset(presets.first, false);
-                    if (!printer_preset) continue;
-                    if (!printer_preset->is_system) continue;
-                    if (preset_bundle->printers.get_preset_base(*printer_preset) != printer_preset) continue;
-                    for (Preset *preset : presets.second) {
-                        if (!preset->is_system) {
-                            wxString printer_name = wxString::FromUTF8(presets.first);
-                            m_preset_sizer->Add(create_checkbox(m_presets_window, printer_name, m_printer_name), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(5));
-                            break;
-                        }
-                    }
-                    
+                for (const std::string &name : m_core.offered_names(ExportPresetsCore::Kind::ProcessPresets)) {
+                    wxString printer_name = wxString::FromUTF8(name);
+                    m_preset_sizer->Add(create_checkbox(m_presets_window, printer_name, m_printer_name), 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(5));
                 }
                 m_serial_text->SetLabel(_L("Only printer names with changed process presets will be displayed, \nand all user process presets in each printer name you select will be exported as a zip."));
             }
@@ -3689,117 +3743,131 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_preset_bundle_to_fi
     std::string export_path = initial_file_path(path, "");
     if (export_path.empty() || "initial_failed" == export_path) return ExportCase::EXPORT_CANCEL;
     BOOST_LOG_TRIVIAL(info) << "Export printer preset bundle";
-    
+
     for (std::pair<::CheckBox *, Preset *> checkbox_preset : m_preset) {
         if (checkbox_preset.first->GetValue()) {
-            Preset *printer_preset = checkbox_preset.second;
-            std::string printer_preset_name_ = printer_preset->name;
-
-            json          bundle_structure;
-            NetworkAgent *agent = wxGetApp().getAgent();
-            std::string   clock = get_curr_timestmp();
-            if (agent) {
-                bundle_structure["version"]   = agent->get_version();
-                bundle_structure["bundle_id"] = agent->get_user_id() + "_" + printer_preset_name_ + "_" + clock;
-            } else {
-                bundle_structure["version"]   = "";
-                bundle_structure["bundle_id"] = "offline_" + printer_preset_name_ + "_" + clock;
-            }
-            bundle_structure["bundle_type"] = "printer config bundle";
-            bundle_structure["printer_preset_name"] = printer_preset_name_;
-            json printer_config   = json::array();
-            json filament_configs = json::array();
-            json process_configs  = json::array();
-
-            mz_zip_archive zip_archive;
-            mz_bool        status = initial_zip_archive(zip_archive, export_path + "/" + printer_preset->name + ".orca_printer");
-            if (MZ_FALSE == status) {
-                BOOST_LOG_TRIVIAL(info) << "Failed to initialize ZIP archive";
-                return ExportCase::INITIALIZE_FAIL;
-            }
-            
-            boost::filesystem::path printer_file_path      = boost::filesystem::path(printer_preset->file);
-            std::string             preset_path       = printer_file_path.make_preferred().string();
-            if (preset_path.empty()) {
-                BOOST_LOG_TRIVIAL(info) << "Export printer preset: " << printer_preset->name << " skip because of the preset file path is empty.";
-                continue;
-            }
-
-            // Add a file to the ZIP file
-            std::string printer_config_file_name = "printer/" + printer_file_path.filename().string();
-            status = mz_zip_writer_add_file(&zip_archive, printer_config_file_name.c_str(), encode_path(preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
-            //status = mz_zip_writer_add_mem(&zip_archive, ("printer/" + printer_preset->name + ".json").c_str(), json_contents, strlen(json_contents), MZ_DEFAULT_COMPRESSION);
-            if (MZ_FALSE == status) {
-                BOOST_LOG_TRIVIAL(info) << printer_preset->name << " Failed to add file to ZIP archive";
-                mz_zip_writer_end(&zip_archive);
-                return ExportCase::ADD_FILE_FAIL;
-            }
-            printer_config.push_back(printer_config_file_name);
-            BOOST_LOG_TRIVIAL(info) << "Printer preset json add successful: " << printer_preset->name;
-
-            const std::string printer_preset_name = printer_preset->name;
-            std::unordered_map<std::string, std::vector<Preset *>>::iterator iter = m_filament_presets.find(printer_preset_name);
-            if (m_filament_presets.end() != iter) {
-                for (Preset *preset : iter->second) {
-                    boost::filesystem::path filament_file_path   = boost::filesystem::path(preset->file);
-                    std::string             filament_preset_path = filament_file_path.make_preferred().string();
-                    if (filament_preset_path.empty()) {
-                        BOOST_LOG_TRIVIAL(info) << "Export filament preset: " << preset->name << " skip because of the preset file path is empty.";
-                        continue;
-                    }
-
-                    std::string filament_config_file_name = "filament/" + filament_file_path.filename().string();
-                    status = mz_zip_writer_add_file(&zip_archive, filament_config_file_name.c_str(), encode_path(filament_preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
-                    if (MZ_FALSE == status) {
-                        BOOST_LOG_TRIVIAL(info) << preset->name << " Failed to add file to ZIP archive";
-                        mz_zip_writer_end(&zip_archive);
-                        return ExportCase::ADD_FILE_FAIL;
-                    }
-                    filament_configs.push_back(filament_config_file_name);
-                    BOOST_LOG_TRIVIAL(info) << "Filament preset json add successful.";
-                }
-            }
-
-            iter = m_process_presets.find(printer_preset_name);
-            if (m_process_presets.end() != iter) {
-                for (Preset *preset : iter->second) {
-                    boost::filesystem::path process_file_path   = boost::filesystem::path(preset->file);
-                    std::string             process_preset_path = process_file_path.make_preferred().string();
-                    if (process_preset_path.empty()) {
-                        BOOST_LOG_TRIVIAL(info) << "Export process preset: " << preset->name << " skip because of the preset file path is empty.";
-                        continue;
-                    }
-
-                    std::string process_config_file_name = "process/" + process_file_path.filename().string();
-                    status = mz_zip_writer_add_file(&zip_archive, process_config_file_name.c_str(), encode_path(process_preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
-                    if (MZ_FALSE == status) {
-                        BOOST_LOG_TRIVIAL(info) << preset->name << " Failed to add file to ZIP archive";
-                        mz_zip_writer_end(&zip_archive);
-                        return ExportCase::ADD_FILE_FAIL;
-                    }
-                    process_configs.push_back(process_config_file_name);
-                    BOOST_LOG_TRIVIAL(info) << "Process preset json add successful: ";
-                }
-            }
-
-            bundle_structure["printer_config"]  = printer_config;
-            bundle_structure["filament_config"] = filament_configs;
-            bundle_structure["process_config"]  = process_configs;
-
-            std::string bundle_structure_str = bundle_structure.dump();
-            status = mz_zip_writer_add_mem(&zip_archive, BUNDLE_STRUCTURE_JSON_NAME, bundle_structure_str.data(), bundle_structure_str.size(), MZ_DEFAULT_COMPRESSION);
-            if (MZ_FALSE == status) {
-                BOOST_LOG_TRIVIAL(info) << " Failed to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
-                mz_zip_writer_end(&zip_archive);
-                return ExportCase::ADD_BUNDLE_STRUCTURE_FAIL;
-            }
-            BOOST_LOG_TRIVIAL(info) << " Success to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
-
-            ExportCase save_result = save_zip_archive_to_file(zip_archive);
-            if (ExportCase::CASE_COUNT != save_result) return save_result;
+            const std::string printer_name = checkbox_preset.second->name;
+            ExportCase        result       = m_core.write_printer_bundle(printer_name, export_path + "/" +
+                                                                    ExportPresetsCore::file_name(ExportPresetsCore::Kind::PrinterBundle, printer_name));
+            if (ExportCase::EXPORT_SUCCESS != result) return result;
         }
     }
     BOOST_LOG_TRIVIAL(info) << "ZIP archive created successfully";
+
+    return ExportCase::EXPORT_SUCCESS;
+}
+
+ExportPresetsCore::ExportCase ExportPresetsCore::write_printer_bundle(const std::string &printer_name, const std::string &file)
+{
+    Preset *printer_preset = this->printer_preset(printer_name);
+    if (!printer_preset) {
+        BOOST_LOG_TRIVIAL(info) << "Printer name do not find, printer name:" << printer_name;
+        return ExportCase::EXPORT_CANCEL;
+    }
+    std::string printer_preset_name_ = printer_preset->name;
+
+    json          bundle_structure;
+    NetworkAgent *agent = wxGetApp().getAgent();
+    std::string   clock = get_curr_timestmp();
+    if (agent) {
+        bundle_structure["version"]   = agent->get_version();
+        bundle_structure["bundle_id"] = agent->get_user_id() + "_" + printer_preset_name_ + "_" + clock;
+    } else {
+        bundle_structure["version"]   = "";
+        bundle_structure["bundle_id"] = "offline_" + printer_preset_name_ + "_" + clock;
+    }
+    bundle_structure["bundle_type"] = "printer config bundle";
+    bundle_structure["printer_preset_name"] = printer_preset_name_;
+    json printer_config   = json::array();
+    json filament_configs = json::array();
+    json process_configs  = json::array();
+
+    boost::filesystem::path printer_file_path      = boost::filesystem::path(printer_preset->file);
+    std::string             preset_path       = printer_file_path.make_preferred().string();
+    if (preset_path.empty()) {
+        BOOST_LOG_TRIVIAL(info) << "Export printer preset: " << printer_preset->name << " skip because of the preset file path is empty.";
+        return ExportCase::EXPORT_SUCCESS; // nothing to write, the dialog goes on with the next printer
+    }
+
+    mz_zip_archive zip_archive;
+    mz_bool        status = initial_zip_archive(zip_archive, file);
+    if (MZ_FALSE == status) {
+        BOOST_LOG_TRIVIAL(info) << "Failed to initialize ZIP archive";
+        return ExportCase::INITIALIZE_FAIL;
+    }
+
+    // Add a file to the ZIP file
+    std::string printer_config_file_name = "printer/" + printer_file_path.filename().string();
+    status = mz_zip_writer_add_file(&zip_archive, printer_config_file_name.c_str(), encode_path(preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
+    //status = mz_zip_writer_add_mem(&zip_archive, ("printer/" + printer_preset->name + ".json").c_str(), json_contents, strlen(json_contents), MZ_DEFAULT_COMPRESSION);
+    if (MZ_FALSE == status) {
+        BOOST_LOG_TRIVIAL(info) << printer_preset->name << " Failed to add file to ZIP archive";
+        mz_zip_writer_end(&zip_archive);
+        return ExportCase::ADD_FILE_FAIL;
+    }
+    printer_config.push_back(printer_config_file_name);
+    BOOST_LOG_TRIVIAL(info) << "Printer preset json add successful: " << printer_preset->name;
+
+    const std::string printer_preset_name = printer_preset->name;
+    std::unordered_map<std::string, std::vector<Preset *>>::iterator iter = m_filament_presets.find(printer_preset_name);
+    if (m_filament_presets.end() != iter) {
+        for (Preset *preset : iter->second) {
+            boost::filesystem::path filament_file_path   = boost::filesystem::path(preset->file);
+            std::string             filament_preset_path = filament_file_path.make_preferred().string();
+            if (filament_preset_path.empty()) {
+                BOOST_LOG_TRIVIAL(info) << "Export filament preset: " << preset->name << " skip because of the preset file path is empty.";
+                continue;
+            }
+
+            std::string filament_config_file_name = "filament/" + filament_file_path.filename().string();
+            status = mz_zip_writer_add_file(&zip_archive, filament_config_file_name.c_str(), encode_path(filament_preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
+            if (MZ_FALSE == status) {
+                BOOST_LOG_TRIVIAL(info) << preset->name << " Failed to add file to ZIP archive";
+                mz_zip_writer_end(&zip_archive);
+                return ExportCase::ADD_FILE_FAIL;
+            }
+            filament_configs.push_back(filament_config_file_name);
+            BOOST_LOG_TRIVIAL(info) << "Filament preset json add successful.";
+        }
+    }
+
+    iter = m_process_presets.find(printer_preset_name);
+    if (m_process_presets.end() != iter) {
+        for (Preset *preset : iter->second) {
+            boost::filesystem::path process_file_path   = boost::filesystem::path(preset->file);
+            std::string             process_preset_path = process_file_path.make_preferred().string();
+            if (process_preset_path.empty()) {
+                BOOST_LOG_TRIVIAL(info) << "Export process preset: " << preset->name << " skip because of the preset file path is empty.";
+                continue;
+            }
+
+            std::string process_config_file_name = "process/" + process_file_path.filename().string();
+            status = mz_zip_writer_add_file(&zip_archive, process_config_file_name.c_str(), encode_path(process_preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
+            if (MZ_FALSE == status) {
+                BOOST_LOG_TRIVIAL(info) << preset->name << " Failed to add file to ZIP archive";
+                mz_zip_writer_end(&zip_archive);
+                return ExportCase::ADD_FILE_FAIL;
+            }
+            process_configs.push_back(process_config_file_name);
+            BOOST_LOG_TRIVIAL(info) << "Process preset json add successful: ";
+        }
+    }
+
+    bundle_structure["printer_config"]  = printer_config;
+    bundle_structure["filament_config"] = filament_configs;
+    bundle_structure["process_config"]  = process_configs;
+
+    std::string bundle_structure_str = bundle_structure.dump();
+    status = mz_zip_writer_add_mem(&zip_archive, BUNDLE_STRUCTURE_JSON_NAME, bundle_structure_str.data(), bundle_structure_str.size(), MZ_DEFAULT_COMPRESSION);
+    if (MZ_FALSE == status) {
+        BOOST_LOG_TRIVIAL(info) << " Failed to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
+        mz_zip_writer_end(&zip_archive);
+        return ExportCase::ADD_BUNDLE_STRUCTURE_FAIL;
+    }
+    BOOST_LOG_TRIVIAL(info) << " Success to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
+
+    ExportCase save_result = save_zip_archive_to_file(zip_archive);
+    if (ExportCase::CASE_COUNT != save_result) return save_result;
 
     return ExportCase::EXPORT_SUCCESS;
 }
@@ -3813,88 +3881,97 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_filament_bundle_to_
     for (std::pair<::CheckBox *, std::string> checkbox_filament_name : m_printer_name) {
         if (checkbox_filament_name.first->GetValue()) {
             std::string filament_name = checkbox_filament_name.second;
-
-            json          bundle_structure;
-            NetworkAgent *agent = wxGetApp().getAgent();
-            std::string   clock = get_curr_timestmp();
-            if (agent) {
-                bundle_structure["version"]   = agent->get_version();
-                bundle_structure["bundle_id"] = agent->get_user_id() + "_" + filament_name + "_" + clock;
-            } else {
-                bundle_structure["version"]   = "";
-                bundle_structure["bundle_id"] = "offline_" + filament_name + "_" + clock;
-            }
-            bundle_structure["bundle_type"] = "filament config bundle";
-            bundle_structure["filament_name"] = filament_name;
-            std::unordered_map<std::string, json> vendor_structure;
-
-            mz_zip_archive zip_archive;
-            mz_bool        status = initial_zip_archive(zip_archive, export_path + "/" + filament_name + ".orca_filament");
-            if (MZ_FALSE == status) {
-                BOOST_LOG_TRIVIAL(info) << "Failed to initialize ZIP archive";
-                return ExportCase::INITIALIZE_FAIL;
-            }
-
-            std::unordered_map<std::string, std::vector<std::pair<std::string, Preset *>>>::iterator iter = m_filament_name_to_presets.find(filament_name);
-            if (m_filament_name_to_presets.end() == iter) {
-                BOOST_LOG_TRIVIAL(info) << "Filament name do not find, filament name:" << filament_name;
-                continue;
-            }
-            std::set<std::pair<std::string, std::string>> vendor_to_filament_name;
-            for (std::pair<std::string, Preset *> printer_name_to_preset : iter->second) {
-                std::string printer_vendor = printer_name_to_preset.first;
-                if (printer_vendor.empty()) continue;
-                Preset *    filament_preset = printer_name_to_preset.second;
-                if (vendor_to_filament_name.find(std::make_pair(printer_vendor, filament_preset->name)) != vendor_to_filament_name.end()) continue;
-                vendor_to_filament_name.insert(std::make_pair(printer_vendor, filament_preset->name));
-                std::string preset_path     = boost::filesystem::path(filament_preset->file).make_preferred().string();
-                if (preset_path.empty()) {
-                    BOOST_LOG_TRIVIAL(info) << "Export printer preset: " << filament_preset->name << " skip because of the preset file path is empty.";
-                    continue;
-                }
-                // Add a file to the ZIP file
-                std::string file_name = printer_vendor + "/" + filament_preset->name + ".json";
-                status                = mz_zip_writer_add_file(&zip_archive, file_name.c_str(), encode_path(preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
-                // status = mz_zip_writer_add_mem(&zip_archive, ("printer/" + printer_preset->name + ".json").c_str(), json_contents, strlen(json_contents), MZ_DEFAULT_COMPRESSION);
-                if (MZ_FALSE == status) {
-                    BOOST_LOG_TRIVIAL(info) << filament_preset->name << " Failed to add file to ZIP archive";
-                    mz_zip_writer_end(&zip_archive);
-                    return ExportCase::ADD_FILE_FAIL;
-                }
-                std::unordered_map<std::string, json>::iterator iter = vendor_structure.find(printer_vendor);
-                if (vendor_structure.end() == iter) {
-                    json j = json::array();
-                    j.push_back(file_name);
-                    vendor_structure[printer_vendor] = j;
-                } else {
-                    iter->second.push_back(file_name);
-                }
-                BOOST_LOG_TRIVIAL(info) << "Filament preset json add successful: " << filament_preset->name;
-            }
-            
-            for (const auto& vendor_name_to_json : vendor_structure) {
-                json j;
-                std::string printer_vendor = vendor_name_to_json.first;
-                j["vendor"]                = printer_vendor;
-                j["filament_path"]         = vendor_name_to_json.second;
-                bundle_structure["printer_vendor"].push_back(j);
-            }
-
-            std::string bundle_structure_str = bundle_structure.dump();
-            status = mz_zip_writer_add_mem(&zip_archive, BUNDLE_STRUCTURE_JSON_NAME, bundle_structure_str.data(), bundle_structure_str.size(), MZ_DEFAULT_COMPRESSION);
-            if (MZ_FALSE == status) {
-                BOOST_LOG_TRIVIAL(info) << " Failed to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
-                mz_zip_writer_end(&zip_archive);
-                return ExportCase::ADD_BUNDLE_STRUCTURE_FAIL;
-            }
-            BOOST_LOG_TRIVIAL(info) << " Success to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
-
-            // Complete writing of ZIP file
-            ExportCase save_result = save_zip_archive_to_file(zip_archive);
-            if (ExportCase::CASE_COUNT != save_result) return save_result;
+            ExportCase  result        = m_core.write_filament_bundle(filament_name, export_path + "/" +
+                                                                     ExportPresetsCore::file_name(ExportPresetsCore::Kind::FilamentBundle, filament_name));
+            if (ExportCase::EXPORT_SUCCESS != result) return result;
         }
     }
     BOOST_LOG_TRIVIAL(info) << "ZIP archive created successfully";
+
+    return ExportCase::EXPORT_SUCCESS;
+}
+
+ExportPresetsCore::ExportCase ExportPresetsCore::write_filament_bundle(const std::string &filament_name, const std::string &file)
+{
+    json          bundle_structure;
+    NetworkAgent *agent = wxGetApp().getAgent();
+    std::string   clock = get_curr_timestmp();
+    if (agent) {
+        bundle_structure["version"]   = agent->get_version();
+        bundle_structure["bundle_id"] = agent->get_user_id() + "_" + filament_name + "_" + clock;
+    } else {
+        bundle_structure["version"]   = "";
+        bundle_structure["bundle_id"] = "offline_" + filament_name + "_" + clock;
+    }
+    bundle_structure["bundle_type"] = "filament config bundle";
+    bundle_structure["filament_name"] = filament_name;
+    std::unordered_map<std::string, json> vendor_structure;
+
+    std::unordered_map<std::string, std::vector<std::pair<std::string, Preset *>>>::iterator iter = m_filament_name_to_presets.find(filament_name);
+    if (m_filament_name_to_presets.end() == iter) {
+        BOOST_LOG_TRIVIAL(info) << "Filament name do not find, filament name:" << filament_name;
+        return ExportCase::EXPORT_CANCEL;
+    }
+
+    mz_zip_archive zip_archive;
+    mz_bool        status = initial_zip_archive(zip_archive, file);
+    if (MZ_FALSE == status) {
+        BOOST_LOG_TRIVIAL(info) << "Failed to initialize ZIP archive";
+        return ExportCase::INITIALIZE_FAIL;
+    }
+
+    std::set<std::pair<std::string, std::string>> vendor_to_filament_name;
+    for (std::pair<std::string, Preset *> printer_name_to_preset : iter->second) {
+        std::string printer_vendor = printer_name_to_preset.first;
+        if (printer_vendor.empty()) continue;
+        Preset *    filament_preset = printer_name_to_preset.second;
+        if (vendor_to_filament_name.find(std::make_pair(printer_vendor, filament_preset->name)) != vendor_to_filament_name.end()) continue;
+        vendor_to_filament_name.insert(std::make_pair(printer_vendor, filament_preset->name));
+        std::string preset_path     = boost::filesystem::path(filament_preset->file).make_preferred().string();
+        if (preset_path.empty()) {
+            BOOST_LOG_TRIVIAL(info) << "Export printer preset: " << filament_preset->name << " skip because of the preset file path is empty.";
+            continue;
+        }
+        // Add a file to the ZIP file
+        std::string file_name = printer_vendor + "/" + filament_preset->name + ".json";
+        status                = mz_zip_writer_add_file(&zip_archive, file_name.c_str(), encode_path(preset_path.c_str()).c_str(), NULL, 0, MZ_DEFAULT_COMPRESSION);
+        // status = mz_zip_writer_add_mem(&zip_archive, ("printer/" + printer_preset->name + ".json").c_str(), json_contents, strlen(json_contents), MZ_DEFAULT_COMPRESSION);
+        if (MZ_FALSE == status) {
+            BOOST_LOG_TRIVIAL(info) << filament_preset->name << " Failed to add file to ZIP archive";
+            mz_zip_writer_end(&zip_archive);
+            return ExportCase::ADD_FILE_FAIL;
+        }
+        std::unordered_map<std::string, json>::iterator iter = vendor_structure.find(printer_vendor);
+        if (vendor_structure.end() == iter) {
+            json j = json::array();
+            j.push_back(file_name);
+            vendor_structure[printer_vendor] = j;
+        } else {
+            iter->second.push_back(file_name);
+        }
+        BOOST_LOG_TRIVIAL(info) << "Filament preset json add successful: " << filament_preset->name;
+    }
+
+    for (const auto& vendor_name_to_json : vendor_structure) {
+        json j;
+        std::string printer_vendor = vendor_name_to_json.first;
+        j["vendor"]                = printer_vendor;
+        j["filament_path"]         = vendor_name_to_json.second;
+        bundle_structure["printer_vendor"].push_back(j);
+    }
+
+    std::string bundle_structure_str = bundle_structure.dump();
+    status = mz_zip_writer_add_mem(&zip_archive, BUNDLE_STRUCTURE_JSON_NAME, bundle_structure_str.data(), bundle_structure_str.size(), MZ_DEFAULT_COMPRESSION);
+    if (MZ_FALSE == status) {
+        BOOST_LOG_TRIVIAL(info) << " Failed to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
+        mz_zip_writer_end(&zip_archive);
+        return ExportCase::ADD_BUNDLE_STRUCTURE_FAIL;
+    }
+    BOOST_LOG_TRIVIAL(info) << " Success to add file: " << BUNDLE_STRUCTURE_JSON_NAME;
+
+    // Complete writing of ZIP file
+    ExportCase save_result = save_zip_archive_to_file(zip_archive);
+    if (ExportCase::CASE_COUNT != save_result) return save_result;
 
     return ExportCase::EXPORT_SUCCESS;
 }
@@ -3902,16 +3979,57 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_filament_bundle_to_
 ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_printer_preset_to_file(const wxString &path)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "start exprot printer presets";
-    std::string export_file = "Printer presets.zip";
+    std::string export_file = ExportPresetsCore::file_name(ExportPresetsCore::Kind::PrinterPresets, "");
     export_file             = initial_file_name(path, export_file);
     if (export_file.empty() || "initial_failed" == export_file) return ExportCase::EXPORT_CANCEL;
 
+    std::vector<std::string> printer_names;
+    for (std::pair<::CheckBox *, Preset *> checkbox_preset : m_preset) {
+        if (checkbox_preset.first->GetValue()) printer_names.push_back(checkbox_preset.second->name);
+    }
+    return m_core.write_presets_zip(ExportPresetsCore::Kind::PrinterPresets, printer_names, export_file);
+}
+
+ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_filament_preset_to_file(const wxString &path)
+{
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "start exprot filament presets";
+    std::string export_file = ExportPresetsCore::file_name(ExportPresetsCore::Kind::FilamentPresets, "");
+    export_file             = initial_file_name(path, export_file);
+    if (export_file.empty() || "initial_failed" == export_file) return ExportCase::EXPORT_CANCEL;
+
+    std::vector<std::string> filament_names;
+    for (std::pair<::CheckBox *, std::string> checkbox_preset : m_printer_name) {
+        if (checkbox_preset.first->GetValue()) filament_names.push_back(checkbox_preset.second);
+    }
+    return m_core.write_presets_zip(ExportPresetsCore::Kind::FilamentPresets, filament_names, export_file);
+}
+
+ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_process_preset_to_file(const wxString &path)
+{
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "start exprot process presets";
+    std::string export_file = ExportPresetsCore::file_name(ExportPresetsCore::Kind::ProcessPresets, "");
+    export_file             = initial_file_name(path, export_file);
+    if (export_file.empty() || "initial_failed" == export_file) return ExportCase::EXPORT_CANCEL;
+
+    std::vector<std::string> printer_names;
+    for (std::pair<::CheckBox *, std::string> checkbox_preset : m_printer_name) {
+        if (checkbox_preset.first->GetValue()) printer_names.push_back(checkbox_preset.second);
+    }
+    return m_core.write_presets_zip(ExportPresetsCore::Kind::ProcessPresets, printer_names, export_file);
+}
+
+ExportPresetsCore::ExportCase ExportPresetsCore::write_presets_zip(Kind kind, const std::vector<std::string> &names, const std::string &file)
+{
     std::vector<std::pair<std::string, std::string>> config_paths;
 
-    for (std::pair<::CheckBox *, Preset *> checkbox_preset : m_preset) {
-        if (checkbox_preset.first->GetValue()) {
-            Preset *    printer_preset = checkbox_preset.second;
-            std::string preset_path    = boost::filesystem::path(printer_preset->file).make_preferred().string();
+    if (kind == Kind::PrinterPresets) {
+        for (const std::string &printer_name : names) {
+            Preset *printer_preset = this->printer_preset(printer_name);
+            if (!printer_preset) {
+                BOOST_LOG_TRIVIAL(info) << "Printer name do not find, printer name:" << printer_name;
+                continue;
+            }
+            std::string preset_path = boost::filesystem::path(printer_preset->file).make_preferred().string();
             if (preset_path.empty()) {
                 BOOST_LOG_TRIVIAL(info) << "Export printer preset: " << printer_preset->name << " skip because of the preset file path is empty.";
                 continue;
@@ -3919,31 +4037,9 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_printer_preset_to_f
             std::string preset_name = printer_preset->name + ".json";
             config_paths.push_back(std::make_pair(preset_name, preset_path));
         }
-    }
-
-    ExportCase save_result = save_presets_to_zip(export_file, config_paths);
-    if (ExportCase::CASE_COUNT != save_result) return save_result;
-
-    BOOST_LOG_TRIVIAL(info) << "ZIP archive created successfully";
-
-    return ExportCase::EXPORT_SUCCESS;
-
-}
-
-ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_filament_preset_to_file(const wxString &path)
-{
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "start exprot filament presets";
-    std::string export_file = "Filament presets.zip";
-    export_file             = initial_file_name(path, export_file);
-    if (export_file.empty() || "initial_failed" == export_file) return ExportCase::EXPORT_CANCEL;
-
-    std::vector<std::pair<std::string, std::string>> config_paths;
-
-    std::set<std::string> filament_presets;
-    for (std::pair<::CheckBox *, std::string> checkbox_preset : m_printer_name) {
-        if (checkbox_preset.first->GetValue()) {
-            std::string filament_name = checkbox_preset.second;
-
+    } else if (kind == Kind::FilamentPresets) {
+        std::set<std::string> filament_presets;
+        for (const std::string &filament_name : names) {
             std::unordered_map<std::string, std::vector<std::pair<std::string, Preset *>>>::iterator iter = m_filament_name_to_presets.find(filament_name);
             if (m_filament_name_to_presets.end() == iter) {
                 BOOST_LOG_TRIVIAL(info) << "Filament name do not find, filament name:" << filament_name;
@@ -3963,29 +4059,9 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_filament_preset_to_
                 config_paths.push_back(std::make_pair(preset_name, preset_path));
             }
         }
-    }
-
-    ExportCase save_result = save_presets_to_zip(export_file, config_paths);
-    if (ExportCase::CASE_COUNT != save_result) return save_result;
-
-    BOOST_LOG_TRIVIAL(info) << "ZIP archive created successfully";
-
-    return ExportCase::EXPORT_SUCCESS;
-}
-
-ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_process_preset_to_file(const wxString &path)
-{
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "start exprot process presets";
-    std::string export_file = "Process presets.zip";
-    export_file             = initial_file_name(path, export_file);
-    if (export_file.empty() || "initial_failed" == export_file) return ExportCase::EXPORT_CANCEL;
-
-    std::vector<std::pair<std::string, std::string>> config_paths;
-
-    std::set<std::string> process_presets;
-    for (std::pair<::CheckBox *, std::string> checkbox_preset : m_printer_name) {
-        if (checkbox_preset.first->GetValue()) {
-            std::string printer_name = checkbox_preset.second;
+    } else if (kind == Kind::ProcessPresets) {
+        std::set<std::string> process_presets;
+        for (const std::string &printer_name : names) {
             std::unordered_map<std::string, std::vector<Preset *>>::iterator iter = m_process_presets.find(printer_name);
             if (m_process_presets.end() != iter) {
                 for (Preset *process_preset : iter->second) {
@@ -3996,15 +4072,17 @@ ExportConfigsDialog::ExportCase ExportConfigsDialog::archive_process_preset_to_f
                         BOOST_LOG_TRIVIAL(info) << "Export process preset: " << process_preset->name << " skip because of the preset file path is empty.";
                         continue;
                     }
-                    
+
                     std::string preset_name = process_preset->name + ".json";
                     config_paths.push_back(std::make_pair(preset_name, preset_path));
                 }
             }
         }
+    } else {
+        return ExportCase::EXPORT_CANCEL;
     }
 
-    ExportCase save_result = save_presets_to_zip(export_file, config_paths);
+    ExportCase save_result = save_presets_to_zip(file, config_paths);
     if (ExportCase::CASE_COUNT != save_result) return save_result;
 
     BOOST_LOG_TRIVIAL(info) << "ZIP archive created successfully";
@@ -4090,6 +4168,15 @@ wxBoxSizer *ExportConfigsDialog::create_select_printer(wxWindow *parent)
 
 void ExportConfigsDialog::data_init()
 {
+    if (!m_core.init()) {
+        MessageDialog dlg(this, _L("Failed to create temporary folder, please try Export Configs again."), wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Info"), wxYES_NO | wxYES_DEFAULT | wxCENTRE);
+        dlg.ShowModal();
+        EndModal(wxCANCEL);
+    }
+}
+
+bool ExportPresetsCore::init()
+{
     // Delete the Temp folder
     boost::filesystem::path folder(data_dir() + "/" + PRESET_USER_DIR + "/" + "Temp");
     if (boost::filesystem::exists(folder)) boost::filesystem::remove_all(folder);
@@ -4109,11 +4196,6 @@ void ExportConfigsDialog::data_init()
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << " create directory failed: " << temp_folder << " " << ec.message();
             temp_folder_exist = false;
         }
-    }
-    if (!temp_folder_exist) {
-        MessageDialog dlg(this, _L("Failed to create temporary folder, please try Export Configs again."), wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Info"), wxYES_NO | wxYES_DEFAULT | wxCENTRE);
-        dlg.ShowModal();
-        EndModal(wxCANCEL);
     }
 
     PresetBundle preset_bundle(*wxGetApp().preset_bundle);
@@ -4162,6 +4244,7 @@ void ExportConfigsDialog::data_init()
         std::string machine_name         = get_machine_name(filament_preset_name);
         m_filament_name_to_presets[get_filament_name(filament_preset_name)].push_back(std::make_pair(get_vendor_name(machine_name), new_filament_preset));
     }
+    return temp_folder_exist;
 }
 
 EditFilamentPresetDialog::EditFilamentPresetDialog(wxWindow *parent, Filamentinformation *filament_info)

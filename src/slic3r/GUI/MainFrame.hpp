@@ -307,6 +307,9 @@ public:
     void        export_config();
     // Query user for the config file and open it.
     void        load_config_file();
+    // The last step of Import Configs (menu and API, no dialogs): reload the presets if any were
+    // imported, then update the compatible presets and the preset lists of the sidebar.
+    void        reload_presets_after_import(bool imported);
     // Open a config file. Return true if loaded.
     bool        load_config_file(const std::string &path);
 
@@ -348,6 +351,8 @@ public:
     void        add_to_recent_projects(const wxString& filename);
     void        get_recent_projects(boost::property_tree::wptree &tree, int images);
     void        get_recent_projects(nlohmann::json& data, int images);
+    // The files of File > Recent projects in menu order (the most recent first), without file access.
+    std::vector<wxString> recent_project_files() const;
     void        open_recent_project(size_t file_id, wxString const & filename);
     void        remove_recent_project(size_t file_id, wxString const &filename);
     void        sm_remove_recent_project(wxString const& filename);

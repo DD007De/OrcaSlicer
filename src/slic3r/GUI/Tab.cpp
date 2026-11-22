@@ -55,6 +55,7 @@
 #include "BedShapeDialog.hpp"
 #include "libslic3r/GCode/Thumbnails.hpp"
 #include "NotificationManager.hpp"
+#include "SSWCPApiMode.hpp" // SSWCP API mode: dialogs become notes
 
 #include "BedShapeDialog.hpp"
 // #include "BonjourDialog.hpp"
@@ -1664,6 +1665,17 @@ void Tab::load_key_value(const std::string& opt_key, const boost::any& value, bo
     update();
 }
 
+// Show a dialog of Tab::on_value_change(). In API mode (sw_Slicer* commands) the dialog is never
+// shown: 'api_note' is recorded and 'api_answer' (the dialog's default answer) is used.
+static int show_value_change_dialog(wxDialog& dialog, const std::string& api_note, int api_answer = wxID_OK)
+{
+    if (sswcp_api::active()) {
+        sswcp_api::note(api_note + " (dialog skipped)");
+        return api_answer;
+    }
+    return dialog.ShowModal();
+}
+
 static wxString support_combo_value_for_config(const DynamicPrintConfig &config, bool is_fff)
 {
     const std::string support         = is_fff ? "enable_support"                 : "supports_enable";
@@ -1864,7 +1876,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             RichMessageDialog dlg(wxGetApp().plater(),
                 _L("The current layer height is 0.1 mm or below. Enabling Subdivide Mixing Layers may cause the subdivided layer height to fall outside the printer's supported range. This could affect print quality."),
                 _L("Configuration Conflict"), wxOK);
-            dlg.ShowModal();
+            show_value_change_dialog(dlg, "print settings: Subdivide Mixing Layers with a layer height of 0.1 mm or below may fall outside the printer's supported range");
         }
 
         if (auto* plater = wxGetApp().plater())
@@ -1877,7 +1889,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         if (!boost::any_cast<bool>(value) && timelapse_enabled) {
             MessageDialog dlg(wxGetApp().plater(), _L("A prime tower is required for smooth timelapse. There may be flaws on the model without prime tower. Are you sure you want to disable prime tower?"),
                               _L("Warning"), wxICON_WARNING | wxYES | wxNO);
-            if (dlg.ShowModal() == wxID_NO) {
+            if (show_value_change_dialog(dlg, "print settings: prime tower disabled although smooth timelapse needs it", wxID_YES) == wxID_NO) {
                 DynamicPrintConfig new_conf = *m_config;
                 new_conf.set_key_value("enable_prime_tower", new ConfigOptionBool(true));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -1888,7 +1900,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         if (boost::any_cast<bool>(value) && is_precise_z_height) {
             MessageDialog dlg(wxGetApp().plater(), _L("Enabling both precise Z height and the prime tower may cause the size of prime tower to increase. Do you still want to enable?"),
                 _L("Warning"), wxICON_WARNING | wxYES | wxNO);
-            if (dlg.ShowModal() == wxID_NO) {
+            if (show_value_change_dialog(dlg, "print settings: prime tower enabled with precise Z height; the prime tower may become larger", wxID_YES) == wxID_NO) {
                 DynamicPrintConfig new_conf = *m_config;
                 new_conf.set_key_value("enable_prime_tower", new ConfigOptionBool(false));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -1914,7 +1926,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         if (!boost::any_cast<bool>(value) && timelapse_enabled) {
             MessageDialog dlg(wxGetApp().plater(), _L("A prime tower is required for smooth timelapse. There may be flaws on the model without prime tower. Are you sure you want to disable prime tower?"),
                               _L("Warning"), wxICON_WARNING | wxYES | wxNO);
-            if (dlg.ShowModal() == wxID_NO) {
+            if (show_value_change_dialog(dlg, "print settings: prime tower disabled although smooth timelapse needs it", wxID_YES) == wxID_NO) {
                 DynamicPrintConfig new_conf = *m_config;
                 new_conf.set_key_value("enable_prime_tower", new ConfigOptionBool(true));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -1930,7 +1942,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         if (!wipe_tower_enabled && boost::any_cast<int>(value) == (int)TimelapseType::tlSmooth) {
             MessageDialog dlg(wxGetApp().plater(), _L("A prime tower is required for smooth timelapse. There may be flaws on the model without prime tower. Do you want to enable prime tower?"),
                               _L("Warning"), wxICON_WARNING | wxYES | wxNO);
-            if (dlg.ShowModal() == wxID_YES) {
+            if (show_value_change_dialog(dlg, "print settings: prime tower enabled for smooth timelapse", wxID_YES) == wxID_YES) {
                 DynamicPrintConfig new_conf = *m_config;
                 new_conf.set_key_value("enable_prime_tower", new ConfigOptionBool(true));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -1948,7 +1960,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             msg_text += "\n\n" + _(L("Still print by object?"));
 
             MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxYES | wxNO);
-            auto          answer = dialog.ShowModal();
+            auto          answer = show_value_change_dialog(dialog, "print settings: print sequence kept at by object; timelapse is not supported", wxID_YES);
             if (answer == wxID_NO) {
                 DynamicPrintConfig new_conf = *m_config;
                 new_conf.set_key_value("print_sequence", new ConfigOptionEnum<PrintSequence>(PrintSequence::ByLayer));
@@ -1978,7 +1990,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             MessageDialog dialog(wxGetApp().plater(), msg_text, "",
                                  wxICON_WARNING | wxYES | wxNO);
             DynamicPrintConfig new_conf = *m_config;
-            if (dialog.ShowModal() == wxID_NO) {
+            if (show_value_change_dialog(dialog, "print settings: non-soluble support material kept for the support base (not recommended)", wxID_YES) == wxID_NO) {
                 new_conf.set_key_value("support_filament",
                                        new ConfigOptionInt(0));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -2097,7 +2109,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
                     MessageDialog dialog(wxGetApp().plater(), msg_text,
                                          "Suggestion",
                                          wxICON_WARNING | wxYES | wxNO);
-                    if (dialog.ShowModal() == wxID_YES) {
+                    if (show_value_change_dialog(dialog, "print settings: recommended support interface settings applied for the support interface filament", wxID_YES) == wxID_YES) {
                         m_config_manipulation.apply(m_config, &filtered_conf);
                     }
                     wxGetApp().plater()->update();
@@ -2115,7 +2127,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxYES | wxNO);
             dialog.SetButtonLabel(wxID_YES, _L("Enable"));
             dialog.SetButtonLabel(wxID_NO, _L("Cancel"));
-            if (dialog.ShowModal() == wxID_NO) {
+            if (show_value_change_dialog(dialog, "print settings: make_overhang_printable enabled; this changes the model's shape", wxID_YES) == wxID_NO) {
                 DynamicPrintConfig new_conf = *m_config;
                 new_conf.set_key_value("make_overhang_printable", new ConfigOptionBool(false));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -2144,7 +2156,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxYES | wxNO);
             dialog.SetButtonLabel(wxID_YES, _L("Enable"));
             dialog.SetButtonLabel(wxID_NO, _L("Cancel"));
-            if (dialog.ShowModal() == wxID_NO) {
+            if (show_value_change_dialog(dialog, "print settings: sparse_infill_rotate_template kept although the sparse infill pattern may not support rotation", wxID_YES) == wxID_NO) {
                 DynamicPrintConfig new_conf = *m_config;
                 new_conf.set_key_value("sparse_infill_rotate_template", new ConfigOptionString(""));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -2167,7 +2179,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
                 auto          msg_text = _(L("Layer height is too small.\nIt will set to min_layer_height\n"));
                 MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxOK);
                 dialog.SetButtonLabel(wxID_OK, _L("OK"));
-                dialog.ShowModal();
+                show_value_change_dialog(dialog, "print settings: layer height too small, set to the printer's minimum layer height");
                 auto new_conf = *m_config;
                 new_conf.set_key_value("layer_height", new ConfigOptionFloat(layer_height_floor));
                 m_config_manipulation.apply(m_config, &new_conf);
@@ -2178,7 +2190,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
                 MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxYES | wxNO);
                 dialog.SetButtonLabel(wxID_YES, _L("Adjust"));
                 dialog.SetButtonLabel(wxID_NO, _L("Ignore"));
-                auto answer   = dialog.ShowModal();
+                auto answer   = show_value_change_dialog(dialog, "print settings: layer height outside the printer's layer height limits, adjusted to the limit", wxID_YES);
                 auto new_conf = *m_config;
                 if (answer == wxID_YES) {
                     if (exceed_maximum_flag)
@@ -2201,7 +2213,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             RichMessageDialog dlg(wxGetApp().plater(),
                 _L("Subdivide Mixing Layers is enabled. At a layer height of 0.1 mm or below, the subdivided layer height may fall outside the printer's supported range. This could affect print quality."),
                 _L("Configuration Conflict"), wxOK);
-            dlg.ShowModal();
+            show_value_change_dialog(dlg, "print settings: Subdivide Mixing Layers with a layer height of 0.1 mm or below may fall outside the printer's supported range");
         }
     }
 
@@ -2226,7 +2238,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
             MessageDialog dialog(wxGetApp().plater(),
                 _L("Experimental feature: Retracting and cutting off the filament at a greater distance during filament changes to minimize flush. "
                     "Although it can notably reduce flush, it may also elevate the risk of nozzle clogs or other printing complications."), "", wxICON_WARNING | wxOK);
-            dialog.ShowModal();
+            show_value_change_dialog(dialog, "printer settings: long retractions when cut is an experimental feature (risk of nozzle clogs)");
         }
     }
 
@@ -2237,7 +2249,7 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
                 _L("Experimental feature: Retracting and cutting off the filament at a greater distance during filament changes to minimize flush. "
                    "Although it can notably reduce flush, it may also elevate the risk of nozzle clogs or other printing complications. "
                    "Please use with the latest printer firmware."), "", wxICON_WARNING | wxOK);
-            dialog.ShowModal();
+            show_value_change_dialog(dialog, "filament settings: long retractions when cut is an experimental feature (risk of nozzle clogs; use the latest printer firmware)");
         }
     }
 
@@ -5689,7 +5701,10 @@ void TabPrinter::toggle_options()
                 _(L("Firmware Retraction")), wxICON_WARNING | wxYES | wxNO);
 
             DynamicPrintConfig new_conf = *m_config;
-            if (dialog.ShowModal() == wxID_YES) {
+            // API mode (sw_Slicer* commands): no dialog; take the default answer "Yes".
+            if (sswcp_api::active())
+                sswcp_api::note("printer settings: wipe disabled because firmware retraction is used (dialog skipped)");
+            if (sswcp_api::active() || dialog.ShowModal() == wxID_YES) {
                 auto wipe = static_cast<ConfigOptionBools*>(m_config->option("wipe")->clone());
                 for (size_t w = 0; w < wipe->values.size(); w++)
                     wipe->values[w] = false;
@@ -6353,11 +6368,103 @@ bool Tab::select_preset(std::string preset_name, bool delete_current /*=false*/,
     return !canceled;
 }
 
+namespace sswcp_api {
+// The options of one preset collection as UnsavedChangesDialog::update_tree() lists them (see
+// SSWCPApiMode.hpp): the same choice of keys, in the same order.
+std::vector<std::string> transfer_options(const PresetCollection& presets)
+{
+    const Preset::Type        type       = presets.type();
+    const DynamicPrintConfig& old_config = presets.get_selected_preset().config;
+    const DynamicPrintConfig& new_config = presets.get_edited_preset().config;
+
+    const bool               deep_compare  = (type == Preset::TYPE_PRINTER || type == Preset::TYPE_SLA_MATERIAL);
+    std::vector<std::string> dirty_options = presets.current_dirty_options(deep_compare);
+    const std::vector<std::string>* flow_options = nullptr;
+    ConfigFlowDomain                flow_domain  = ConfigFlowDomain::Process;
+    if (type == Preset::TYPE_FILAMENT) {
+        flow_domain  = ConfigFlowDomain::Filament;
+        flow_options = &filament_flow_variant_options();
+    } else if (type == Preset::TYPE_PRINT) {
+        flow_options = &process_flow_variant_options();
+    }
+    if (flow_options != nullptr) {
+        dirty_options.erase(std::remove_if(dirty_options.begin(), dirty_options.end(),
+                                           [flow_options](const std::string& key) {
+                                               return std::find(flow_options->begin(), flow_options->end(), key) != flow_options->end();
+                                           }),
+                            dirty_options.end());
+        const std::vector<std::string> flow_dirty_options = presets.current_flow_variant_dirty_options(flow_domain, *flow_options);
+        dirty_options.insert(dirty_options.end(), flow_dirty_options.begin(), flow_dirty_options.end());
+    }
+
+    std::vector<std::string> options;
+    // A changed number of extruders.
+    if (type == Preset::TYPE_PRINTER && presets.get_selected_preset().printer_technology() == ptFFF) {
+        const auto* old_nozzles = old_config.opt<ConfigOptionFloats>("nozzle_diameter");
+        const auto* new_nozzles = new_config.opt<ConfigOptionFloats>("nozzle_diameter");
+        if (old_nozzles != nullptr && new_nozzles != nullptr && old_nozzles->values.size() != new_nozzles->values.size())
+            options.emplace_back("extruders_count");
+    }
+
+    // The dialog leaves out text options without a field in the settings tab (internal ids and
+    // serialized data).
+    Search::OptionsSearcher& searcher = wxGetApp().sidebar().get_searcher();
+    searcher.sort_options_by_key();
+    for (const std::string& opt_key : dirty_options) {
+        const size_t      hash     = opt_key.find('#');
+        const std::string pure_key = (hash != std::string::npos && hash > 0) ? opt_key.substr(0, hash) : opt_key;
+        if (searcher.get_option(pure_key, type).opt_key() != pure_key) {
+            const ConfigOption* o = old_config.option(pure_key);
+            if (o == nullptr)
+                o = new_config.option(pure_key);
+            if (o == nullptr || o->type() == coString || o->type() == coStrings)
+                continue;
+        }
+        options.push_back(opt_key);
+    }
+    searcher.sort_options_by_label();
+    return options;
+}
+} // namespace sswcp_api
+
 // If the current preset is dirty, the user is asked whether the changes may be discarded.
 // if the current preset was not dirty, or the user agreed to discard the changes, 1 is returned.
 bool Tab::may_discard_current_dirty_preset(PresetCollection* presets /*= nullptr*/, const std::string& new_printer_name /*= ""*/, bool no_transfer)
 {
     if (presets == nullptr) presets = m_presets;
+
+    // API mode (sw_Slicer* commands): never ask. With the choice Transfer, run the branch of the
+    // button "Transfer" below, with every listed option selected, but only where the dialog shows
+    // that button (a preset name is given, no_transfer is not set, the printer technology stays).
+    // Otherwise the caller has already discarded the unsaved preset edits, so this is only a safety
+    // net: cancel the switch.
+    if (sswcp_api::active()) {
+        const Preset* target            = new_printer_name.empty() ? nullptr : m_presets->find_preset(new_printer_name);
+        const bool    transfer_possible = !no_transfer && target != nullptr &&
+                                       m_presets->get_edited_preset().printer_technology() == target->printer_technology();
+        if (sswcp_api::preset_choice() == sswcp_api::PresetChoice::Transfer && transfer_possible) {
+            const std::string type_name = presets->type() == Preset::TYPE_PRINTER  ? "printer" :
+                                          presets->type() == Preset::TYPE_FILAMENT ? "filament" :
+                                                                                     "print";
+            sswcp_api::note("unsaved changes of " + type_name + " preset '" + presets->get_edited_preset().name +
+                            "' transferred, like \"Transfer\" (dialog skipped)");
+            std::vector<std::string> selected_options = sswcp_api::transfer_options(*presets);
+            if (m_type == presets->type()) {
+                if (m_type == Preset::TYPE_PRINTER) {
+                    auto it = std::find(selected_options.begin(), selected_options.end(), "extruders_count");
+                    if (it != selected_options.end()) {
+                        selected_options.erase(it);
+                        static_cast<TabPrinter*>(this)->cache_extruder_cnt();
+                    }
+                }
+                cache_config_diff(selected_options);
+            } else
+                wxGetApp().get_tab(presets->type())->cache_config_diff(selected_options);
+            return true;
+        }
+        sswcp_api::note("preset switch cancelled: unsaved preset changes (dialog skipped)");
+        return false;
+    }
 
     UnsavedChangesDialog dlg(m_type, presets, new_printer_name, no_transfer);
 

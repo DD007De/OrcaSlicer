@@ -9,6 +9,9 @@
 #include <wx/textctrl.h>
 #include <wx/checkbox.h>
 #include <wx/msgdlg.h>
+#include <wx/colour.h>
+#include <string>
+#include <vector>
 
 #include "Widgets/SpinInput.hpp"
 
@@ -16,6 +19,19 @@
 class Button;
 class Label;
 
+
+namespace Slic3r { namespace GUI {
+// Shared by the "Flushing volumes" dialog and the API.
+// Colours of the filaments as the dialog shows them.
+std::vector<wxColour> flush_colours_from_strings(const std::vector<std::string>& extruder_colours);
+// The "Calculate" computation of the dialog: count x count matrix (index count * from + to), without the
+// multiplier, diagonal 0. min_flush_volumes is indexed by the "from" filament.
+std::vector<float> calc_auto_flush_matrix(const std::vector<wxColour>& colours, const std::vector<int>& min_flush_volumes);
+// Limits of the dialog: the multiplier range and the largest value a matrix box accepts (as shown, i.e. times the multiplier).
+float  flush_multiplier_min();
+float  flush_multiplier_max();
+double flush_value_max();
+}} // namespace Slic3r::GUI
 
 class RammingPanel : public wxPanel {
 public:
@@ -69,7 +85,6 @@ public:
 private:
     void fill_in_matrix();
     bool advanced_matches_simple();
-    int calc_flushing_volume(const wxColour& from, const wxColour& to,int min_flush_volume);
     void update_warning_texts();
         
     std::vector<wxSpinCtrl*> m_old;

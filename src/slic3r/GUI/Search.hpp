@@ -137,6 +137,12 @@ public:
 
     const std::vector<FoundOption> &found_options() { return found; }
     const GroupAndCategory &        get_group_and_category(const std::string &opt_key) { return groups_and_categories[opt_key]; }
+    // Read-only lookup: nullptr if 'opt_key' is not registered (get_group_and_category() would add it).
+    const GroupAndCategory *        find_group_and_category(const std::string &opt_key) const
+    {
+        auto it = groups_and_categories.find(opt_key);
+        return it == groups_and_categories.end() ? nullptr : &it->second;
+    }
     std::string &                   search_string() { return search_line; }
 
     void set_printer_technology(PrinterTechnology pt) { printer_technology = pt; }

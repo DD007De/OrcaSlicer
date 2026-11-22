@@ -189,7 +189,8 @@ public:
     void                on_input_enter_model(wxCommandEvent &evt);
     void                on_input_enter_description(wxCommandEvent &evt);
     void                on_select_license(wxCommandEvent& evt);
-    void                update_info();
+    // send_events false: only show the values (ChangeValue), without applying them again through wxEVT_TEXT.
+    void                update_info(bool send_events = true);
     void                msw_rescale();
 };
 
@@ -238,6 +239,8 @@ public:
 
     void update_all_panel();
     void update_all_cover();
+    // Show the current project info in the info editor without applying it again (after an API change).
+    void refresh_designer_info();
 };
 
 wxDECLARE_EVENT(EVT_AUXILIARY_IMPORT, wxCommandEvent);

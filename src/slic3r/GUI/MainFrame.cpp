@@ -3513,15 +3513,13 @@ void MainFrame::load_config_file()
         ForwardCompatibilitySubstitutionRule::Enable);
     if (!cfiles.empty()) {
         wxGetApp().app_config->update_config_dir(get_dir_name(cfiles.back()));
-        wxGetApp().load_current_presets();
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " presets has been import,and size is" << cfiles.size();
         NetworkAgent* agent = wxGetApp().getAgent();
         if (agent) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " user is: " << agent->get_user_id();
         }
     }
-    wxGetApp().preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
-    update_side_preset_ui();
+    reload_presets_after_import(!cfiles.empty());
     auto msg = wxString::Format(_L_PLURAL("There is %d config imported. (Only non-system and compatible configs)",
         "There are %d configs imported. (Only non-system and compatible configs)", cfiles.size()), cfiles.size());
     if(cfiles.empty())
@@ -3529,6 +3527,14 @@ void MainFrame::load_config_file()
     MessageDialog dlg2(this,msg ,
                         _L("Import result"), wxOK);
     dlg2.ShowModal();
+}
+
+void MainFrame::reload_presets_after_import(bool imported)
+{
+    if (imported)
+        wxGetApp().load_current_presets();
+    wxGetApp().preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
+    update_side_preset_ui();
 }
 
 // Load a config file containing a Print, Filament & Printer preset from command line.
@@ -3951,6 +3957,14 @@ void MainFrame::get_recent_projects(nlohmann::json& data, int images) {
         }
         data.push_back(item);
     }
+}
+
+std::vector<wxString> MainFrame::recent_project_files() const
+{
+    std::vector<wxString> files;
+    for (size_t i = 0; i < m_recent_projects.GetCount(); ++i)
+        files.push_back(m_recent_projects.GetHistoryFile(i));
+    return files;
 }
 
 void MainFrame::get_recent_projects(boost::property_tree::wptree &tree, int images)

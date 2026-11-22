@@ -222,23 +222,12 @@ protected:
 
 };
 
-class ExportConfigsDialog : public DPIDialog
+// The work of File > Export > Export Preset Bundle without the dialog: the presets the dialog collects,
+// the names it offers as check boxes per export type, and the archive writers. Shared by
+// ExportConfigsDialog and the API (sw_SlicerExportPresets), so both follow the same rules.
+class ExportPresetsCore
 {
 public:
-    ExportConfigsDialog(wxWindow *parent);
-    ~ExportConfigsDialog();//to do: delete preset
-
-protected:
-    
-    struct ExportType
-    {
-        wxString preset_bundle;
-        wxString filament_bundle;
-        wxString printer_preset;
-        wxString filament_preset;
-        wxString process_preset;
-    };
-
     enum ExportCase {
         INITIALIZE_FAIL = 0,
         ADD_FILE_FAIL,
@@ -250,22 +239,84 @@ protected:
         CASE_COUNT,
     };
 
+    // The five export types of the dialog, in its order.
+    enum class Kind { PrinterBundle, FilamentBundle, PrinterPresets, FilamentPresets, ProcessPresets };
+
+    ExportPresetsCore() { ++live_count(); }
+    // Deletes the preset copies and the temporary folder (as closing the dialog does).
+    ~ExportPresetsCore();
+    ExportPresetsCore(const ExportPresetsCore &)            = delete;
+    ExportPresetsCore &operator=(const ExportPresetsCore &) = delete;
+
+    // Is an instance alive (the dialog is open)? All instances share the temporary folder, so a second
+    // one must not be made while one lives. GUI thread only.
+    static bool in_use() { return live_count() > 0; }
+
+    // Collect the presets (re)creating the temporary folder. False if that folder could not be created.
+    bool init();
+    // The names the dialog offers as check boxes for a type, in the dialog's order: printer names for
+    // PrinterBundle, PrinterPresets and ProcessPresets, filament names for the two filament types.
+    std::vector<std::string> offered_names(Kind kind) const;
+    // The collected copy of a printer preset (nullptr if there is none).
+    Preset *printer_preset(const std::string &printer_name) const;
+    // The file name the dialog writes in the chosen folder: "<name>.orca_printer", "<name>.orca_filament",
+    // or the fixed zip name of a zip type ("Printer presets.zip", ...; name is not used).
+    static std::string file_name(Kind kind, const std::string &name);
+
+    // Write the bundle of one offered name to file (PrinterBundle, FilamentBundle). EXPORT_SUCCESS on success.
+    ExportCase write_printer_bundle(const std::string &printer_name, const std::string &file);
+    ExportCase write_filament_bundle(const std::string &filament_name, const std::string &file);
+    // Write the zip of a zip type with the presets of all given offered names to file. EXPORT_SUCCESS on success.
+    ExportCase write_presets_zip(Kind kind, const std::vector<std::string> &names, const std::string &file);
+
+private:
+    static int &live_count()
+    {
+        static int count = 0;
+        return count;
+    }
+    static bool earse_preset_fields_for_safe(Preset *preset);
+    static int  initial_zip_archive(mz_zip_archive &zip_archive, const std::string &file_path);
+    static ExportCase save_zip_archive_to_file(mz_zip_archive &zip_archive);
+    static ExportCase save_presets_to_zip(const std::string &export_file, const std::vector<std::pair<std::string, std::string>> &config_paths);
+
+    std::unordered_map<std::string, Preset *>              m_printer_presets;//first: printer name, second: printer presets have same printer name
+    std::unordered_map<std::string, std::vector<Preset *>> m_filament_presets;//first: printer name, second: filament presets have same printer name
+    std::unordered_map<std::string, std::vector<Preset *>> m_process_presets;//first: printer name, second: filament presets have same printer name
+    std::unordered_map<std::string, std::vector<std::pair<std::string, Preset *>>> m_filament_name_to_presets;//first: filament name, second presets have same filament name and printer name in vector
+};
+
+class ExportConfigsDialog : public DPIDialog
+{
+public:
+    ExportConfigsDialog(wxWindow *parent);
+    ~ExportConfigsDialog();//to do: delete preset
+
+protected:
+
+    struct ExportType
+    {
+        wxString preset_bundle;
+        wxString filament_bundle;
+        wxString printer_preset;
+        wxString filament_preset;
+        wxString process_preset;
+    };
+
+    using ExportCase = ExportPresetsCore::ExportCase;
+
 private:
     void        data_init();
     void        select_curr_radiobox(std::vector<std::pair<RadioBox *, wxString>> &radiobox_list, int btn_idx);
     void        on_dpi_changed(const wxRect &suggested_rect) override;
     void        show_export_result(const ExportCase &export_case);
     bool        has_check_box_selected();
-    bool        earse_preset_fields_for_safe(Preset *preset);
     std::string initial_file_path(const wxString &path, const std::string &sub_file_path);
     std::string initial_file_name(const wxString &path, const std::string file_name);
     wxBoxSizer *create_export_config_item(wxWindow *parent);
     wxWindow   *create_dialog_buttons(wxWindow *parent);
     wxBoxSizer *create_select_printer(wxWindow *parent);
     wxBoxSizer *create_radio_item(wxString title, wxWindow *parent, wxString tooltip, std::vector<std::pair<RadioBox *, wxString>> &radiobox_list);
-    int         initial_zip_archive(mz_zip_archive &zip_archive, const std::string &file_path);
-    ExportCase  save_zip_archive_to_file(mz_zip_archive &zip_archive);
-    ExportCase  save_presets_to_zip(const std::string &export_file, const std::vector<std::pair<std::string, std::string>> &config_paths);
     ExportCase  archive_preset_bundle_to_file(const wxString &path);
     ExportCase  archive_filament_bundle_to_file(const wxString &path);
     ExportCase  archive_printer_preset_to_file(const wxString &path);
@@ -276,10 +327,7 @@ private:
     std::vector<std::pair<RadioBox *, wxString>>           m_export_type_btns;
     std::vector<std::pair<::CheckBox *, Preset *>>         m_preset;         // for printer preset bundle,printer preset, process preset export
     std::vector<std::pair<::CheckBox *, std::string>>      m_printer_name;    // for filament and peocess preset export, collaborate with m_filament_name_to_presets
-    std::unordered_map<std::string, Preset *>              m_printer_presets;//first: printer name, second: printer presets have same printer name
-    std::unordered_map<std::string, std::vector<Preset *>> m_filament_presets;//first: printer name, second: filament presets have same printer name
-    std::unordered_map<std::string, std::vector<Preset *>> m_process_presets;//first: printer name, second: filament presets have same printer name
-    std::unordered_map<std::string, std::vector<std::pair<std::string, Preset *>>> m_filament_name_to_presets;//first: filament name, second presets have same filament name and printer name in vector
+    ExportPresetsCore                                      m_core;           // the presets and the archive writers
     ExportType                                             m_exprot_type;
     wxBoxSizer *                                           m_main_sizer             = nullptr;
     wxScrolledWindow *                                     m_scrolled_preset_window = nullptr;

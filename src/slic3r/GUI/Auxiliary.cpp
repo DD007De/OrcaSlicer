@@ -1055,6 +1055,12 @@ void AuxiliaryPanel::update_all_cover()
     }
 }
 
+void AuxiliaryPanel::refresh_designer_info()
+{
+    if (m_designer_panel != nullptr)
+        m_designer_panel->update_info(/*send_events=*/false);
+}
+
 
  DesignerPanel::DesignerPanel(wxWindow *          parent,
                              AuxiliaryFolderType type,
@@ -1170,23 +1176,32 @@ void DesignerPanel::on_input_enter_description(wxCommandEvent &evt)
     ensure_model_info()->description = std::string(text.ToUTF8().data());
 }
 
-void DesignerPanel::update_info() 
+// SetValue sends wxEVT_TEXT (the handlers apply the value again), ChangeValue does not.
+static void designer_set_text(wxTextCtrl* ctrl, const wxString& value, bool send_events)
+{
+    if (send_events)
+        ctrl->SetValue(value);
+    else
+        ctrl->ChangeValue(value);
+}
+
+void DesignerPanel::update_info(bool send_events)
 {
     if (wxGetApp().plater()->model().design_info != nullptr) {
         wxString text = wxString::FromUTF8(wxGetApp().plater()->model().design_info->Designer);
-        m_input_designer->GetTextCtrl()->SetValue(text);
+        designer_set_text(m_input_designer->GetTextCtrl(), text, send_events);
     } else {
-        m_input_designer->GetTextCtrl()->SetValue(wxEmptyString);
+        designer_set_text(m_input_designer->GetTextCtrl(), wxEmptyString, send_events);
     }
 
     if (wxGetApp().plater()->model().model_info != nullptr) {
-        m_input_model_name->GetTextCtrl()->SetValue(wxString::FromUTF8(wxGetApp().plater()->model().model_info->model_name));
+        designer_set_text(m_input_model_name->GetTextCtrl(), wxString::FromUTF8(wxGetApp().plater()->model().model_info->model_name), send_events);
         m_input_description->ChangeValue(wxString::FromUTF8(wxGetApp().plater()->model().model_info->description));
         if (!m_combo_license->SetStringSelection(wxString::FromUTF8(wxGetApp().plater()->model().model_info->license))) {
             m_combo_license->SetSelection(0);
         }
     } else {
-        m_input_model_name->GetTextCtrl()->SetValue(wxEmptyString);
+        designer_set_text(m_input_model_name->GetTextCtrl(), wxEmptyString, send_events);
         m_input_description->ChangeValue(wxEmptyString);
         m_combo_license->SetSelection(0);
     }

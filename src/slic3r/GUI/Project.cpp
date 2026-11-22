@@ -309,6 +309,19 @@ void ProjectPanel::update_model_data()
     wxPostEvent(this, event);
 }
 
+void ProjectPanel::refresh_project_info()
+{
+    if (m_auxiliary != nullptr)
+        m_auxiliary->refresh_designer_info();
+    // The project page reloads itself when the tab is shown (Show -> update_model_data), so only reload the page
+    // that is on screen now, with on_reload like update_model_data.
+    if (m_browser != nullptr && m_browser->IsShownOnScreen()) {
+        auto event = wxCommandEvent(EVT_PROJECT_RELOAD);
+        event.SetEventObject(this);
+        wxPostEvent(this, event);
+    }
+}
+
 void ProjectPanel::clear_model_info()
 {
     json m_Res = json::object();

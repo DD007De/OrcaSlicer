@@ -84,6 +84,8 @@ public:
    
     void msw_rescale();
     void update_model_data();
+    // After the project info changed outside the info editor (the API): show it, without leaving the info editor.
+    void refresh_project_info();
     void clear_model_info();
     void init_auxiliary() { m_auxiliary->init_auxiliary(); }
 
