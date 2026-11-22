@@ -2841,6 +2841,30 @@ size_t NotificationManager::get_notification_count() const
 	return ret;
 }
 
+std::vector<NotificationManager::NotificationInfo> NotificationManager::get_active_notifications(const std::vector<NotificationType>& types) const
+{
+	std::vector<NotificationInfo> ret;
+	for (const std::unique_ptr<PopNotification>& notification : m_pop_notifications) {
+		if (std::find(types.begin(), types.end(), notification->get_type()) == types.end())
+			continue;
+		// Same states as render() and bbl_render_block_notification(): Hidden, ClosePending and Finished are not drawn.
+		if (notification->get_state() == PopNotification::EState::Hidden || notification->is_finished())
+			continue;
+		std::string text = notification->get_text1();
+		// The markup that count_lines() removes before the first render.
+		for (const std::string mark : { "<Error>", "</Error>" }) {
+			const size_t pos = text.find(mark);
+			if (pos != std::string::npos)
+				text.erase(pos, mark.length());
+		}
+		const std::string hypertext = boost::algorithm::trim_copy(notification->get_hypertext());
+		if (!hypertext.empty())
+			text += " " + hypertext;
+		ret.push_back({ notification->get_type(), notification->get_data().level, text, notification->is_gray() });
+	}
+	return ret;
+}
+
 void NotificationManager::bbl_show_plateinfo_notification(const std::string &text)
 {
     NotificationData data{NotificationType::BBLPlateInfo, NotificationLevel::PrintInfoNotificationLevel, BBL_NOTICE_MAX_INTERVAL, text};

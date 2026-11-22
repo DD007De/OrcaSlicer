@@ -2103,25 +2103,28 @@ void GCodeViewer::update_layers_slider_mode()
     // TODO m_layers_slider->SetModeAndOnlyExtruder(one_extruder_printed_model, only_extruder);
 }
 
-void GCodeViewer::update_marker_curr_move() {
-    if ((int)m_last_result_id != -1) {
-        if (m_use_gpu_pipeline && _pathStack != nullptr) {
-            // O(1) sid lookup; the legacy path linearly scans all moves below
-            // (AdvancedRenderer replaces this the same way)
-            const uint32_t moveIndex = _pathStack->MoveIndexOfSid(m_sequential_view.current.last);
-            if (m_gcode_result != nullptr && moveIndex < m_gcode_result->moves.size())
-                m_sequential_view.marker.update_curr_move(m_gcode_result->moves[moveIndex]);
-            return;
-        }
-        auto it = std::find_if(m_gcode_result->moves.begin(), m_gcode_result->moves.end(), [this](auto move) {
-                if (m_sequential_view.current.last < m_sequential_view.gcode_ids.size() && m_sequential_view.current.last >= 0) {
-                    return move.gcode_id == static_cast<uint64_t>(m_sequential_view.gcode_ids[m_sequential_view.current.last]);
-                }
-                return false;
-            });
-        if (it != m_gcode_result->moves.end())
-            m_sequential_view.marker.update_curr_move(*it);
+const GCodeProcessorResult::MoveVertex* GCodeViewer::get_current_move() const
+{
+    // Same lookup as update_marker_curr_move(), without touching the marker.
+    if (m_gcode_result == nullptr || (int)m_last_result_id == -1)
+        return nullptr;
+    const size_t last = m_sequential_view.current.last;
+    if (m_use_gpu_pipeline && _pathStack != nullptr) {
+        const uint32_t moveIndex = _pathStack->MoveIndexOfSid(last);
+        return moveIndex < m_gcode_result->moves.size() ? &m_gcode_result->moves[moveIndex] : nullptr;
     }
+    if (last >= m_sequential_view.gcode_ids.size())
+        return nullptr;
+    const uint64_t gcode_id = static_cast<uint64_t>(m_sequential_view.gcode_ids[last]);
+    for (const GCodeProcessorResult::MoveVertex& move : m_gcode_result->moves)
+        if (move.gcode_id == gcode_id)
+            return &move;
+    return nullptr;
+}
+
+void GCodeViewer::update_marker_curr_move() {
+    if (const GCodeProcessorResult::MoveVertex* move = get_current_move())
+        m_sequential_view.marker.update_curr_move(*move);
 }
 
 void GCodeViewer::set_view_type(EViewType type, bool reset_feature_type_visible)
@@ -2217,6 +2220,51 @@ void GCodeViewer::set_layers_z_range(const std::array<unsigned int, 2>& layers_z
     m_layers_z_range = layers_z_range;
     refresh_render_paths(keep_sequential_current_first, keep_sequential_current_last);
     update_moves_slider(true);
+}
+
+std::vector<GCodeViewer::EViewType> GCodeViewer::get_selectable_view_types() const
+{
+    // Only the items with a label are shown in the combo box (update_by_mode).
+    const size_t n = std::min(view_type_items.size(), view_type_items_str.size());
+    return std::vector<EViewType>(view_type_items.begin(), view_type_items.begin() + n);
+}
+
+bool GCodeViewer::select_view_type(EViewType type)
+{
+    const size_t n = std::min(view_type_items.size(), view_type_items_str.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (view_type_items[i] != type)
+            continue;
+        // Same steps as selecting the item in the combo box (render_legend).
+        m_view_type_sel = static_cast<int>(i);
+        set_view_type(type);
+        reset_visible(type);
+        refresh_render_paths(false, false);
+        update_moves_slider();
+        return true;
+    }
+    return false;
+}
+
+bool GCodeViewer::is_filament_visible(size_t extruder_id) const
+{
+    return extruder_id < m_tools.m_tool_visibles.size() && m_tools.m_tool_visibles[extruder_id];
+}
+
+void GCodeViewer::set_filament_visible(size_t extruder_id, bool visible)
+{
+    if (extruder_id < m_tools.m_tool_visibles.size())
+        m_tools.m_tool_visibles[extruder_id] = visible;
+}
+
+void GCodeViewer::refresh_after_visibility_change(bool travel_changed)
+{
+    // m_gcode_result is only set once a result has been loaded (has_data()).
+    if (travel_changed && m_view_type == EViewType::Feedrate && has_data() && m_gcode_result != nullptr)
+        refresh(*m_gcode_result, wxGetApp().plater()->get_extruder_colors_from_plater_config(m_gcode_result));
+    else
+        refresh_render_paths(false, false);
+    update_moves_slider();
 }
 
 void GCodeViewer::export_toolpaths_to_obj(const char* filename) const

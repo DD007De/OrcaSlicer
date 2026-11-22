@@ -131,6 +131,18 @@ public:
     void on_change_color_mode(bool is_dark);
     void set_menu_enable(bool enable = true) { m_menu_enable = enable; }
 
+    // Public tick actions (used by the API). Like the user, they first put the upper
+    // handle on `tick` (SetHigherValue) and then run the existing protected action.
+    void add_pause(int tick);
+    void add_template(int tick);
+    void add_custom_gcode_at(int tick, const std::string& custom_gcode);
+    void add_filament_change(int tick, int filament);
+    void delete_tick_at(int tick);
+    bool can_change_filament() const { return m_can_change_color; }
+    bool menu_enabled() const { return m_menu_enable; }
+    bool is_sequential() const { return m_draw_mode == dmSequentialFffPrint; }
+    const std::vector<std::string>& extruder_colors() const { return m_extruder_colors; }
+
 protected:
     void add_custom_gcode(std::string custom_gcode);
     void add_code_as_tick(Type type, int selected_extruder = -1);

@@ -412,6 +412,39 @@ void IMSlider::delete_tick(const TickCode& tick) {
     post_ticks_changed_event(t);
 }
 
+void IMSlider::add_pause(int tick)
+{
+    SetHigherValue(tick);
+    add_code_as_tick(PausePrint);
+}
+
+void IMSlider::add_template(int tick)
+{
+    SetHigherValue(tick);
+    add_code_as_tick(Template);
+}
+
+void IMSlider::add_custom_gcode_at(int tick, const std::string& custom_gcode)
+{
+    SetHigherValue(tick);
+    add_custom_gcode(custom_gcode);
+}
+
+void IMSlider::add_filament_change(int tick, int filament)
+{
+    SetHigherValue(tick);
+    add_code_as_tick(ToolChange, filament);
+}
+
+void IMSlider::delete_tick_at(int tick)
+{
+    SetHigherValue(tick);
+    const auto it = m_ticks.ticks.find(TickCode{tick});
+    if (it == m_ticks.ticks.end()) return;
+    const TickCode code = *it; // copy: delete_tick erases the element
+    delete_tick(code);
+}
+
 bool IMSlider::check_ticks_changed_event(Type type)
 {
     //BBL only support MultiExtruder

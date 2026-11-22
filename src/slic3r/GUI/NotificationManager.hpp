@@ -182,6 +182,16 @@ public:
 		ErrorNotificationLevel,
 	};
 
+	// A notification as it is shown on the canvas (see get_active_notifications()).
+	struct NotificationInfo {
+		NotificationType  type;
+		NotificationLevel level;
+		// Main text, followed by the hypertext if there is one.
+		std::string       text;
+		// Drawn gray: it belongs to an older state (for example a slicing result that is no longer valid).
+		bool              gray { false };
+	};
+
 	NotificationManager(wxEvtHandler* evt_handler);
 	~NotificationManager(){}
 
@@ -311,6 +321,9 @@ public:
 	bool update_notifications(GLCanvas3D& canvas);
 	// returns number of all notifications shown
 	size_t get_notification_count() const;
+	// Read only: the notifications of the given types that are shown in the current view (or will be
+	// at the next render). Hidden, closed and finished notifications are left out.
+	std::vector<NotificationInfo> get_active_notifications(const std::vector<NotificationType>& types) const;
 
 
 	//BBS Notice
@@ -431,6 +444,7 @@ private:
 		const NotificationType get_type() const { return m_data.type; }
 		const NotificationData& get_data() const { return m_data; }
         std::string             get_text1() const { return m_text1; }
+		const std::string&     get_hypertext() const { return m_hypertext; }
 		const bool             is_gray() const { return m_is_gray; }
 		void                   set_gray(bool g) { m_is_gray = g; }
 		virtual bool           compare_text(const std::string& text) const;
